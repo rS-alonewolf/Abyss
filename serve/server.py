@@ -2910,7 +2910,10 @@ def main() -> int:
     tpl = tpath / "chat_template.jinja"
     bos_id = (getattr(tok, "special_ids", None) or {}).get("tokenizer.ggml.bos_token_id")
     bos = tok.tokens[bos_id] if isinstance(bos_id, int) and 0 <= bos_id < len(tok.tokens) else ""
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja", bos_token=bos),
+    # a V4.1 pack (iq_pack.py writes engram.txt for deepseek41 only), relative to the engine's working directory
+    dsml41 = (Path(cfg.get("cwd") or ".") / engine_model_path(cfg.get("args") or []) / "engram.txt").exists()
+    template = ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja", bos_token=bos, dsml41=dsml41)
+    svc = Service(engine, tok, template,
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)

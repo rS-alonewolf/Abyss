@@ -1,5 +1,5 @@
 """Tool calls in GLM-5.x's own form (issue #5: every GLM call was "malformed") and Qwen's, streamed and whole, and a
-call quoted in a code fence or inline code staying text (Strata #1058).
+call quoted in a code fence or inline code staying text (Strata #1058), and DeepSeek's DSML in V4's and V4.1's spelling.
     python -m unittest serve.test_tools"""
 from __future__ import annotations
 
@@ -99,6 +99,75 @@ class GlmCalls(unittest.TestCase):
             self.assertEqual((got[0].name, got[0].arguments), ("get_weather", {"city": "Paris", "days": 3}), pieces)
             streamed = "".join(e.text for e in ev if e.kind == "tool_args")
             self.assertEqual(json.loads(streamed), {"city": "Paris", "days": 3}, pieces)
+
+
+DSML_V4 = ("<\uff5cDSML\uff5ctool_calls>\n<\uff5cDSML\uff5cinvoke name=\"get_weather\">\n"
+           "<\uff5cDSML\uff5cparameter name=\"city\" string=\"true\">Paris</\uff5cDSML\uff5cparameter>\n"
+           "<\uff5cDSML\uff5cparameter name=\"days\" string=\"false\">3</\uff5cDSML\uff5cparameter>\n"
+           "</\uff5cDSML\uff5cinvoke>\n</\uff5cDSML\uff5ctool_calls>")
+DSML_V41 = ("<\uff5cDSML\uff5c calls>\n<\uff5cDSML\uff5c invoke name=\"get_weather\">\n"
+            "<\uff5cDSML\uff5c parameter name=\"city\" string=\"true\">Paris</\uff5cDSML\uff5c parameter>\n"
+            "<\uff5cDSML\uff5c parameter name=\"days\" string=\"false\">3</\uff5cDSML\uff5c parameter>\n"
+            "</\uff5cDSML\uff5c invoke>\n</\uff5cDSML\uff5c calls>")
+
+
+class DsmlCalls(unittest.TestCase):
+    """DeepSeek V4 writes <｜DSML｜tool_calls>; V4.1 writes <｜DSML｜ calls> with a space after the token (its invokes
+    and parameters too).  Before, V4.1's calls came back as text and agents stopped at the first tool call."""
+
+    def calls(self, text, pieces=None):
+        out = run(text, pieces)
+        self.assertEqual([e.kind for e in out if e.kind == "content"], [])
+        return [(e.call.name, e.call.arguments) for e in out if e.kind == "tool_call"]
+
+    def test_both_spellings_whole_and_streamed(self):
+        for text in (DSML_V4, DSML_V41):
+            for pieces in (None, 1, 7):
+                self.assertEqual(self.calls(text, pieces), [("get_weather", {"city": "Paris", "days": 3})])
+
+    def test_unterminated_block_is_text_with_its_own_tag(self):
+        out = run(DSML_V41[:60])
+        self.assertTrue("".join(e.text for e in out if e.kind == "content").startswith("<\uff5cDSML\uff5c calls>"))
+
+    def test_opening_tag_alone_stays_text(self):
+        for text in (DSML_V4[:DSML_V4.index(">") + 1], DSML_V41[:DSML_V41.index(">") + 1]):
+            out = run(text)
+            self.assertEqual("".join(e.text for e in out if e.kind == "content"), text)
+
+    def test_template_respelled_for_a_v41_pack(self):
+        # both ways a template spells the tags: the token written out, and a variable holding it (the ISTA GGUFs)
+        src = ("{%- set dsml_token = '\\uff5cDSML\\uff5c' -%}Write <\uff5cDSML\uff5ctool_calls> blocks.\n"
+               "{{ obj.dsml_token ~ 'parameter' }} {{ \"dsml_token + 'invoke'\" }}\n"
+               "{%- set t = '\uff5cDSML\uff5c' -%}{%- set t = 'x' -%}{{ t + 'invoke' }}|"
+               "{{ '<' + (dsml_token|string) + 'tool_calls>' }}{{ '<' ~ dsml_token ~ ('invoke' if 1 else 'parameter') }}|"
+               "{%- for m in messages -%}{%- if m.tool_calls -%}{{ '<' + dsml_token + 'tool_calls>' }}"
+               "{%- for c in m.tool_calls -%}{{ '<' + dsml_token + 'invoke name=\"' + c.function.name + '\">' }}"
+               "{{ '<' + dsml_token + 'parameter name=\"p\">v</' + dsml_token + 'parameter>' }}"
+               "{{ '</' + dsml_token + 'invoke>' }}{%- endfor -%}{{ '</' + dsml_token + 'tool_calls>' }}"
+               "{%- else -%}{{ m.content }}{%- endif -%}{%- endfor -%}")
+        quoted = "say <\uff5cDSML\uff5ctool_calls> and <\uff5cDSML\uff5cparameterized>"
+        msgs = [{"role": "user", "content": quoted},
+                {"role": "assistant", "tool_calls": [{"function": {"name": "bash", "arguments": {}}}]}]
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "chat_template.jinja"
+            p.write_text(src, encoding="utf-8")
+            v4, v41 = ChatTemplate(p), ChatTemplate(p, dsml41=True)
+            out4 = v4.render(msgs, add_generation_prompt=False, obj={"dsml_token": "x_"})
+            out41 = v41.render(msgs, add_generation_prompt=False, obj={"dsml_token": "x_"})
+            p.write_text(src.replace("tool_calls>", " calls>").replace("+ 'invoke", "+ ' invoke")
+                         .replace("+ 'parameter", "+ ' parameter").replace("('invoke' if 1 else 'parameter')",
+                                                                           "(' invoke' if 1 else ' parameter')"),
+                         encoding="utf-8")
+            again = ChatTemplate(p, dsml41=True)            # already V4.1's spelling: nothing to change
+        self.assertEqual((v4.dsml41, v41.dsml41, again.dsml41), (False, True, False))
+        self.assertIn("x_parameter dsml_token + 'invoke'xinvoke|", out41)   # an attribute, a string, a variable set twice
+        self.assertIn("|<\uff5cDSML\uff5c calls><\uff5cDSML\uff5c invoke|", out41)  # through a filter and a conditional
+        self.assertIn("<\uff5cDSML\uff5ctool_calls><\uff5cDSML\uff5cinvoke name=\"bash\">", out4)
+        self.assertIn("Write <\uff5cDSML\uff5c calls> blocks.", out41)
+        self.assertIn("<\uff5cDSML\uff5c calls><\uff5cDSML\uff5c invoke name=\"bash\"><\uff5cDSML\uff5c parameter "
+                      "name=\"p\">v</\uff5cDSML\uff5c parameter></\uff5cDSML\uff5c invoke></\uff5cDSML\uff5c calls>", out41)
+        self.assertIn(quoted, out41)                    # a message's own text is never respelled
 
 
 class ThinkToken(unittest.TestCase):

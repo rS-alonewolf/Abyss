@@ -29,7 +29,7 @@ from jinja2.sandbox import ImmutableSandboxedEnvironment
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
-    def __init__(self, path: str | Path, bos_token: str = ""):
+    def __init__(self, path: str | Path, bos_token: str = "", dsml41: bool = False):
         def raise_exception(message):
             raise jinja2.exceptions.TemplateError(message)
 
@@ -41,7 +41,12 @@ class ChatTemplate:
         env.filters["from_json"] = json.loads           # DeepSeek V4's template parses tool-call arguments
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
-        self.template = env.from_string(self.source)
+        # DeepSeek V4.1 writes <｜DSML｜ calls> (a space after the token); a V4.1 pack whose template spells V4's
+        # <｜DSML｜tool_calls> (ISTA-DASLab's GSQ-RCO GGUFs) shows the model V4.1's spelling instead, so the model
+        # sees the form it writes.  Only the template's own strings change, never a message's.
+        tree = env.parse(self.source)
+        self.dsml41 = dsml41 and respell_dsml41(tree)
+        self.template = env.from_string(tree)
         self.bos_token = bos_token
         # DeepSeek V4 (the DSML tool-call template): thinking is the template's `thinking` (off unless asked), with
         # reasoning_effort "high" / "max" on top.  The server's levels map to: none -> off, low -> thinking,
@@ -311,16 +316,78 @@ ARG_VAL, ARG_VAL_END = "<arg_value>", "</arg_value>"
 #   </｜DSML｜tool_calls>
 # string="true" values are written as they are, the others as JSON (the chat template's own encoding).
 DSML_CALLS, DSML_CALLS_END = "<\uff5cDSML\uff5ctool_calls>", "</\uff5cDSML\uff5ctool_calls>"
+# DeepSeek V4.1 writes a space after the DSML token and `calls` for the block (<｜DSML｜ calls>, <｜DSML｜ invoke ...>,
+# <｜DSML｜ parameter ...>), whatever spelling the pack's template shows; both are read.
+DSML41_CALLS, DSML41_CALLS_END = "<\uff5cDSML\uff5c calls>", "</\uff5cDSML\uff5c calls>"
+DSML_ENDS = {DSML_CALLS: DSML_CALLS_END, DSML41_CALLS: DSML41_CALLS_END}
+
+
+def _dsml41_text(text: str, after_token: bool = False) -> str:
+    """V4's DSML tags in a string -> V4.1's spelling; after_token: the string follows the token itself."""
+    import re
+    head = "^" if after_token else "(?<=\uff5cDSML\uff5c)"
+    text = re.sub(head + "tool_calls>", " calls>", text)
+    return re.sub(head + r"(invoke|parameter)\b", r" \1", text)
+
+
+def respell_dsml41(tree) -> bool:
+    """Respell a parsed chat template's DSML tags in V4.1's form, in place: the string constants that hold the token
+    and the ones that follow a variable assigned the token (`'<' + dsml_token + 'invoke name="'`).  True when one
+    changed.  Messages are values, not constants, so a message's text is never touched."""
+    from jinja2 import nodes
+    from collections import Counter
+    sets = Counter(a.target.name for a in tree.find_all(nodes.Assign) if isinstance(a.target, nodes.Name)
+                   and isinstance(a.node, nodes.Const) and a.node.value == "\uff5cDSML\uff5c")
+    stores = Counter(n.name for n in tree.find_all(nodes.Name) if n.ctx in ("store", "param"))
+    names = {k for k, c in sets.items() if stores[k] == c}     # never given another value (a loop, a macro, a set)
+
+    def token(n) -> bool:                               # the expression ends with the token variable
+        while isinstance(n, (nodes.Add, nodes.Concat, nodes.Filter)):
+            n = n.right if isinstance(n, nodes.Add) else n.nodes[-1] if isinstance(n, nodes.Concat) else n.node
+        return isinstance(n, nodes.Name) and n.name in names
+
+    def consts(n):                                      # a constant, or the constants of a conditional's branches
+        if isinstance(n, nodes.Const):
+            yield n
+        elif isinstance(n, nodes.CondExpr):
+            yield from consts(n.expr1)
+            if n.expr2 is not None:
+                yield from consts(n.expr2)
+
+    changed = False
+
+    def fix(n, after_token: bool) -> None:
+        nonlocal changed
+        attr = "data" if isinstance(n, nodes.TemplateData) else "value"
+        old = getattr(n, attr)
+        if isinstance(old, str):
+            new = _dsml41_text(old, after_token)
+            if new != old:
+                setattr(n, attr, new)
+                changed = True
+
+    for n in tree.find_all((nodes.Const, nodes.TemplateData)):
+        fix(n, False)
+    for n in tree.find_all(nodes.Add):
+        if token(n.left):
+            for c in consts(n.right):
+                fix(c, True)
+    for n in tree.find_all(nodes.Concat):
+        for a, b in zip(n.nodes, n.nodes[1:]):
+            if token(a):
+                for c in consts(b):
+                    fix(c, True)
+    return changed
 
 
 def parse_dsml_calls(body: str) -> list[ToolCall]:
     """The body of a DSML tool_calls block -> its calls, in order."""
     import re
     calls = []
-    for m in re.finditer(r'<\uff5cDSML\uff5cinvoke\s+name="([^"]*)"\s*>(.*?)</\uff5cDSML\uff5cinvoke>', body, re.S):
+    for m in re.finditer(r'<\uff5cDSML\uff5c\s*invoke\s+name="([^"]*)"\s*>(.*?)</\uff5cDSML\uff5c\s*invoke>', body, re.S):
         args = {}
-        for pm in re.finditer(r'<\uff5cDSML\uff5cparameter\s+name="([^"]*)"(?:\s+string="(true|false)")?\s*>(.*?)'
-                              r'</\uff5cDSML\uff5cparameter>', m.group(2), re.S):
+        for pm in re.finditer(r'<\uff5cDSML\uff5c\s*parameter\s+name="([^"]*)"(?:\s+string="(true|false)")?\s*>(.*?)'
+                              r'</\uff5cDSML\uff5c\s*parameter>', m.group(2), re.S):
             value = pm.group(3)
             if pm.group(2) == "true":
                 args[pm.group(1)] = value
@@ -416,6 +483,7 @@ class OutputParser:
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  think_token: bool = False):
         self.state = "reasoning" if thinking else "content"
+        self.dsml_tag = DSML_CALLS                      # the block opening seen last (V4 or V4.1 spelling)
         # think_token: the model ends its reasoning with a SPECIAL token the caller reports (feed(..., think_end=True));
         # the text "</think>" inside the reasoning is then the model writing about the tag (DeepSeek V4.1 explaining
         # a chat template), not the end of it
@@ -654,14 +722,15 @@ class OutputParser:
                         return out
                     self.buf, self.lead = stripped, False
                 i = self.buf.find(CALL_START)
-                d = self.buf.find(DSML_CALLS)
+                hits = [(d, t) for t in DSML_ENDS for d in (self.buf.find(t),) if d >= 0]
+                d, dtag = min(hits) if hits else (-1, DSML_CALLS)
                 dsml = d >= 0 and (i < 0 or d < i)
                 if dsml:
                     i = d
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
                     # so emitting them early would make streamed and whole outputs differ.
-                    j = len(self.buf) - self._hold(self.buf, (CALL_START, DSML_CALLS))
+                    j = len(self.buf) - self._hold(self.buf, (CALL_START, DSML_CALLS, DSML41_CALLS))
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
                     if j > 0:
@@ -675,7 +744,7 @@ class OutputParser:
                 self._track(self.buf[:i])
                 in_code = self._in_code()
                 self.fence, self.line, self.ticks = snap
-                tag = DSML_CALLS if dsml else CALL_START
+                tag = dtag if dsml else CALL_START
                 if in_code:
                     out.append(Event("content", self._track(self.buf[:i + len(tag)])))
                     self.buf = self.buf[i + len(tag):]
@@ -684,11 +753,13 @@ class OutputParser:
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(tag):]
                 self.state = "dsml" if dsml else "call"
+                self.dsml_tag = dtag
             elif self.state == "dsml":
-                i = self.buf.find(DSML_CALLS_END)
+                end = DSML_ENDS[self.dsml_tag]
+                i = self.buf.find(end)
                 if i < 0:
                     return out
-                body, self.buf = self.buf[:i], self.buf[i + len(DSML_CALLS_END):]
+                body, self.buf = self.buf[:i], self.buf[i + len(end):]
                 for call in parse_dsml_calls(body):
                     out.append(Event("tool_call", call=call))
                 self.state, self.lead = "content", True
@@ -723,9 +794,9 @@ class OutputParser:
             self.buf = ""
             self._reset_scan()
             return out
-        if self.buf:
+        if self.buf or self.state == "dsml":           # (a block that ended at its opening tag stays text too)
             kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
-            text = CALL_START + self.buf if self.state == "call" else DSML_CALLS + self.buf if self.state == "dsml" \
+            text = CALL_START + self.buf if self.state == "call" else self.dsml_tag + self.buf if self.state == "dsml" \
                 else self.buf
             out.append(Event(kind, text))
             self.buf = ""
