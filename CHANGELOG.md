@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.57 - 2026-10-26
+
+**Ornith's NextN drafter runs on GGUFs whose token_embd the GPU cannot read, two contributed fixes merged.**
+
+- Qwen3.5 / Ornith (issue #18, thanks to its reporter): the NextN drafter reads its token's embedding from the pinned
+  token_embd on the GPU, which only Q8_0 / Q5_K / Q6_K tables give; a GGUF with another type (IQ3_S in the Ornith
+  IQ3_XXS-B file, llama-quantize's pick for an IQ3_XXS target) or `STRATA_GLM_ZERO_COPY=0` left the drafter off
+  without a word, and decode fell back to the n-gram drafter. Such a table now gets a Q8_0 copy for the drafter only
+  (773 MB pinned on Ornith); the trunk keeps its exact row. The engine log says which path it took. Ornith IQ3_XXS-B on
+  a 16 GB GPU + 64 GB RAM setup: drafts accepted 39% -> 71%, decode 39.5 -> 42.6 tok/s. No file needs downloading again.
+- DeepSeek V4.1 tool calls (PR #16, thanks to its author): V4.1 Flash 1017 writes `<｜DSML｜ calls>` (a space after the
+  token); the server read only V4's `<｜DSML｜tool_calls>`, so agents stopped at the first call. Both spellings are read,
+  whole and streamed, and a V4.1 pack whose chat template spells V4's tags (ISTA-DASLab's GSQ-RCO GGUFs) shows the
+  model V4.1's form. Templates that already spell V4.1 (unsloth, orcarouter, Maya-XS) render byte-identically; V4
+  packs are untouched.
+- RX 7900 XT / XTX (PR #17, thanks to its author): gfx1100 takes the RDNA expert kernels for IQ2_XS 4096x2048 and V4.1's
+  5120x2304 gate/up and down (1.23-1.41x per kernel, bit-identical) and a warp a row for Q6_K dense GEMV. Other GPUs
+  are unchanged.
+
 ## v1.3.56 - 2026-10-25
 
 **Two contributed CPU / Windows speed-ups merged, and `--bench` fixed where reports from 16 GB cards showed it
