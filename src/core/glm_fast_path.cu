@@ -918,6 +918,41 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::fprintf(stderr, "glm fast: CUDA%d zero-copy token boundary: token_embd pinned (%.0f MB), the table "
                                  "edits and the token are read and written host-mapped\n", dev_, (double) bytes / 1048576.0);
     }
+    // the NextN drafter reads its token's embedding on the device: a table the GPU cannot read (IQ3_S, IQ4_XS, ...;
+    // or STRATA_GLM_ZERO_COPY=0) gets a Q8_0 copy for the drafter only - the trunk keeps its exact host row
+    if (g.qwen35() && mtp_il_ >= 0 && F->emb_tab_d == nullptr && pack_emb_src_ != nullptr) {
+        const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+        const ggml_type_traits* tq = ggml_get_type_traits(GGML_TYPE_Q8_0);
+        const int E = (int) g.n_embd;
+        const size_t src_rb = ggml_row_size((ggml_type) pack_emb_type_, E), q8_rb = ggml_row_size(GGML_TYPE_Q8_0, E);
+        const size_t bytes = (size_t) g.n_vocab * q8_rb;
+        if (tt == nullptr || tt->to_float == nullptr || tq->from_float_ref == nullptr || E % 32 != 0) {
+            std::fprintf(stderr, "glm fast: the NextN drafter is off: token_embd (%s) has no row reader\n",
+                         ggml_type_name((ggml_type) pack_emb_type_));
+        } else if (cudaHostAlloc((void**) &F->emb_q8_h, bytes, cudaHostAllocMapped) != cudaSuccess ||
+                   cudaHostGetDevicePointer((void**) &F->emb_q8_d, F->emb_q8_h, 0) != cudaSuccess) {
+            cudaGetLastError();
+            if (F->emb_q8_h) cudaFreeHost(F->emb_q8_h);
+            F->emb_q8_h = F->emb_q8_d = nullptr;
+            std::fprintf(stderr, "glm fast: the NextN drafter is off: its Q8_0 copy of token_embd (%.0f MB) did not pin\n",
+                         (double) bytes / 1048576.0);
+        } else {
+            const int64_t V = (int64_t) g.n_vocab;
+            const int nt = std::max(1, std::min(16, (int) std::thread::hardware_concurrency()));
+            std::vector<std::thread> th;
+            for (int k = 0; k < nt; ++k)
+                th.emplace_back([&, k] {
+                    std::vector<float> row((size_t) E);
+                    for (int64_t r = V * k / nt; r < V * (k + 1) / nt; ++r) {
+                        tt->to_float(pack_emb_src_ + (size_t) r * src_rb, row.data(), E);
+                        tq->from_float_ref(row.data(), F->emb_q8_h + (size_t) r * q8_rb, E);
+                    }
+                });
+            for (auto& t : th) t.join();
+            std::fprintf(stderr, "glm fast: CUDA%d the NextN drafter reads a Q8_0 copy of token_embd (%s, %.0f MB pinned)\n",
+                         dev_, ggml_type_name((ggml_type) pack_emb_type_), (double) bytes / 1048576.0);
+        }
+    }
 
     // ---- the expert pool: per-layer partitions (equal quota per layer within its size class)
     size_t blob_max = 0;
@@ -3243,6 +3278,7 @@ void Glm5Model::fast_destroy() {
     if (F->emb_h) cudaFreeHost(F->emb_h);
     if (F->tok_in_h) cudaFreeHost(F->tok_in_h);
     if (F->emb_tab_h) cudaFreeHost(F->emb_tab_h);
+    if (F->emb_q8_h) cudaFreeHost(F->emb_q8_h);
     if (F->hop_h) cudaFreeHost(F->hop_h);
     if (F->tok_h) cudaFreeHost(F->tok_h);
     if (F->scratch) cudaFree(F->scratch);

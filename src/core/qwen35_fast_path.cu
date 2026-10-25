@@ -180,7 +180,7 @@ void Glm5Model::qwen35_reset() {
 // (fast_token, a window's first token, or a draft), then its row is written; a draft step at the pending position
 // writes the row itself.  Chained drafts feed the block its own normed output as h and its argmax as the token.
 bool Glm5Model::q35_mtp_on() const {
-    return g_.qwen35() && mtp_il_ >= 0 && fast_ != nullptr && fast_->emb_tab_d != nullptr && fast_->q35_pend_h != nullptr;
+    return g_.qwen35() && mtp_il_ >= 0 && fast_ != nullptr && (fast_->emb_tab_d != nullptr || fast_->emb_q8_d != nullptr) && fast_->q35_pend_h != nullptr;
 }
 
 void Glm5Model::q35_mtp_pend_set(int64_t p, const float* h) {
@@ -212,7 +212,7 @@ bool Glm5Model::q35_mtp_rows(int64_t p0, int n, const float* h_rows, size_t h_st
     const auto& Ly = F->L[(size_t) il];
     if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "qwen35 mtp rows", err)) return false;   // (tok_in_h may feed an earlier copy)
     for (int t = 0; t < n; ++t) F->tok_in_h[t] = next[t];
-    if (!gf::embed_rows_q(pack_emb_type_, F->emb_tab_d, F->tok_in_d, n, E, F->q35_mt_emb, s)) { err = "qwen35 mtp: the embedding rows"; return false; }
+    if (!gf::embed_rows_q(F->emb_tab_d ? pack_emb_type_ : 8 /* Q8_0 */, F->emb_tab_d ? F->emb_tab_d : F->emb_q8_d, F->tok_in_d, n, E, F->q35_mt_emb, s)) { err = "qwen35 mtp: the embedding rows"; return false; }
     for (int t = 0; t < n; ++t)
         gf::mtp_in(F->q35_mt_emb + (size_t) t * E, h_rows + (size_t) t * h_stride, Ly.enorm, Ly.hnorm, g.norm_eps, E,
                    (uint8_t*) F->q35_mt_cat + (size_t) t * cat_b, s);
@@ -239,7 +239,7 @@ bool Glm5Model::q35_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     cudaStream_t s = F->cs;
     const int il = mtp_il_, E = g.n_embd;
     const auto& Ly = F->L[(size_t) il];
-    if (!gf::embed_rows_q(pack_emb_type_, F->emb_tab_d, tok_dev, 1, E, F->emb, s)) { err = "qwen35 mtp: the embedding"; return false; }
+    if (!gf::embed_rows_q(F->emb_tab_d ? pack_emb_type_ : 8 /* Q8_0 */, F->emb_tab_d ? F->emb_tab_d : F->emb_q8_d, tok_dev, 1, E, F->emb, s)) { err = "qwen35 mtp: the embedding"; return false; }
     gf::mtp_in(F->emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
     gf::MvJob eh = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
     if (!gf::mv(&eh, 1, s)) { err = "qwen35 mtp: eh_proj"; return false; }

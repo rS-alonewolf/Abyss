@@ -321,6 +321,8 @@ struct Glm5Model::FastState {
     int* tok_in_d = nullptr;
     uint8_t* emb_tab_h = nullptr;   // pinned copy of token_embd (Q8_0), host-mapped
     uint8_t* emb_tab_d = nullptr;
+    uint8_t* emb_q8_h = nullptr;    // Qwen3.5's NextN drafter when token_embd did not pin: a Q8_0 copy, host-mapped
+    uint8_t* emb_q8_d = nullptr;
     int* upd_key_hd[2] = {nullptr, nullptr};   // the edit sets' device addresses
     unsigned long long* upd_val_hd[2] = {nullptr, nullptr};
     float* hop_h = nullptr;     // pinned, hc * n_embd
