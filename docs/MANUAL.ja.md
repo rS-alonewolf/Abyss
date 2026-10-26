@@ -536,7 +536,7 @@ swe-bench の問題ごとに +16〜32%。これらの問題では下書きの 68
 | `STRATA_GLM_RAM_FRAC` | 0.73 | Linux・単体 GPU で `STRATA_GLM_RAM_GB` がないとき、RAM 層が pin する RAM の上限 (全体に対する割合)。94 GB 機で 73% を超えて pin するとスラッシングした |
 | `STRATA_GLM_STREAM_FETCH` | オン | SSD から読んだエキスパートを、読めた塊から順に VRAM へコピーする。PCIe のコピーが SSD の読みのすぐ後ろを走る（v1.3.31。DeepSeek V4.1 で 1 トークン −9%）。`0` で読み終わってからまとめてコピー |
 | `STRATA_GLM_RAM_THP` | オン（Linux） | RAM 層を透過的ヒュージページに置く（空きの 2 MB ブロックの範囲で。APU のレーンが再検証するページが 512 分の 1 になり、数秒の停止が消える）。`0` でドライバの pinned ページ |
-| `STRATA_GLM_RESERVE_MB` | 700 | エキスパート用プールの横に空けておく VRAM |
+| `STRATA_GLM_RESERVE_MB` | 700（CUDA）、1536（HIP） | エキスパート用プールの横に空けておく VRAM。HIP は v1.3.68 から多めに空けます。最初のプロンプトのときに hipBLASLt の GEMM がカーネルを読み込み（約 0.7 GB）、0.7 GB の空きでは R9700 で `--max-context 131072` のときに読み込めず、プロンプトの GEMM がすべて失敗して 8K のプロンプトに 1,300 秒かかっていました。プールが小さくなる分、生成は約 3% 遅くなります |
 | `STRATA_GLM_CPU_LANE` | 物理コアごとに 1 スレッド | RAM 層のエキスパートを計算する CPU スレッド数。`0` で無効 |
 | `STRATA_GLM_X3_SPLIT` | オフ | EXL3 の pack で、各ルートの RAM 層エキスパートのうちこの割合を CPU スレッドが、残りを iGPU が同時に計算する（`auto`: 起動時の計測から）。Ryzen AI Max+ 395 では電力と熱を共有するため遅くなる（[EXL3](exl3/README.md#settings)） |
 | `STRATA_GLM_EXL3_DECODE` | GPU による | EXL3 の pack で、`new`（tensor core のタイル、RTX 30 以降）か `legacy`（CUDA コア）をどの GPU でも選ぶ |

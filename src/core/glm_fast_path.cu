@@ -399,6 +399,15 @@ static void numa_pinned_free(void* p, size_t bytes) {
 }
 
 namespace glmfast {
+// the VRAM a discrete card keeps free beside the expert pool (STRATA_GLM_RESERVE_MB): ~700 MB for the driver, the
+// sampler and kernel launches' local memory; 1.5 GB on HIP, where the first prompt's hipBLASLt GEMMs load their code
+// objects and take ~0.7 GB more (an R9700 at --max-context 131072 had 0.6 GB left: every prompt GEMM failed to load
+// and fell back, an 8K prompt 1,300 s)
+#if defined(STRATA_USE_HIP)
+constexpr int kVramReserveMb = 1536;
+#else
+constexpr int kVramReserveMb = 700;
+#endif
 
 // [off, off + len) of a shard into dst: O_DIRECT through an aligned per-thread bounce buffer when the shard has a
 // direct fd (no page cache), a buffered pread otherwise, the mapping as the last resort
@@ -992,9 +1001,8 @@ bool Glm5Model::fast_setup(std::string& err) {
                          (long long) max_ctx_, (double) state_bytes_ / G,
                          (double) (sc_bytes_ + F->arena_bytes + 8 * sstride) / G, (used - known) / G);
         }
-        // headroom: cuBLAS-free path; the context's own growth is already allocated (state arena);
-        // keep ~700 MB for the driver, the sampler and kernel launches' local memory
-        size_t reserve = (size_t) (F->unified_memory ? 1024 : 700) << 20;
+        // headroom: the context's own growth is already allocated (state arena); see kVramReserveMb
+        size_t reserve = (size_t) (F->unified_memory ? 1024 : glmfast::kVramReserveMb) << 20;
         if (const char* r = getenv("STRATA_GLM_RESERVE_MB")) reserve = (size_t) std::atoll(r) << 20;
         size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
 #if defined(STRATA_USE_HIP)
@@ -5759,13 +5767,13 @@ void Glm5Model::gap_report() {
 }
 
 // the bytes the expert pool may take from what is free: headroom kept (cuBLAS-free path; the context's own growth is
-// already allocated in the state arena) - ~700 MB for the driver, the sampler and kernel launches' local memory,
-// STRATA_GLM_RESERVE_MB; STRATA_GLM_POOL_GB caps it; STRATA_GLM_VRAM_GB=<n> behaves like a card with n GB (the cap
+// already allocated in the state arena) - glmfast::kVramReserveMb, STRATA_GLM_RESERVE_MB; STRATA_GLM_POOL_GB caps it;
+// STRATA_GLM_VRAM_GB=<n> behaves like a card with n GB (the cap
 // counts everything this process already holds on the device, so the pool gets what such a card would have).  The
 // prompt path and the layer split search size from the same number, before the pool is carved (a discrete card's:
 // fast_setup prices a unified-memory APU's pool itself).
 size_t Glm5Model::pool_avail(size_t free_b, size_t total_b) {
-    size_t reserve = (size_t) 700 << 20;
+    size_t reserve = (size_t) glmfast::kVramReserveMb << 20;
     if (const char* r = getenv("STRATA_GLM_RESERVE_MB")) reserve = (size_t) std::atoll(r) << 20;
     size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
     if (const char* cap = getenv("STRATA_GLM_POOL_GB"))

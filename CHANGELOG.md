@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.68 - 2026-10-27
+
+**AMD (HIP): long contexts no longer crawl - 1.5 GB of VRAM kept free beside the expert pool (was 0.7).**
+
+- The first prompt's hipBLASLt GEMMs load their kernels (~0.7 GB of VRAM) after the expert pool has been carved. With
+  0.7 GB kept, an AI PRO R9700 at `--max-context 131072` (the full-VRAM config) had ~0.6 GB left before the prompt:
+  every prompt GEMM failed to load its kernel and fell back, and an 8K-token prompt took 1,300 s (5 tok/s). At the
+  configs' 65,536 it fitted with ~80 MB to spare. HIP now keeps 1.5 GB (`STRATA_GLM_RESERVE_MB`, CUDA unchanged at
+  700 MB): the Ornith pool 83 -> 80 slots a layer, decode ~3% slower (UD-Q4_K_XL `--bench` 59.1 / 60.2 -> 56.7 / 58.6
+  tok/s), the prompts unchanged. Not checked on CUDA at 131072 yet.
+- Long contexts checked on the four models (R9700, the full-VRAM configs at `--max-context 131072`): prompts of
+  ~8K / 32K / 64K / 115K tokens with a passphrase on the first line, then asked for it - every model found it at every
+  length. Prompt tok/s / decode tok/s after it:
+  - Ornith-1.5-122B UD-Q4_K_XL: 966 / 1,478 / 1,119 / 781, decode 49.2 / 48.9 / 47.6 / 38.3
+  - DeepSeek V4.1 Flash 1017 UD-IQ2_XXS: 206 (cold disk) / 853 / 1,038 / 1,071, decode 20.0 / 19.5 / 20.8 / 19.7
+    (SSD-bound)
+  - DeepSeek V4 Flash 0731 UD-Q2_K_XL: 820 / 952 / 872 / 721, decode 45.8 / 44.5 / 42.3 / 39.6
+  - GLM-5.3-Flash Maya-S-v2-IQ2_XXS: 597 / 912 / 843 / 810, decode 37.0 / 36.6 / 35.9 / 34.8
+
 ## v1.3.67 - 2026-10-27
 
 **Ornith (Qwen3.5-MoE) prompts: the attention on tensor cores - a 115K-token prompt 685 -> 154 s.**
