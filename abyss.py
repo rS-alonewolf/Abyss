@@ -2770,6 +2770,45 @@ def bench_quality(cfg: dict, pack: Path | None, SV) -> dict | None:
             "verdict": "OK" if kl <= 0.02 else "slightly off" if kl <= 0.05 else "OFF", "lossy_off": off}
 
 
+def sweep_report(shares, own, own_disk, start, now, lane_name, how) -> list:
+    """The --deep share sweep's lines: (share, tokens/s) runs, the engine's own share before and after them (own),
+    those two runs' SSD reads a token (own_disk, may be empty), the engine's plan as a share (start), the speed to
+    compare with when there are no own runs (now), and how to set a share (a format string with {s})."""
+    best = max(shares, key=lambda x: x[1])
+    lines = ["", "PCIe / CPU-lane share sweep (--deep; 0 = all missed experts on the CPU lane, 1 = all over PCIe;",
+             "  every run writes the same answer on a warm GPU pool, so these run faster than the decode answers",
+             "  above (new text) - compare the shares with each other; see the note below):"]
+    lines += [f"  share {s:.2f}: {v:6.1f} tokens/s" + ("  <- fastest" if (s, v) == best else "") for s, v in shares]
+    if own:
+        # issue #19: the mean of a still-cold first run and a warm last one made share 0 look 22% faster than the
+        # engine's own share, which ran 5% faster than it once warm - a share has to beat the engine's best run
+        now = max(own)
+        lines.append(f"  the engine's own share{f' (~{start:.2f})' if start is not None else ''}: "
+                     f"{' / '.join(f'{v:.1f}' for v in own)} tokens/s, the same answer before and after the sweep")
+        if len(own_disk) == 2 and own_disk[0] > max(1.0, 2 * own_disk[1]):
+            lines.append(f"  (the first of them still read the SSD {own_disk[0]:.1f} times a token, the last "
+                         f"{own_disk[1]:.1f}: the tiers were still filling with this answer's experts, so the shares "
+                         "run early in the sweep are slowed by the disk, not by their share)")
+        elif len(own) == 2 and abs(own[0] - own[1]) > 0.1 * max(own):
+            lines.append("  (its two runs differ by more than 10%: read gaps of that size between the shares as noise)")
+    if best[1] > 1.05 * now:
+        # issue #14: the sweep runs after the engine's own share has filled the GPU's pool - the experts that go
+        # over PCIe are promoted into VRAM, and a lower share promotes fewer.  Set at startup, a lower share keeps
+        # the startup's pool much longer (Ornith on DDR4: share 0 34.7 tokens/s in the sweep, 21 from the start
+        # vs 24.7 for the engine's own), so this is a lead to try, not a setting to take
+        lines.append(f"  share {best[0]:.2f} beats the engine's own choice ({now:.1f} tokens/s) on this warm pool. "
+                     f"Set at startup it may not: a lower share fills the GPU's pool more slowly. Try "
+                     f"{how.format(s=best[0])} and keep it only if a plain --bench gets faster with it")
+    elif max(v for _, v in shares) > 1.25 * min(v for _, v in shares):
+        slow = min(shares, key=lambda x: x[1])
+        lines.append(f"  the engine's own choice is as fast as the best share; share {slow[0]:.2f} is "
+                     f"{best[1] / slow[1]:.1f}x slower - " + ("PCIe is the narrow path here (the lane does the "
+                     "missed experts better)" if slow[0] > best[0] else "the lane is the slow path here"))
+    else:
+        lines.append(f"  the share barely moves the speed: neither PCIe nor the {lane_name} is what limits it")
+    return lines
+
+
 def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) -> int:
     """--bench: a standard speed test of the installed model on this PC - decode (writing an answer) on three
     questions and prefill (reading a prompt) at 2k and 8k tokens of this folder's docs - through the engine alone, the
@@ -2832,6 +2871,7 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
     step(1, f"benchmark: {cfg_path.name} (loading the model first - a minute or a few)")
     t0 = time.time()
     shares, own = [], []
+    n_sweep = 0
     with open(log_path, "w", encoding="utf-8") as log:
         p = subprocess.Popen([cfg["exe"], "--serve"] + SV.engine_args(cfg), stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=log, text=True, env=env,
@@ -2873,9 +2913,13 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
         if deep:                                            # what moves the speed: the missed experts' PCIe share
             say("  the PCIe / CPU-lane share (0 = every missed expert on the CPU lane, 1 = all copied to the GPU):")
             # the engine's own share before and after the five, under the same conditions (issue #14: the sweep runs
-            # last, on warmer tiers and shorter answers than the decode above, so it is compared with these)
+            # last, on warmer tiers and shorter answers than the decode above, so it is compared with these).  Every
+            # run writes the same answer, so a first, untimed one brings its experts in first: issue #19's first
+            # own-share run still read the SSD 6.8 times a token, the share-0 run after it 0.4
+            gen(chat(BENCH_TOPICS[0]), 128)
             for s in (None, 0.0, 0.25, 0.5, 0.75, 1.0, None):
                 f = gen(chat(BENCH_TOPICS[0]), 128, "" if s is None else f"pcie_frac={s} ")
+                n_sweep += 1
                 if f[0] == "DONE" and float(f[4]) > 0:
                     v = int(f[1]) / float(f[4]) * 1000.0
                     if s is None:
@@ -2938,39 +2982,16 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
             moves = BENCH_ADVICE_HIP.get(verdict, moves)
         lines += [f"- likely bottleneck: {what}", f"- what moves it: {moves}"]
     if shares:
-        best = max(shares, key=lambda x: x[1])
-        lines += ["", "PCIe / CPU-lane share sweep (--deep; 0 = all missed experts on the CPU lane, 1 = all over PCIe;",
-                  "  run on a warm GPU pool - see the note below):"]
-        lines += [f"  share {s:.2f}: {v:6.1f} tokens/s" + ("  <- fastest" if (s, v) == best else "")
-                  for s, v in shares]
-        start = plan_share(log_lines)
+        how = (f"\"STRATA_GLM_PCIE_SHARE\": \"{{s:.2f}}\" in {cfg_path.name}'s \"env\"" if cfg.get("backend") == "hip"
+               else "STRATA_GLM_PCIE_SHARE={s:.2f} in the config's \"env\"")
+        sweep_recs = recs[-n_sweep:] if n_sweep and len(recs) >= n_sweep else []
+        own_disk = [sweep_recs[0]["disk_reads"], sweep_recs[-1]["disk_reads"]] if len(sweep_recs) == 7 else []
         if own:
-            now = _mean(own)
-            lines.append(f"  the engine's own share{f' (~{start:.2f})' if start is not None else ''}: {now:6.1f} "
-                         f"tokens/s, the same answer before and after the sweep ({' / '.join(f'{v:.1f}' for v in own)})")
-            if len(own) == 2 and abs(own[0] - own[1]) > 0.1 * now:
-                lines.append("  (its two runs differ by more than 10%: the tiers were still warming, so read gaps of "
-                             "that size between the shares as noise)")
+            now = None
         else:                                                # (no own-share runs: the decode answers above)
             now = _mean(r["ms"] for r in dec_recs)
             now = 1000.0 / now if now > 0 else _mean(dec)
-        if best[1] > 1.05 * now:
-            # issue #14: the sweep runs after the engine's own share has filled the GPU's pool - the experts that go
-            # over PCIe are promoted into VRAM, and a lower share promotes fewer.  Set at startup, a lower share keeps
-            # the startup's pool much longer (Ornith on DDR4: share 0 34.7 tokens/s in the sweep, 21 from the start
-            # vs 24.7 for the engine's own), so this is a lead to try, not a setting to take
-            how = (f"\"STRATA_GLM_PCIE_SHARE\": \"{best[0]:.2f}\" in {cfg_path.name}'s \"env\"" if cfg.get("backend") == "hip"
-                   else f"STRATA_GLM_PCIE_SHARE={best[0]:.2f} in the config's \"env\"")
-            lines.append(f"  share {best[0]:.2f} beats the engine's own choice ({now:.1f} tokens/s) on this warm pool. "
-                         f"Set at startup it may not: a lower share fills the GPU's pool more slowly. Try {how} and keep "
-                         "it only if a plain --bench gets faster with it")
-        elif max(v for _, v in shares) > 1.25 * min(v for _, v in shares):
-            slow = min(shares, key=lambda x: x[1])
-            lines.append(f"  the engine's own choice is already the fastest; share {slow[0]:.2f} is "
-                         f"{best[1] / slow[1]:.1f}x slower - " + ("PCIe is the narrow path here (the lane does the "
-                         "missed experts better)" if slow[0] > best[0] else "the lane is the slow path here"))
-        else:
-            lines.append(f"  the share barely moves the speed: neither PCIe nor the {lane_name} is what limits it")
+        lines += sweep_report(shares, own, own_disk, plan_share(log_lines), now, lane_name, how)
     lines += ["", f"quality: {q_txt}"]
     if quality and quality.get("lossy_off"):
         lines.append(f"  (scored without this setup's {', '.join(quality['lossy_off'])}: they change the numbers on "

@@ -7,6 +7,18 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.62 - 2026-10-26
+
+**`--bench --deep`: the share sweep no longer calls a share faster because the disk warmed up during the sweep.**
+
+- Every run of the share sweep writes the same answer, so the first run read the SSD for that answer's experts and the
+  later ones did not: on an AM5 desktop with an R9700 on Gen4 x16 and 64 GB (issue #19) the engine's own share ran
+  24.8 tokens/s first (6.8 SSD reads a token) and 44.8 last (0.06), and the sweep compared share 0 (42.6) with the
+  mean of the two (34.8) and called it the winner. Now an untimed run brings the answer's experts in first, a share
+  has to beat the faster of the engine's own two runs, both runs are shown, and when the first still read the SSD much
+  more than the last the sweep says the early shares were slowed by the disk. The header also says the sweep's numbers
+  run above the decode answers (new text). docs/BENCH(.ja) updated.
+
 ## v1.3.61 - 2026-10-26
 
 **Docs: what a larger RAM tier does on a DDR4 desktop.**

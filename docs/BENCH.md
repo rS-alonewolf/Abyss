@@ -96,14 +96,18 @@ host between tokens) are what is left to speed up. That is where a report from a
 The engine splits the experts that are not in GPU memory between the lane (computed on the CPU / iGPU, from RAM) and
 PCIe (copied to the GPU). `--deep` answers the same question at five shares, with the engine's own share before and
 after them (the sweep runs last, on warmer tiers and shorter answers than the decode above, so it is compared with
-those two runs, not with the decode):
+those two runs, not with the decode). Every run writes the same answer, so an untimed run first brings that answer's
+experts into the tiers, and a share has to beat the faster of the engine's two runs (issue #19: a still-cold first run
+read the SSD 6.8 times a token against 0.4 later, and the mean of the two made share 0 look 22% faster than the engine's
+own share, which was 5% faster than it once warm). If the first run still read the SSD much more than the last, the
+sweep says so: then the early shares were slowed by the disk, not by their share:
 
 ```
   share 0.00:   58.4 tokens/s  <- fastest
   share 0.25:   23.3 tokens/s
   ...
   share 1.00:   12.2 tokens/s
-  the engine's own choice is already the fastest; share 1.00 is 4.8x slower - PCIe is the narrow path here
+  the engine's own choice is as fast as the best share; share 1.00 is 4.8x slower - PCIe is the narrow path here
 ```
 
 - The fastest share well above the engine's own share: a lead, not a setting yet. The sweep runs after the engine's

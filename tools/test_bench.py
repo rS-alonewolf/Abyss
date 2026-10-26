@@ -49,6 +49,23 @@ class BenchTests(unittest.TestCase):
             self.assertIn("STRATA_GLM_PCIE_SHARE", A.BENCH_ADVICE_HIP[k])
             self.assertIn("CUDA-only", A.BENCH_ADVICE_HIP["cpu"])
 
+    def test_sweep_compares_with_the_engines_best_run(self):
+        # issue #19: own 24.8 (cold, 6.8 SSD reads a token) / 44.8 (warm, 0.06); share 0 42.6 is no win
+        shares = [(0.0, 42.6), (0.25, 39.4), (0.5, 32.3), (0.75, 32.3), (1.0, 32.1)]
+        out = "\n".join(A.sweep_report(shares, [24.8, 44.8], [6.81, 0.06], 0.21, None, "CPU lane", "share {s:.2f}"))
+        self.assertNotIn("beats the engine's own choice", out)
+        self.assertIn("still read the SSD 6.8 times a token", out)
+        self.assertIn("24.8 / 44.8 tokens/s", out)
+        # a share well above both own runs is still named, with how to set it
+        out = "\n".join(A.sweep_report([(0.0, 58.4), (1.0, 12.2)], [30.0, 31.0], [0.2, 0.2], 0.5, None, "CPU lane",
+                                       "S={s:.2f}"))
+        self.assertIn("share 0.00 beats the engine's own choice (31.0 tokens/s)", out)
+        self.assertIn("S=0.00", out)
+        self.assertNotIn("still read the SSD", out)
+        # no own runs: compared with the decode speed given
+        out = "\n".join(A.sweep_report([(0.0, 20.0), (1.0, 19.5)], [], [], None, 19.8, "CPU lane", "{s}"))
+        self.assertIn("barely moves the speed", out)
+
     def test_verdicts(self):
         self.assertEqual(A.bench_verdict([stat(disk_ms=8.0)])[0], "ssd")
         self.assertEqual(A.bench_verdict([stat(lane_ms=18.0)])[0], "cpu")
