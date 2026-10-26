@@ -11,6 +11,10 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import abyss as maya
 
+# main() under a system Python execs ./abyss.sh with the test's argv - a real start (a real --bench ran and
+# overwrote abyss-bench.txt); the CI's venv never takes that path
+os.environ["MAYA_SH"] = "1"
+
 
 class HipSetupTests(unittest.TestCase):
     def setUp(self):

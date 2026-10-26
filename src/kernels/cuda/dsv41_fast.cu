@@ -226,6 +226,45 @@ __global__ void mask_kernel(float* __restrict__ score, int n_vis, int block, con
     if (j < n_vis && keep[j / block] == 0) score[j] = -INFINITY;
 }
 
+// the prompt path's candidate blocks over a group of rows (row t = position p0 + t sees (p0 + t + 1) / ratio
+// compressed rows; rows that see cand_min or fewer are left alone): a launch a group instead of three or four a row
+__global__ void block_max_batch_kernel(const float* __restrict__ score, int ld, int ratio, int p0, int cand_min,
+                                       int block, float* __restrict__ bscore, int bld) {
+    const int t = blockIdx.y, n_vis = (p0 + t + 1) / ratio;
+    if (n_vis <= cand_min) return;
+    const int B = (n_vis + block - 1) / block, c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= B) return;
+    const float* sc = score + (size_t) t * ld;
+    float m = -INFINITY;
+    const int j1 = min(n_vis, (c + 1) * block);
+    for (int j = c * block; j < j1; ++j) m = fmaxf(m, sc[j]);
+    bscore[(size_t) t * bld + c] = c == (n_vis - 1) / block ? INFINITY : m;
+}
+__global__ void __launch_bounds__(1024) block_select_batch_kernel(const float* __restrict__ bscore, int bld, int ratio,
+                                                                  int p0, int cand_min, int block, int top_blocks,
+                                                                  int* __restrict__ bsel, int* __restrict__ sel,
+                                                                  int sel_ld, int keep_off) {
+    const int t = blockIdx.x, n_vis = (p0 + t + 1) / ratio;
+    if (n_vis <= cand_min) return;   // (the whole block: t is the block's)
+    const int B = (n_vis + block - 1) / block, top = min(min(top_blocks, B), strata::kernels::dsa::kMaxTop);
+    unsigned char* keep = reinterpret_cast<unsigned char*>(sel + (size_t) t * sel_ld + keep_off);
+    for (int i = threadIdx.x; i < B; i += blockDim.x) keep[i] = 0;
+    int* bs = bsel + (size_t) t * top_blocks;
+    strata::kernels::dsa::select_top_pools(bscore + (size_t) t * bld, B, top, 1, bs);
+    __syncthreads();   // (the zeroed keep and bs, before the selected blocks are set)
+    for (int i = threadIdx.x; i < top; i += blockDim.x) {
+        const int c = bs[i];
+        if (c >= 0 && c < B) keep[c] = 1;
+    }
+}
+__global__ void mask_batch_kernel(float* __restrict__ score, int ld, int ratio, int p0, int cand_min, int block,
+                                  const int* __restrict__ sel, int sel_ld, int keep_off) {
+    const int t = blockIdx.y, n_vis = (p0 + t + 1) / ratio, j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n_vis <= cand_min || j >= n_vis) return;
+    const unsigned char* keep = reinterpret_cast<const unsigned char*>(sel + (size_t) t * sel_ld + keep_off);
+    if (keep[j / block] == 0) score[(size_t) t * ld + j] = -INFINITY;
+}
+
 // ---------------------------------------------------------------- Engram's gate and add
 __global__ void __launch_bounds__(512) engram_kernel(float* __restrict__ R, const float* __restrict__ kv,
                                                      const float* __restrict__ qn, const float* __restrict__ kn,
@@ -347,6 +386,28 @@ void candidate_mask(float* score, int n_vis, int block, const unsigned char* kee
     if (n_vis <= 0) return;
     mask_kernel<<<(n_vis + 255) / 256, 256, 0, s>>>(score, n_vis, block, keep);
     check("candidate_mask");
+}
+
+void candidates_batch(const float* score, int ld, int ratio, int p0, int T, int cand_min, int block, int top_blocks,
+                      float* bscore, int bld, int* bsel, int* sel, int sel_ld, int keep_off, cudaStream_t s) {
+    const int n_max = (p0 + T) / ratio;
+    if (T <= 0 || n_max <= cand_min) return;
+    const int B = (n_max + block - 1) / block;
+    block_max_batch_kernel<<<dim3((unsigned) ((B + 255) / 256), (unsigned) T), 256, 0, s>>>(score, ld, ratio, p0,
+                                                                                          cand_min, block, bscore, bld);
+    block_select_batch_kernel<<<T, 1024, 0, s>>>(bscore, bld, ratio, p0, cand_min, block, top_blocks, bsel, sel, sel_ld,
+                                                 keep_off);
+    check("candidates_batch");
+}
+
+void candidate_mask_batch(float* score, int ld, int ratio, int p0, int T, int cand_min, int block, const int* sel,
+                          int sel_ld, int keep_off, cudaStream_t s) {
+    const int n_max = (p0 + T) / ratio;
+    if (T <= 0 || n_max <= cand_min) return;
+    mask_batch_kernel<<<dim3((unsigned) ((n_max + 255) / 256), (unsigned) T), 256, 0, s>>>(score, ld, ratio, p0,
+                                                                                         cand_min, block, sel, sel_ld,
+                                                                                         keep_off);
+    check("candidate_mask_batch");
 }
 
 // the token's Engram rows of one table, once the host's reader has landed them in pinned memory (*flag == want):

@@ -7,6 +7,28 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.63 - 2026-10-26
+
+**DeepSeek V4.1 long prompts: the indexer on WMMA and the candidate blocks batched; a score-buffer overrun fixed.**
+
+- DeepSeek V4.1 prompts, AMD (gfx11 / gfx12): the indexer's 32 heads score on the WMMA kernel deepseek4's 64 used
+  (40K prompt: 3.4 -> 1.9 s of GPU time). `STRATA_DS4_IDX=1` goes back to the plain kernel.
+- DeepSeek V4.1 prompts: the candidate blocks of the rows that see more than 16K compressed rows (layer 20 on) take a
+  launch per group of rows instead of three or four per row (a 60K prompt has ~44K such rows a layer); their scratch
+  comes out of the score buffer. `STRATA_GLM_V41_CAND_ROW=1` goes back to a row at a time.
+- AI PRO R9700 + iGPU, Maya-XS prompt tok/s at 32K / 60K: 1,093 / 1,028 -> 1,119 / 1,214 (Project Maya v1.1.28: 948 /
+  1,235). UD-IQ2_XXS 60K stays ~880: 25 s of its 67 s are SSD waits, which faster compute does not shorten. One 65,536-
+  token chunk instead of two of 32,768 is slower (it borrows 15.6 GB of the expert pool: 60K 764). KL of 255 tokens
+  after 40K against the token-at-a-time attention: 0.0043 (0.0055 / 0.0059 with either change off - the run-to-run
+  band); DeepSeek V4's prompt path 0.0032 against its token path.
+- Fix (from v1.3.60): a V4.1 sub-batch of 1-3 tokens past a quarter of the context wrote its indexer scores past the
+  score buffer (a ratio-1 row sees the whole context, the buffer held a quarter of it a token); the buffer now holds
+  at least 6 rows. It landed in unused prompt-path memory here; a 40,961-token prompt now runs clean.
+- tools/test_maya_hip.py / test_maya_models.py: under a system Python `main()` re-ran itself through ./abyss.sh with
+  the test's arguments - a real `--bench` that overwrote abyss-bench.txt. The tests now set MAYA_SH.
+- Not yet run on an RTX 5090 (the CUDA build compiles; the CUDA side changes only the candidate batching and the
+  buffer size).
+
 ## v1.3.62 - 2026-10-26
 
 **`--bench --deep`: the share sweep no longer calls a share faster because the disk warmed up during the sweep.**

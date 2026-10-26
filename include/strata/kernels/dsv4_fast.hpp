@@ -136,8 +136,9 @@ void indexer_batch(float* iq, const uint16_t* K, const float* w, int idx_heads, 
                    float* score, int ld, int* sel, cudaStream_t s);
 
 /// indexer_batch's two halves (deepseek41 masks the scores in between): the scores of every token's visible rows,
-/// then each token's top min(top_k, visible) into sel[t * sel_ld ..].  idx_heads <= 64; the plain kernel (32 heads).
-void indexer_batch_scores(const float* iq, const uint16_t* K, const float* w, int idx_heads, int ratio, int p0, int T,
+/// then each token's top min(top_k, visible) into sel[t * sel_ld ..].  idx_heads <= 64; on HIP gfx11 / gfx12 the
+/// WMMA kernel for 32 heads (iq converted in place: the caller's last read of these rows), else the plain kernel.
+void indexer_batch_scores(float* iq, const uint16_t* K, const float* w, int idx_heads, int ratio, int p0, int T,
                           float* score, int ld, cudaStream_t s);
 void indexer_batch_select(const float* score, int ld, int ratio, int p0, int T, int top_k, int* sel, int sel_ld,
                           cudaStream_t s);

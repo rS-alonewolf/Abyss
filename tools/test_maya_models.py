@@ -1,6 +1,7 @@
 """tools/test_maya_models.py - the setup's model downloads: what a setup is offered (Project Maya's four quants, the
 24 GB recommendation, the EXL3 model on NVIDIA only) and that every download names a hash per file.  No GPU, no
 network."""
+import os
 from pathlib import Path
 import shlex
 import sys
@@ -11,6 +12,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import abyss as maya  # noqa: E402
+
+# main() under a system Python execs ./abyss.sh with the test's argv - a real start (a real --bench ran and
+# overwrote abyss-bench.txt); the CI's venv never takes that path
+os.environ["MAYA_SH"] = "1"
 
 
 class ModelChoice(unittest.TestCase):

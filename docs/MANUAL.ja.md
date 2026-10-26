@@ -549,6 +549,7 @@ swe-bench の問題ごとに +16〜32%。これらの問題では下書きの 68
 | `STRATA_GLM_V41_BATCH` | on | DeepSeek V4.1 の prompt の attention：射影（q_a、kv、圧縮器、q_b、出力の LoRA）をサブバッチまとめて行列計算し、リング・圧縮行・indexer・attention は 1 トークンずつのまま（v1.3.59。skip と合わせて AI PRO R9700 の 8K / 16K / 32K / 60K の prompt が 86 / 101 / 101 / 101 → 185 / 242 / 273 / 262 tok/s、KL は同じ設定を 2 回回したときの揺れと同じ）。`0`：1 トークンずつの attention |
 | `STRATA_GLM_V41_ATTN_TOK` | off | `1`：V4.1 の prompt の attention のリング・圧縮行・indexer・attention を 1 トークンずつに戻す（v1.3.59 の処理。比較用）。off：サブバッチまとめて計算（v1.3.60。下の Engram の行列計算と合わせて、AI PRO R9700 + iGPU で UD-IQ2_XXS の 8K / 16K / 32K / 60K の prompt が 237 / 292 / 314 / 277 → 363 / 596 / 781 / 896 tok/s、Maya-XS は 192 / 334 / 327 / 288 → 964 / 1055 / 1093 / 1028。1 トークンずつの版との KL は 8K〜40K で 0.0038〜0.0040） |
 | `STRATA_GLM_V41_ENG_GEMM` | on | V4.1 の prompt：Engram の engram_kv を 256 トークンごとに 1 回の FP16 行列計算に（v1.3.60。トークンごとの GEMV は約 160 MB の重みを毎トークン読み直していた。32K の prompt で 20 → 3.9 秒）。`0`：1 トークンずつ |
+| `STRATA_GLM_V41_CAND_ROW` | off | `1`：V4.1 の prompt の候補ブロック（indexer で見える行が 16K を超える行）を 1 行ずつに戻す。off：行のまとまりごとに 1 回の呼び出し（v1.3.63）。HIP の gfx11 / gfx12 では V4.1 の 32 ヘッドの indexer も WMMA で計算する（`STRATA_DS4_IDX=1` で戻す。40K の prompt で GPU 時間 3.4 → 1.9 秒）。両方で AI PRO R9700 の Maya-XS の 32K / 60K の prompt が 1,093 / 1,028 → 1,119 / 1,214 tok/s（UD-IQ2_XXS の 60K は SSD が上限で変わらず） |
 | `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | 起動をまたいで残すエキスパートの使用記録。`0` で無効 |
 | `STRATA_GLM_NO_REUSE` | オフ | `1`: 会話を再利用しない |
 | `STRATA_GLM_THINK_RESERVE` | 1024 | （サーバー）思考が回答のために必ず残すトークン数 |

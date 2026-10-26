@@ -55,6 +55,15 @@ void candidates(const float* score, int n_vis, int block, int top_blocks, float*
 /// score[j] = -inf where keep[j / block] == 0, j < n_vis.
 void candidate_mask(float* score, int n_vis, int block, const unsigned char* keep, cudaStream_t s);
 
+/// The prompt path's candidates / candidate_mask over a group of T rows: row t is position p0 + t and sees
+/// (p0 + t + 1) / ratio compressed rows of its score row (score + t * ld); only rows that see more than cand_min take
+/// part.  Its keep bytes sit in its selection slot (sel + t * sel_ld, from int keep_off on); bscore (T x bld floats,
+/// bld >= the blocks of the longest row) and bsel (T x top_blocks ints) are scratch.
+void candidates_batch(const float* score, int ld, int ratio, int p0, int T, int cand_min, int block, int top_blocks,
+                      float* bscore, int bld, int* bsel, int* sel, int sel_ld, int keep_off, cudaStream_t s);
+void candidate_mask_batch(float* score, int ld, int ratio, int p0, int T, int cand_min, int block, const int* sel,
+                          int sel_ld, int keep_off, cudaStream_t s);
+
 /// Engram's add (spec 3.5) into the 4 streams of R (hc x n_embd) in place: kv = 5 x n_embd (4 keys, the value),
 /// qn / kn = [4][n_embd] norm weights; per stream h: s = rms(R_h) * qn_h . rms(key_h) * kn_h / sqrt(n_embd),
 /// g = sigmoid(sign(s) sqrt(max(|s|, 1e-6))), R_h += g * value.

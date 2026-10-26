@@ -242,7 +242,7 @@ struct Ds4Bufs {
     float *qr_raw, *qr, *kv_raw, *ckv, *csc, *ikv, *isc, *iw, *q, *iq, *o, *oa, *score;
     uint16_t *qr16, *o16, *oa16, *keys;
     int* sel;
-    int score_ld;
+    int score_ld, score_rows;
 };
 Ds4Bufs carve_ds4(Carve& c, size_t T, const Glm5Geometry& g, int max_rows) {
     Ds4Bufs b{};
@@ -264,7 +264,10 @@ Ds4Bufs carve_ds4(Carve& c, size_t T, const Glm5Geometry& g, int max_rows) {
     b.oa16 = c.take<uint16_t>(T * OL);
     b.keys = c.take<uint16_t>((T + (size_t) g.n_swa) * D);
     b.score_ld = std::max(1, max_rows);
-    b.score = c.take<float>(T * (size_t) b.score_ld);
+    // at least 6 rows: deepseek41's ratio-1 rows see up to the whole context (4 rows of max_rows), and the candidate
+    // blocks' scratch takes ~1/8 of a row and 2048 ints more - a sub-batch's last few tokens wrote past 4 x their rows
+    b.score_rows = (int) std::max<size_t>(T, 6);
+    b.score = c.take<float>((size_t) b.score_rows * b.score_ld);
     b.sel = c.take<int>(T * (size_t) g.idx_top_k);
     return b;
 }
@@ -1722,14 +1725,32 @@ bool Glm5Model::prefill_v41_mixer(int il, int64_t p0_64, int tn, int row0, const
         int* const sel0 = (int*) (S->v41_rows + (size_t) row0 * vr);
         const int sel_ld = (int) (vr / sizeof(int));
         if (r != 0 && Ly.idx_src && (p0 + tn) / r > g.idx_top_k) {
-            const size_t cap = (size_t) tn * (size_t) B.score_ld;
+            const size_t cap = (size_t) B.score_rows * (size_t) B.score_ld;
             const int cand_min = g.cand_blocks * g.cand_bs;
+            // the candidate blocks over a group (v1.3.63: a launch a group, not three or four a row - a 60K prompt
+            // took ~44K rows a layer past cand_min) take their scratch from the score buffer's end: a row costs its
+            // scores, its block maxima and its block selection.  STRATA_GLM_V41_CAND_ROW=1: a row at a time
+            static const bool cand_row = [] { const char* v = getenv("STRATA_GLM_V41_CAND_ROW"); return v && std::atoi(v) == 1; }();
+            const int maxv = std::max(1, (p0 + tn) / r);
+            const bool cand = il >= g.cand_layer && maxv > cand_min, cand_grp = cand && !cand_row;
+            const size_t per = (size_t) maxv + (cand_grp ? (size_t) (maxv + g.cand_bs - 1) / g.cand_bs + g.cand_blocks : 0);
             for (int g0 = 0; g0 < tn;) {
-                int gn = (int) std::max<size_t>(1, std::min<size_t>((size_t) (tn - g0), cap / (size_t) std::max(1, (p0 + tn) / r)));
+                int gn = (int) std::max<size_t>(1, std::min<size_t>((size_t) (tn - g0), cap / per));
                 const int ld = std::max(1, (p0 + g0 + gn) / r);
                 ds::indexer_batch_scores(B.iq + (size_t) g0 * IQ, Ly.idx_cache, B.iw + (size_t) g0 * g.idx_heads,
                                          g.idx_heads, r, p0 + g0, gn, B.score, ld, s);
-                if (il >= g.cand_layer)
+                if (cand_grp) {
+                    const int bld = (ld + g.cand_bs - 1) / g.cand_bs;
+                    float* const bscore = B.score + (size_t) gn * ld;
+                    int* const bsel = (int*) (bscore + (size_t) gn * bld);
+                    int* const sel_g = sel0 + (size_t) g0 * sel_ld;
+                    if (il == g.cand_layer)
+                        d41::candidates_batch(B.score, ld, r, p0 + g0, gn, cand_min, g.cand_bs, g.cand_blocks, bscore,
+                                              bld, bsel, sel_g, sel_ld, g.idx_top_k, s);
+                    else
+                        d41::candidate_mask_batch(B.score, ld, r, p0 + g0, gn, cand_min, g.cand_bs, sel_g, sel_ld,
+                                                  g.idx_top_k, s);
+                } else if (cand)
                     for (int t = g0; t < g0 + gn; ++t) {
                         const int n_vis = (p0 + t + 1) / r;
                         if (n_vis <= cand_min) continue;

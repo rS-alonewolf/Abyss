@@ -1009,6 +1009,8 @@ __global__ void __launch_bounds__(256) iwb_prep_kernel(float* __restrict__ iq, i
         o[128 + lane * 4 + i] = l[i];
     }
 }
+// H heads (64: deepseek4; 32: deepseek41, v1.3.63)
+template <int H>
 __global__ void __launch_bounds__(IWB2_WAVES * 32) idx_score_batch_wmma2_kernel(const float* __restrict__ iqp,
                                                                                 const uint16_t* __restrict__ K,
                                                                                 const float* __restrict__ w, int ratio,
@@ -1036,15 +1038,15 @@ __global__ void __launch_bounds__(IWB2_WAVES * 32) idx_score_batch_wmma2_kernel(
     for (int i = 0; i < tn; ++i) {
         const int t = t0 + i, n_vis = (p0 + t + 1) / ratio;
         if (wrow >= n_vis) continue;
-        const _Float16* q = reinterpret_cast<const _Float16*>(iqp + (size_t) t * 64 * 128);   // [head][hi 128 | lo 128]
-        const float* wt = w + (size_t) t * 64;
+        const _Float16* q = reinterpret_cast<const _Float16*>(iqp + (size_t) t * H * 128);   // [head][hi 128 | lo 128]
+        const float* wt = w + (size_t) t * H;
         float s[IWB2_RG][8];
 #pragma unroll
         for (int g = 0; g < IWB2_RG; ++g)
 #pragma unroll
             for (int r = 0; r < 8; ++r) s[g][r] = 0.0f;
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < H / 16; ++nt) {
             const _Float16* qh = q + (size_t) (nt * 16 + l16) * 256;
             iw_f8 d[IWB2_RG] = {};
 #pragma unroll
@@ -2012,7 +2014,7 @@ void indexer_batch(float* iq, const uint16_t* K, const float* w, int idx_heads, 
         iwb_prep_kernel<<<(unsigned) ((T * 64 + 7) / 8), 256, 0, s>>>(iq, T * 64);
         check("iwb_prep");
         const dim3 grid((unsigned) ((max_vis + IWB2_ROWS - 1) / IWB2_ROWS), (unsigned) ((T + IWB2_TT - 1) / IWB2_TT));
-        idx_score_batch_wmma2_kernel<<<grid, IWB2_WAVES * 32, 0, s>>>(iq, K, w, ratio, p0, T, score, ld);
+        idx_score_batch_wmma2_kernel<64><<<grid, IWB2_WAVES * 32, 0, s>>>(iq, K, w, ratio, p0, T, score, ld);
         check("idx_score_batch_wmma");
         idx_select_batch_kernel<<<T, 1024, 0, s>>>(score, ld, ratio, p0, top_k, sel, top_k);
         check("idx_select_batch");
@@ -2031,11 +2033,22 @@ void indexer_batch(float* iq, const uint16_t* K, const float* w, int idx_heads, 
     idx_select_batch_kernel<<<T, 1024, 0, s>>>(score, ld, ratio, p0, top_k, sel, top_k);
     check("idx_select_batch");
 }
-void indexer_batch_scores(const float* iq, const uint16_t* K, const float* w, int idx_heads, int ratio, int p0, int T,
+void indexer_batch_scores(float* iq, const uint16_t* K, const float* w, int idx_heads, int ratio, int p0, int T,
                           float* score, int ld, cudaStream_t s) {
     const int max_vis = (p0 + T) / ratio;
     if (T <= 0 || max_vis <= 0) return;
-    // (the WMMA / mma kernels are 64 heads: deepseek41's 32 take the plain one)
+#if defined(STRATA_USE_HIP)
+    // deepseek41's 32 heads on WMMA too (v1.3.63; iq is converted in place, as indexer_batch does: these rows' last
+    // reader).  (The CUDA mma kernel is 64 heads: the plain one below.)
+    if (idx_heads == 32 && idx_use_wmma(64)) {
+        iwb_prep_kernel<<<(unsigned) ((T * 32 + 7) / 8), 256, 0, s>>>(iq, T * 32);
+        check("iwb_prep");
+        const dim3 grid((unsigned) ((max_vis + IWB2_ROWS - 1) / IWB2_ROWS), (unsigned) ((T + IWB2_TT - 1) / IWB2_TT));
+        idx_score_batch_wmma2_kernel<32><<<grid, IWB2_WAVES * 32, 0, s>>>(iq, K, w, ratio, p0, T, score, ld);
+        check("idx_score_batch_wmma");
+        return;
+    }
+#endif
     const dim3 grid((unsigned) ((max_vis + IRT - 1) / IRT), (unsigned) ((T + IQT - 1) / IQT));
     idx_score_batch_kernel<<<grid, 256, 0, s>>>(iq, K, w, idx_heads, ratio, p0, T, score, ld);
     check("idx_score_batch");
