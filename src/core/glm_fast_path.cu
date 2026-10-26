@@ -3224,6 +3224,10 @@ void Glm5Model::fast_destroy() {
         cudaFree(dsv4_snap_);
         dsv4_snap_ = nullptr;
     }
+    if (q35_snap_h_) {
+        cudaFreeHost(q35_snap_h_);
+        q35_snap_h_ = nullptr;
+    }
     if (dsv4_state_) {
         cudaFree(dsv4_state_);
         dsv4_state_ = nullptr;
@@ -6243,7 +6247,14 @@ void Glm5Model::snap_pool_copy(bool restore) {
 }
 
 bool Glm5Model::snapshot_save() {
-    if (g_.qwen35()) return false;   // (no conversation snapshots yet: the prompt runs again)
+    if (g_.qwen35()) {   // (no layer splits for qwen35moe)
+        if (split_next_ != nullptr || !q35_snap_copy(false)) {
+            snap_pos_ = -1;
+            return false;
+        }
+        snap_pos_ = pos_;
+        return true;
+    }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr) return false;
         const Glm5Geometry& g = m->g_;
@@ -6286,6 +6297,12 @@ bool Glm5Model::snapshot_save() {
 }
 
 bool Glm5Model::snapshot_restore() {
+    if (g_.qwen35()) {
+        if (split_next_ != nullptr || snap_pos_ < 0 || !q35_snap_copy(true)) return false;
+        pos_ = snap_pos_;
+        dspark_reset();
+        return true;
+    }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ == nullptr || m->snap_pos_ < 0) return false;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {

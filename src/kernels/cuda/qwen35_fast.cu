@@ -6,6 +6,8 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <algorithm>
 
 namespace strata::kernels::q35 {
 namespace {
@@ -13,6 +15,7 @@ namespace {
 constexpr int kD = 256;       // head_dim
 constexpr int kChunk = 256;   // attention positions a block
 constexpr int kWarps = 4;     // ... its warps
+constexpr int kMinChunks = 130;   // the chunks a row and head attn_split's scratch always holds
 
 __device__ __forceinline__ float sigmoid_f(float x) { return 1.0f / (1.0f + expf(-x)); }
 __device__ __forceinline__ float softplus_f(float x) { return x > 20.0f ? x : log1pf(expf(x)); }   // (ggml's)
@@ -516,6 +519,151 @@ __global__ void __launch_bounds__(256) attn_window_kernel(const float* __restric
         }
     }
 }
+// the decode / verify-window attention over one chunk of keys, its partials into part [row][head][chunk] for
+// attn_merge_kernel: a block takes RB rows x one KV head's group of G heads (RB * G = 8 * PW query-head pairs), a warp
+// PW pairs, a lane 8 dims of each pair's q.  The keys go 8 at a time: a lane's 8 partial dots are summed over the warp
+// in one transposed butterfly (9 shuffles for 8 keys, not 5 a key), and the softmax runs per tile of 32 keys (one max
+// and one rescale a tile, not one a key); the tile's probabilities pass through shared memory to the P.V sums.
+// grid (ceil(T / RB), n_head_kv, n_chunks)
+template <int PW>
+__global__ void __launch_bounds__(256) attn_split_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kc,
+                                                         const uint16_t* __restrict__ vc, int n_head, int n_head_kv,
+                                                         int64_t p0, int T, float scale, float* __restrict__ part,
+                                                         int n_chunks, int chunk) {
+    __shared__ __align__(16) float sp[8][PW][32];
+    __shared__ __align__(16) uint4 sk[32][kD / 8], sv[32][kD / 8];   // the tile's K / V rows (one KV head), FP16
+    const int g = blockIdx.y, c = blockIdx.z, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int G = n_head / n_head_kv, RB = 8 * PW / G, r0 = blockIdx.x * RB, nr = min(RB, T - r0);
+    float qr[PW][8], acc[PW][8], m[PW], l[PW];
+    int64_t lim[PW];   // a pair's last key (its row's position); -1: no pair
+#pragma unroll
+    for (int j = 0; j < PW; ++j) {
+        const int pi = warp * PW + j, r = pi / G, h = g * G + pi % G;
+        const bool ok = r < nr;
+        lim[j] = ok ? p0 + r0 + r : -1;
+        const float* qp = q + ((size_t) (r0 + (ok ? r : 0)) * n_head + h) * kD + lane * 8;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            qr[j][e] = ok ? qp[e] * scale : 0.0f;
+            acc[j][e] = 0.0f;
+        }
+        m[j] = -INFINITY;
+        l[j] = 0.0f;
+    }
+    // the key a lane holds after the butterfly: lane bits 4, 3, 2 (bits 1, 0 hold copies)
+    const int kk = ((lane >> 4) & 1) * 4 + ((lane >> 3) & 1) * 2 + ((lane >> 2) & 1);
+    const int64_t k0 = (int64_t) c * chunk, k1 = min(k0 + chunk, p0 + r0 + nr);
+    for (int64_t kt = k0; kt < k1; kt += 32) {
+        const int nk = (int) min((int64_t) 32, k1 - kt);
+#pragma unroll
+        for (int it = 0; it < 4; ++it) {   // 32 rows x 32 uint4 each for K and V, 256 threads
+            const int idx = it * 256 + threadIdx.x, row = idx >> 5, col = idx & 31;
+            const uint4 z = make_uint4(0, 0, 0, 0);
+            const size_t off = ((size_t) (kt + row) * n_head_kv + g) * kD + col * 8;
+            sk[row][col] = row < nk ? *reinterpret_cast<const uint4*>(kc + off) : z;
+            sv[row][col] = row < nk ? *reinterpret_cast<const uint4*>(vc + off) : z;
+        }
+        __syncthreads();
+        float sc[PW][4];
+#pragma unroll
+        for (int sub = 0; sub < 4; ++sub) {
+            float v[PW][8];
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                float kf[8];
+                unpack8(sk[sub * 8 + i][lane], kf);
+#pragma unroll
+                for (int j = 0; j < PW; ++j) {
+                    float d = 0.0f;
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) d += qr[j][e] * kf[e];
+                    v[j][i] = d;
+                }
+            }
+            // butterfly: 8 values over 32 lanes -> lane holds key kk's sum
+            const bool b4 = lane & 16, b3 = lane & 8, b2 = lane & 4;
+#pragma unroll
+            for (int j = 0; j < PW; ++j) {
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float send = b4 ? v[j][i] : v[j][i + 4], keep = b4 ? v[j][i + 4] : v[j][i];
+                    v[j][i] = keep + __shfl_xor_sync(0xffffffffu, send, 16);
+                }
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const float send = b3 ? v[j][i] : v[j][i + 2], keep = b3 ? v[j][i + 2] : v[j][i];
+                    v[j][i] = keep + __shfl_xor_sync(0xffffffffu, send, 8);
+                }
+                {
+                    const float send = b2 ? v[j][0] : v[j][1], keep = b2 ? v[j][1] : v[j][0];
+                    v[j][0] = keep + __shfl_xor_sync(0xffffffffu, send, 4);
+                }
+                float t = v[j][0];
+                t += __shfl_xor_sync(0xffffffffu, t, 2);
+                t += __shfl_xor_sync(0xffffffffu, t, 1);
+                const int64_t kp = kt + sub * 8 + kk;
+                sc[j][sub] = (kp < k1 && kp <= lim[j]) ? t : -INFINITY;
+            }
+        }
+        // the tile's softmax, a pair at a time (the 8 key-lanes of a quad-group hold distinct keys: reduce over bits 4..2)
+#pragma unroll
+        for (int j = 0; j < PW; ++j) {
+            float mx = fmaxf(fmaxf(sc[j][0], sc[j][1]), fmaxf(sc[j][2], sc[j][3]));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 16));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 8));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 4));
+            const float mn = fmaxf(m[j], mx);
+            float ps = 0.0f, pr[4];
+#pragma unroll
+            for (int sub = 0; sub < 4; ++sub) {
+                pr[sub] = mn == -INFINITY ? 0.0f : expf(sc[j][sub] - mn);
+                ps += pr[sub];
+            }
+            ps += __shfl_xor_sync(0xffffffffu, ps, 16);
+            ps += __shfl_xor_sync(0xffffffffu, ps, 8);
+            ps += __shfl_xor_sync(0xffffffffu, ps, 4);
+            const float corr = m[j] == -INFINITY ? 0.0f : expf(m[j] - mn);
+            l[j] = l[j] * corr + ps;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc[j][e] *= corr;
+            m[j] = mn;
+            if ((lane & 3) == 0) {
+#pragma unroll
+                for (int sub = 0; sub < 4; ++sub) sp[warp][j][sub * 8 + kk] = pr[sub];
+            }
+        }
+        __syncthreads();
+        for (int i4 = 0; i4 < nk; i4 += 4) {
+            float vf[4][8];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                unpack8(sv[i4 + i][lane], vf[i]);
+            }
+#pragma unroll
+            for (int j = 0; j < PW; ++j) {
+                const float4 p4 = *reinterpret_cast<const float4*>(&sp[warp][j][i4]);
+                const float pv[4] = {p4.x, p4.y, p4.z, p4.w};
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) acc[j][e] += pv[i] * vf[i][e];
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < PW; ++j) {
+        if (lim[j] < 0) continue;
+        const int pi = warp * PW + j, r = pi / G, h = g * G + pi % G;
+        float* op = part + (((size_t) (r0 + r) * n_head + h) * n_chunks + c) * (kD + 2);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) op[lane * 8 + e] = acc[j][e];
+        if (lane == 0) {
+            op[kD] = m[j];
+            op[kD + 1] = l[j];
+        }
+    }
+}
 __global__ void attn_gate_rows_kernel(float* __restrict__ o, const float* __restrict__ qf, int n_head) {
     const int h = blockIdx.x, t = blockIdx.y, d = threadIdx.x;
     o[((size_t) t * n_head + h) * kD + d] *= sigmoid_f(qf[((size_t) t * n_head + h) * 2 * kD + kD + d]);
@@ -584,14 +732,46 @@ void attn_prep(const float* q_full, const float* k, const float* v, const float*
                                                        rope_base, p, kc, vc, q);
     check("attn_prep");
 }
+// attn_split_kernel over the keys < p0 + T for T rows; part holds at least kMinChunks chunks a row and head.
+// false: a shape it does not take (the caller runs its old kernel)
+static bool attn_split(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int64_t p0,
+                       int T, float scale, float* part, float* out, cudaStream_t s) {
+    static const int mode = [] { const char* v = getenv("STRATA_Q35_ATTN"); return v ? std::atoi(v) : 0; }();
+    static const int chunk_env = [] { const char* v = getenv("STRATA_Q35_ATTN_CHUNK"); return v ? std::atoi(v) : 0; }();
+    const int G = n_head_kv > 0 ? n_head / n_head_kv : 0;
+    if (mode == 1 || G * n_head_kv != n_head || G % 8 != 0 || G > 64) return false;
+    static const int pw_max = [] { const char* v = getenv("STRATA_Q35_ATTN_PW"); return v ? std::atoi(v) : 2; }();
+    const int RB = std::max(1, std::min(T, pw_max * 8 / G)), PW = RB * G / 8;
+    const int64_t n_keys = p0 + T;
+    static const int chunk_min = [] { const char* v = getenv("STRATA_Q35_ATTN_CHUNK_MIN"); return v ? std::max(32, std::atoi(v)) : 64; }();
+    // ~128 chunks a KV group (part holds kMinChunks), at least chunk_min keys each (short contexts: more blocks), a
+    // multiple of 32
+    const int64_t fit = (n_keys + kMinChunks - 2) / (kMinChunks - 1);   // the smallest chunk that fits part
+    int chunk = chunk_env >= 32 ? chunk_env : (int) std::max<int64_t>(chunk_min, n_keys / 128);
+    chunk = (int) (std::max<int64_t>(chunk, fit) + 31) / 32 * 32;
+    const int n_chunks = (int) ((n_keys + chunk - 1) / chunk);
+    const dim3 grid((unsigned) ((T + RB - 1) / RB), (unsigned) n_head_kv, (unsigned) n_chunks);
+    switch (PW) {
+#define Q35_SPLIT(n) case n: attn_split_kernel<n><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, n_chunks, chunk); break;
+        Q35_SPLIT(1) Q35_SPLIT(2) Q35_SPLIT(3) Q35_SPLIT(4) Q35_SPLIT(5) Q35_SPLIT(6) Q35_SPLIT(7) Q35_SPLIT(8)
+#undef Q35_SPLIT
+        default: return false;
+    }
+    attn_merge_kernel<<<dim3((unsigned) n_head, (unsigned) T), kD, 0, s>>>(part, n_chunks, out);
+    return true;
+}
 size_t attn_part_floats(int n_head, int head_dim, int max_ctx) {
-    const size_t chunks = ((size_t) max_ctx + kChunk - 1) / kChunk + 1;
+    const size_t chunks = std::max<size_t>(((size_t) max_ctx + kChunk - 1) / kChunk + 1, kMinChunks);
     return (size_t) n_head * chunks * ((size_t) head_dim + 2);
 }
 void attn_decode(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
                  int n_pos, float scale, float* part, float* out, cudaStream_t s) {
     if (head_dim != kD || n_pos <= 0 || n_head % n_head_kv != 0) {
         std::fprintf(stderr, "qwen35 attn_decode: head_dim %d, n_pos %d, heads %d / %d\n", head_dim, n_pos, n_head, n_head_kv);
+        return;
+    }
+    if (attn_split(q, kc, vc, n_head, n_head_kv, n_pos - 1, 1, scale, part, out, s)) {
+        check("attn_decode");
         return;
     }
     const int n_chunks = (n_pos + kChunk - 1) / kChunk;
@@ -710,7 +890,7 @@ void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
     check("attn_prompt");
 }
 size_t attn_window_floats(int n_head, int head_dim, int max_ctx, int max_rows) {
-    const size_t chunks = ((size_t) max_ctx + kWinChunk - 1) / kWinChunk + 1;
+    const size_t chunks = std::max<size_t>(((size_t) max_ctx + kWinChunk - 1) / kWinChunk + 1, kMinChunks);
     return (size_t) max_rows * n_head * chunks * ((size_t) head_dim + 2);
 }
 void attn_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
@@ -720,6 +900,10 @@ void attn_window(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
     if (head_dim != kD || G * n_head_kv != n_head || (G != 8 && G != 16 && G != 32)) {
         std::fprintf(stderr, "qwen35 attn_window: head_dim %d, heads %d / %d (a group of 8, 16 or 32)\n", head_dim,
                      n_head, n_head_kv);
+        return;
+    }
+    if (attn_split(q, kc, vc, n_head, n_head_kv, p0, T, scale, part, out, s)) {
+        check("attn_window");
         return;
     }
     const int n_chunks = (int) ((p0 + T + kWinChunk - 1) / kWinChunk);

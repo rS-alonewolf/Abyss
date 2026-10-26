@@ -172,6 +172,47 @@ void Glm5Model::qwen35_reset() {
     cudaStreamSynchronize(F->cs);
 }
 
+bool Glm5Model::q35_snap_copy(bool restore) {
+    FastState* F = fast_;
+    if (F == nullptr || qwen35_state_ == nullptr) return false;
+    const Glm5Geometry& g = g_;
+    const size_t S = (size_t) g.ssm_state, HV = (size_t) g.ssm_v_heads, C = (size_t) g.ssm_conv_dim();
+    const size_t state_b = S * HV * S * 4, conv_b = C * (size_t) (g.d_conv - 1) * 4;
+    const size_t pend_b = F->q35_pend_h != nullptr ? (size_t) g.n_embd * 4 : 0;
+    size_t total = pend_b;
+    for (int il = l0_; il < l1_; ++il)
+        if (F->L[(size_t) il].recr) total += state_b + conv_b;
+    if (q35_snap_h_ == nullptr) {
+        if (restore) return false;
+        if (cudaHostAlloc(&q35_snap_h_, total, cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            q35_snap_h_ = nullptr;
+            return false;
+        }
+    }
+    uint8_t* at = (uint8_t*) q35_snap_h_;
+    const auto run = [&](void* d, size_t b) {
+        cudaMemcpyAsync(restore ? d : at, restore ? at : d, b, restore ? cudaMemcpyHostToDevice : cudaMemcpyDeviceToHost,
+                        F->cs);
+        at += b;
+    };
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        if (!Ly.recr) continue;
+        run(Ly.gdn_state, state_b);
+        run(Ly.gdn_conv, conv_b);
+    }
+    if (pend_b > 0) run(F->q35_pend_h, pend_b);
+    if (restore) {
+        q35_pend_pos_ = q35_snap_pend_;
+        q35_row_done_ = q35_snap_done_;
+    } else {
+        q35_snap_pend_ = q35_pend_pos_;
+        q35_snap_done_ = q35_row_done_;
+    }
+    return cudaStreamSynchronize(F->cs) == cudaSuccess;
+}
+
 // ---------------------------------------------------------------- the NextN block as the drafter
 // The block (llama.cpp's graph_mtp): h = the trunk's output_norm'd hidden at a position, e = the NEXT token's
 // embedding -> eh_proj([enorm(e) | hnorm(h)]) -> an attention layer (its own KV cache, a row a position) -> the MoE ->

@@ -87,6 +87,8 @@ systemd-run --user --scope -p MemoryMax=88G .venv/bin/python serve/server.py --e
 | with the NextN block's drafts (`STRATA_GLM_MTP_GGUF`, below): code / prose / the copy task | 16.9 (59 tok/s) / 20.0 (50) / 11.8 (85) |
 | ... the CPU computing the lane (no iGPU): code / prose | 24.0 (42 tok/s) / 25.5 (39), from 28.0 / 30.3 |
 | a 575-token prompt through the batched path (chunks up to 32768, sub-batches of 1024) | 359 tok/s |
+| decode after a 57.6K / 115K-token prompt (IQ3_XXS-B, 16 GB of VRAM, no lane, NextN; v1.3.65) | 37.9 / 34.0 tok/s, from 30.5-31.5 / 23.7-24.6 |
+| a repeated ~5.5K-token prompt / its next turn (conversation reuse, v1.3.65) | 8.1 -> 1.4 s / 8.0 -> 1.8 s |
 | KL against llama.cpp (its CPU backend), 559 positions of a 576-token text | 0.024 |
 | ... the same text, the first half through the prompt path, the 287 positions after it | 0.026 |
 
@@ -132,7 +134,10 @@ NVIDIA: the CUDA build compiles; it has not been run yet.
 
 ## Not yet
 
-- Conversation slots (snapshots); a layer split; images.
+- Conversation slots on disk (`STRATA_GLM_SLOTS`; the live reuse of the last conversation works from v1.3.65); a
+  layer split; images.
+- The prompt's attention (`attn_prompt`) still walks every key per 4 queries on the plain FP32 kernel: at 115K tokens
+  it is a large part of the ~690 s the prompt takes.
 - The lane's expert kernels are tuned for DeepSeek's and GLM's shapes - Ornith's 3072 x 1024 experts take the
   generic ones. The recurrence kernel runs far below the memory bound. Both are the next speed-ups.
 

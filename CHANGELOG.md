@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.65 - 2026-10-26
+
+**Ornith (Qwen3.5-MoE): long-context decode ~40% faster at 115K tokens, and the conversation is reused.**
+
+- The decode and verify-window attention runs on a new split kernel: a block takes a chunk of keys for one KV head
+  and its rows' heads, a lane's 8 partial dots of 8 keys are summed in one shuffle tree (9 shuffles for 8 keys, not
+  5 a key), the softmax runs once a 32-key tile, and the tile's K / V go through shared memory once for the block's 8
+  warps. AI PRO R9700, a layer at 115K positions: a token 1.09 -> 0.57 ms, a 3-row window 3.29 -> 1.39 (12 attention
+  layers a token); at short contexts a window 0.15 -> 0.02 ms. IQ3_XXS-B on 16 GB of VRAM with no lane, decode after a
+  57.6K / 115K-token prompt: 30.5-31.5 / 23.7-24.6 -> 37.9 / 34.0 tok/s (prompts unchanged: their attention is the
+  prompt kernel). Short answers unchanged (UD-Q4_K_XL `--bench` 57.1 -> 58.3 / 58.8 tok/s); the quality check KL
+  0.0049 (a reorder of the sums alone gives 0.0060: the activations' q8_1 rounding turns any reorder into this).
+  `STRATA_Q35_ATTN=1` goes back to the old kernels.
+- Conversation reuse: a request that repeats or continues the last one restores the delta-net layers' states and conv
+  rows and the NextN drafter's pending row (kept in pinned RAM, ~150 MB, not VRAM) instead of reading the prompt again.
+  A ~5.5K-token prompt asked again: 8.1 -> 1.4 s; its next turn 8.0 -> 1.8 s. Conversation slots on disk stay off
+  for this model.
+- Not yet run on an RTX 5090 (the CUDA build compiles).
+
 ## v1.3.64 - 2026-10-26
 
 **AMD runs: the dashboard, the report and the stall watchdog read the AMD card, not an NVIDIA card beside it (issue #14).**

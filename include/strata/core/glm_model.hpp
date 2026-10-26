@@ -428,8 +428,8 @@ public:
     // STRATA_GLM_ABL: rows of a layer's attention (which 0) or shared-expert (1) output, ld floats apart, minus their
     // refusal-direction part (a no-op without the file, past its layers or at a zero strength)
     void abl_apply(int il, int which, float* x, int rows, int ld, cudaStream_t s);
-    // ---- qwen35moe (src/core/qwen35_fast_path.cu): the token path (its prompt goes through it a token at a time:
-    // no prompt path, no snapshots, no verify windows or layer splits yet)
+    // ---- qwen35moe (src/core/qwen35_fast_path.cu): the token path (the prompt path, the verify windows and the
+    // conversation snapshot are elsewhere; no layer splits yet)
     void* qwen35_state_ = nullptr;                         // the GDN states, conv states, KV caches and activations
     void qwen35_bind(int il, std::string& missing);        // fast_setup's layer loop: this layer's weights
     bool qwen35_alloc(std::string& err);
@@ -480,6 +480,12 @@ public:
     bool q35_mtp_step(int64_t p, const int* tok_dev, const float* h, float* conf_out, int* tok_out, std::string& err);
     bool q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
     int64_t q35_pend_pos_ = -1, q35_row_done_ = -1;
+    // the conversation snapshot's qwen35moe state (pinned host memory, not VRAM): each delta-net layer's state and conv
+    // rows, the drafter's pending hidden and its two positions - the KV caches are written a row a position, so the
+    // position alone restores them
+    void* q35_snap_h_ = nullptr;
+    int64_t q35_snap_pend_ = -1, q35_snap_done_ = -1;
+    bool q35_snap_copy(bool restore);
     const Glm5Model* verify_tail() const;
     // the conversation snapshot's deepseek4 state: every layer's window ring and compressor rings (the compressed
     // caches are append-only by position - a row is written exactly when it becomes visible - so the position alone
