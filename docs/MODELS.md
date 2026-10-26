@@ -71,7 +71,9 @@ V4.1 overlays and the run-time edit (UD-IQ1_S, R9700 + lane, v1.3.52):
 
 V4.1 lossy settings (KL on nazeshinjite Q2, 8 sequences): `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1` 0.229 ->
 0.240-0.241 (5090: 17.7 -> ~28-29 tok/s); `=4` 0.235. `STRATA_GLM_ROUTE_AFFINITY_RAM=0.08` 0.2406 -> 0.2438 (-8-12% a
-token). `STRATA_GLM_DEFER=1` 0.15 -> 0.28 on one sequence (left off).
+token). `STRATA_GLM_DEFER=1` 0.15 -> 0.28 on one sequence (left off). UD-IQ2_XXS on the R9700 + lane (NM790, 4
+sequences, 2026-10-27): exact routing 48.5-53.4 ms a token (~19 tok/s, ~20 ms of it SSD waits), `TAIL_SKIP=4` +
+`_DISK=1` 39.8 ms (25.1 tok/s) for KL +0.007, `=3` 38.6 ms for +0.020 - `=4` is the pick there.
 
 V4.1 DSpark drafter (Lucebox's `deepseek41-dflash-draft`, DSpark-draft-Q2K-Q4K, 4.92 GB, ~1.67 GB of VRAM, opt-in,
 v1.3.53): the answers do not change. On the R9700 with the NM790, swe 8 tasks +16-19% (UD-IQ1_S: 40.0 ->

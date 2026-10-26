@@ -1551,8 +1551,10 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->disk_adapt = F->disk_lane && da != nullptr && std::atoi(da) != 0;
         const char* sf = getenv("STRATA_GLM_STREAM_FETCH");
         F->stream_fetch = sf == nullptr || std::atoi(sf) != 0;
+        // at most 10: a streamed expert's ready word has a bit per part and chunk (3 x 10 = 30 of 32; 16 set bits
+        // past 31 - the device copied chunks that had not landed, and the routes read garbage)
         const char* rc = getenv("STRATA_GLM_READ_CHUNKS");
-        F->read_chunks = std::max(1, std::min(16, rc ? std::atoi(rc) : 8));
+        F->read_chunks = std::max(1, std::min(10, rc ? std::atoi(rc) : 8));
         std::array<std::array<short, 8>, gf::kAhead> none;
         for (auto& r : none) r.fill(-1);
         F->ah_pred.assign((size_t) NL, none);

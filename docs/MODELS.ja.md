@@ -71,6 +71,7 @@ V4.1 のオーバーレイと実行時の書き換え（UD-IQ1_S、R9700 + レ�
 V4.1 の lossy な設定（KL は nazeshinjite Q2、8 系列）: `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1` は 0.229 → 0.240〜0.241
 （5090 で 17.7 → 約 28〜29 tok/s）。`=4` は 0.235。`STRATA_GLM_ROUTE_AFFINITY_RAM=0.08` は 0.2406 → 0.2438（-8〜12% / トークン）。
 `STRATA_GLM_DEFER=1` は 1 系列で 0.15 → 0.28（不採用）。
+R9700 + レーンの UD-IQ2_XXS（NM790、4 系列、2026-10-27）: 省略なしで 1 トークン 48.5〜53.4 ms（約 19 tok/s。うち約 20 ms が SSD 待ち）、`TAIL_SKIP=4` + `_DISK=1` で 39.8 ms（25.1 tok/s）、KL +0.007。`=3` は 38.6 ms、+0.020 で、ここでは `=4` を選ぶ。
 
 V4.1 の DSpark ドラフトモデル（Lucebox の `deepseek41-dflash-draft`、DSpark-draft-Q2K-Q4K、4.92 GB、VRAM 約 1.67 GB、opt-in、v1.3.53）:
 答えは変わらない。NM790 の R9700 で swe 8 問 +16〜19%（UD-IQ1_S: 40.0 → 47.5、2026-10-24）。ORICO クラスの SSD では効果なし（2026-10-23）。

@@ -63,7 +63,7 @@ Gen5 x16 | RAM 94 GB | SSD 4.9 GB/s | decode 56.4 tok/s | prompt 8k 960 tok/s | 
 
 | 判定 | 規則 | 速くする方法 |
 |---|---|---|
-| **ssd** | SSD の待ちが 1 トークンの 25% 以上 | GPU + RAM に収まる小さい量子化、RAM の層を増やす（`STRATA_GLM_RAM_GB`）、速い SSD |
+| **ssd** | SSD の待ちが 1 トークンの 25% 以上 | GPU + RAM に収まる小さい量子化、RAM の層を増やす（`STRATA_GLM_RAM_GB`）、速い SSD。答えが少し変わってよければ、SSD の tail skip（`STRATA_GLM_TAIL_SKIP=4` + `STRATA_GLM_TAIL_SKIP_DISK=1`。R9700 の DeepSeek V4.1 UD-IQ2_XXS で +34%、KL +0.007） |
 | **cpu** | レーンの稼働が 1 トークンの 80% 以上 | `./abyss.sh --calibrate`（レーンの分担とスレッド数。AMD では振り分けで一番速かった分担率を `STRATA_GLM_PCIE_SHARE` に）、CPU の電源モード、Radeon APU なら iGPU レーン |
 | **pcie** | 1 トークンで 10 個以上のエキスパートを PCIe で送っている | もっと良いスロット（Gen4 x16 は x4 / OCuLink の 4 倍運べる）、`--calibrate`（AMD では `STRATA_GLM_PCIE_SHARE`） |
 | **gpu** | 上のどれでもない（または `--deep` でドラフトモデルなしのとき、GPU の稼働率が 85% 以上） | `./abyss.sh --gpu-tune` と報告。この GPU 用のカーネルに改善の余地があるかもしれない |

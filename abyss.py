@@ -2461,7 +2461,9 @@ def _mean(xs) -> float:
 # what each bottleneck means and what moves it - the bench's verdict, and docs/BENCH(.ja).md's table
 BENCH_ADVICE = {
     "ssd": ("the SSD: the experts that fit neither in GPU memory nor in the RAM tier are read from disk every token",
-            "a smaller quant that fits GPU + RAM, more RAM for the RAM tier (STRATA_GLM_RAM_GB), a faster SSD"),
+            "a smaller quant that fits GPU + RAM, more RAM for the RAM tier (STRATA_GLM_RAM_GB), a faster SSD; or, "
+            "changing the answers a little, the disk tail skip (STRATA_GLM_TAIL_SKIP=4 and STRATA_GLM_TAIL_SKIP_DISK=1 "
+            "in the config's \"env\": DeepSeek V4.1 UD-IQ2_XXS on an R9700 +34%, KL +0.007)"),
     "cpu": ("the CPU / iGPU lane: the experts it computes take as long as the GPU's whole token",
             f"{ME} --calibrate (the lane's share and threads), the CPU's power mode; on a PC with a Radeon iGPU the "
             "iGPU lane"),

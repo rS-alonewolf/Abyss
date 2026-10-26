@@ -69,7 +69,7 @@ The benchmark names the likely bottleneck from those counters (rules of thumb, c
 
 | verdict | rule | what moves it |
 |---|---|---|
-| **ssd** | SSD waits >= 25% of a token | a smaller quant that fits GPU + RAM, more RAM for the RAM tier (`STRATA_GLM_RAM_GB`), a faster SSD |
+| **ssd** | SSD waits >= 25% of a token | a smaller quant that fits GPU + RAM, more RAM for the RAM tier (`STRATA_GLM_RAM_GB`), a faster SSD; or, changing the answers a little, the disk tail skip (`STRATA_GLM_TAIL_SKIP=4` + `STRATA_GLM_TAIL_SKIP_DISK=1`: DeepSeek V4.1 UD-IQ2_XXS on an R9700 +34%, KL +0.007) |
 | **cpu** | the lane busy >= 80% of a token | `./abyss.sh --calibrate` (the lane's share and threads; AMD: the sweep's best share as `STRATA_GLM_PCIE_SHARE`), the CPU's power mode, the iGPU lane on a Radeon APU |
 | **pcie** | >= 10 experts a token copied over PCIe | a better slot (Gen4 x16 carries 4x an x4 / OCuLink link), `--calibrate` (AMD: `STRATA_GLM_PCIE_SHARE`) |
 | **gpu** | none of the above (or, with `--deep` and no drafter, the GPU busy >= 85%) | `./abyss.sh --gpu-tune`, and a report: the kernels for this GPU may have room |

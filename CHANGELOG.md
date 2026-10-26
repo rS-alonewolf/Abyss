@@ -7,6 +7,21 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.69 - 2026-10-27
+
+**DeepSeek V4.1 UD-IQ2_XXS: where its ~20 tok/s goes, the speed setting for it, and a read-chunk fix.**
+
+- `STRATA_GLM_READ_CHUNKS` above 10 broke SSD-read experts: a streamed expert's ready word has a bit per part and
+  chunk (3 x 16 = 48 of 32 bits), so the device copied chunks that had not landed and the routes read garbage
+  ("invalid expert ID"). It is capped at 10 now (default 8 unchanged; 10 was no faster on an R9700).
+- Measured on an AI PRO R9700 + 8060S lane (UD-IQ2_XXS, 300 GB, NM790 SSD, 4 sequences): a token is 48.5-53.4 ms, ~20
+  ms of it SSD waits (8-9 reads of 8-12 MB, ~2.1 ms each - near the SSD's speed). ~57% of the experts fit VRAM + RAM;
+  a cache study on the routes (LRU, decayed LFU, frequency admission) gave 6.6-6.8 reads a token, the clairvoyant
+  bound 3.1, so the eviction policy has little left. rocprofv3: the dense GEMVs run at ~88-90% of the card's memory
+  bandwidth (~11 ms a token), the rest is the experts (~5 ms) and small kernels - no large lossless lever left.
+- The speed setting: `STRATA_GLM_TAIL_SKIP=4 STRATA_GLM_TAIL_SKIP_DISK=1` 39.8 ms a token (25.1 tok/s, +34%) for KL
+  +0.007; `=3` 38.6 ms for +0.020. `--bench`'s "ssd" verdict now names it (docs/BENCH, MANUAL, MODELS).
+
 ## v1.3.68 - 2026-10-27
 
 **AMD (HIP): long contexts no longer crawl - 1.5 GB of VRAM kept free beside the expert pool (was 0.7).**
