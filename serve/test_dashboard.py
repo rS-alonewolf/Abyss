@@ -180,5 +180,40 @@ class GpuRelease(unittest.TestCase):
         sleep.assert_called_once()
 
 
+class AmdTelemetry(unittest.TestCase):
+    """Issue #14: a HIP run reads its AMD card from sysfs, not NVML's card 0 (an NVIDIA display card beside it)."""
+
+    def test_reads_the_amd_card_from_sysfs(self):
+        from serve import telemetry as T
+        with tempfile.TemporaryDirectory() as t:
+            dev = Path(t, "0000:c7:00.0")
+            (dev / "hwmon" / "hwmon3").mkdir(parents=True)
+            for name, v in (("gpu_busy_percent", "87"), ("mem_info_vram_used", str(30 << 30)),
+                            ("mem_info_vram_total", str(32 << 30)), ("current_link_speed", "16.0 GT/s PCIe"),
+                            ("max_link_speed", "32.0 GT/s PCIe"), ("current_link_width", "4"),
+                            ("hwmon/hwmon3/temp1_input", "61000"), ("hwmon/hwmon3/power1_average", "212000000"),
+                            ("hwmon/hwmon3/power1_cap", "300000000")):
+                (dev / name).write_text(v + "\n")
+            g = T._AmdSysfs("0000:c7:00.0", "gfx1201", base=t)
+            self.assertTrue(g.ok())
+            self.assertEqual(g.name(), "AMD Radeon (gfx1201)")      # no product_name file: the arch
+            r = g.read()
+            self.assertEqual((r["util"], r["mem_total"], r["temp"], r["power"], r["power_limit"]),
+                             (87, 32 << 30, 61.0, 212.0, 300.0))
+            self.assertEqual((r["pcie_gen"], r["pcie_gen_max"], r["pcie_width"]), (4, 5, 4))
+            (dev / "product_name").write_text("AMD Radeon AI PRO R9700\n")
+            self.assertEqual(g.name(), "AMD Radeon AI PRO R9700")
+            self.assertFalse(T._AmdSysfs("0000:01:00.0", base=t).ok())   # not an amdgpu card
+            self.assertFalse(T._AmdSysfs(None).ok())
+
+    def test_a_hip_run_never_opens_nvml(self):
+        from unittest import mock
+        from serve import telemetry as T
+        with mock.patch.object(T, "_Nvml") as nvml:
+            tel = T.Telemetry(gpu_index=0, amd=[(0, None, "gfx1201")])
+        nvml.assert_not_called()
+        self.assertIsNone(tel.static["gpu_name"])
+
+
 if __name__ == "__main__":
     unittest.main()

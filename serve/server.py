@@ -1269,7 +1269,8 @@ class Service:
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
-                                       gpu_indices=getattr(self, "gpu_indices", None))
+                                       gpu_indices=getattr(self, "gpu_indices", None),
+                                       amd=getattr(self, "amd_gpus", None))
             if isinstance(self.engine, StrataEngine):
                 self.engine.gpu_busy = self._gpu_busy     # the stall watchdog's third sign of work
 
@@ -2932,6 +2933,10 @@ def main() -> int:
     svc.api_key = a.api_key or cfg.get("api_key", "")
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
+    if cfg.get("backend") == "hip":                     # AMD: those cards from sysfs, never NVML's card 0 (issue #14)
+        nodes = {g["index"]: g for g in amd_gpu_nodes()}
+        svc.amd_gpus = [(i, nodes[i]["pci"] if i in nodes else None, nodes[i]["arch"] if i in nodes else "")
+                        for i in (hip_gpu_list(cfg) or [0])]
     if a.config:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
     args = [str(x) for x in cfg.get("args") or []]

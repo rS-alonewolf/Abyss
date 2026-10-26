@@ -2,7 +2,8 @@
 
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: NVIDIA's own NVML library (nvml.dll / libnvidia-ml.so.1, installed with every driver) through ctypes, so no
-  pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.
+  pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.  A HIP run reads its AMD card
+  from the amdgpu driver's sysfs files instead (Linux; the same readings but the PCIe throughput).
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import collections
 import ctypes
+import glob
 import os
 import platform
 import sys
@@ -147,6 +149,71 @@ class _Nvml:
         return out
 
 
+# ------------------------------------------------------------------------------------------------ AMD (sysfs)
+PCIE_GEN = {"2.5": 1, "5.0": 2, "8.0": 3, "16.0": 4, "32.0": 5, "64.0": 6}   # GT/s -> PCIe generation
+
+
+class _AmdSysfs:
+    """An AMD card's readings from the amdgpu driver's sysfs files (Linux, no ROCm library needed), read like _Nvml:
+    a HIP run has to read the card it runs on, not NVML's card 0 (issue #14: an NVIDIA display card beside an
+    R9700 was reported as the GPU, and the stall watchdog read its load).  `pci`: the card's address
+    ("0000:c7:00.0"); `arch`: its gfx target, for the name when the driver has no product_name."""
+
+    def __init__(self, pci, arch="", base="/sys/bus/pci/devices"):
+        self.dev = os.path.join(base, pci) if pci else None
+        self.arch = arch
+        if self.dev and not os.path.isfile(os.path.join(self.dev, "gpu_busy_percent")):
+            self.dev = None
+        hw = sorted(glob.glob(os.path.join(self.dev, "hwmon", "hwmon*"))) if self.dev else []
+        self.hwmon = hw[0] if hw else None
+
+    def ok(self):
+        return self.dev is not None
+
+    @staticmethod
+    def _read(path):
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def _int(self, folder, name):
+        v = self._read(os.path.join(folder, name)) if folder else None
+        try:
+            return int(v.split()[0]) if v else None
+        except ValueError:
+            return None
+
+    def pids(self):
+        return None
+
+    def name(self):
+        return (self._read(os.path.join(self.dev, "product_name")) if self.dev else None) or \
+            f"AMD Radeon ({self.arch or '?'})"
+
+    def _gen(self, name):
+        v = self._read(os.path.join(self.dev, name))
+        return PCIE_GEN.get(v.split()[0]) if v else None
+
+    def read(self):
+        if not self.dev:
+            return {}
+        uw = self._int(self.hwmon, "power1_average")
+        if uw is None:
+            uw = self._int(self.hwmon, "power1_input")
+        cap, mc = self._int(self.hwmon, "power1_cap"), self._int(self.hwmon, "temp1_input")
+        return {"util": self._int(self.dev, "gpu_busy_percent"),
+                "mem_used": self._int(self.dev, "mem_info_vram_used"),
+                "mem_total": self._int(self.dev, "mem_info_vram_total"),
+                "temp": mc / 1000.0 if mc is not None else None,
+                "power": uw / 1e6 if uw is not None else None,
+                "power_limit": cap / 1e6 if cap is not None else None,
+                "pcie_gen": self._gen("current_link_speed"), "pcie_gen_max": self._gen("max_link_speed"),
+                "pcie_width": self._int(self.dev, "current_link_width"),
+                "pcie_rx_mb": None, "pcie_tx_mb": None}
+
+
 # ------------------------------------------------------------------------------------------------ CPU / RAM
 def _cpu_name():
     if os.name == "nt":
@@ -213,17 +280,19 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None):
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=None):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
-        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own."""
+        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: a HIP run's
+        cards as [(HIP number, PCI address, arch)], read from sysfs instead of NVML (issue #14)."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
         idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
-        self.gpus = [(i, _Nvml(i)) for i in idx]
+        self.gpus = [(i, _AmdSysfs(pci, arch)) for i, pci, arch in amd] if amd is not None else \
+            [(i, _Nvml(i)) for i in idx]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
         try:

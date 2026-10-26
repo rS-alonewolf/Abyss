@@ -7,6 +7,18 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.64 - 2026-10-26
+
+**AMD runs: the dashboard, the report and the stall watchdog read the AMD card, not an NVIDIA card beside it (issue #14).**
+
+- The server's hardware readings (the Monitor tab, `/metrics`, the dashboard's Copy report) came from NVIDIA's NVML
+  only, so a HIP run on a PC with an NVIDIA display card read that card: the report named an RTX 3060 beside an AI
+  PRO R9700, and the stall watchdog's "is the GPU busy" sign read the 3060's load. A HIP run now reads its own cards
+  from the amdgpu driver's sysfs files (load, VRAM, temperature, power and its cap, PCIe link; no PCIe throughput),
+  found by the config's `gpu_pci` / HIP numbers, and never opens NVML. The name is the driver's product_name, else
+  "AMD Radeon (<arch>)". CUDA runs are unchanged.
+- Windows with HIP has no sysfs: the GPU readings there show as not readable instead of an NVIDIA card's.
+
 ## v1.3.63 - 2026-10-26
 
 **DeepSeek V4.1 long prompts: the indexer on WMMA and the candidate blocks batched; a score-buffer overrun fixed.**
