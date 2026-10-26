@@ -530,7 +530,7 @@ swe-bench の問題ごとに +16〜32%。これらの問題では下書きの 68
 | 設定 | 既定値 | |
 | --- | --- | --- |
 | `STRATA_GLM_WARM` | オン | `0`: 起動時に読み込まない（使われたエキスパートから載っていく。最初の応答が遅い） |
-| `STRATA_GLM_RAM_GB` | 空き RAM から | pinned の RAM 層の大きさを GB で固定 |
+| `STRATA_GLM_RAM_GB` | 空き RAM から | pinned の RAM 層の大きさを GB で固定。大きくすると SSD の待ちは減るが、そのエキスパートは CPU のレーンが計算する。DDR4 のデスクトップの V4.1 で 80 → 88 GB にすると SSD の待ち 11.1 → 8.7 ms、レーン 9.4 → 10.6 ms、生成 +3%（docs/BENCH） |
 | `STRATA_GLM_RAM_HEADROOM_GB` | 6 | RAM 層を決めるとき、システムのために空けておく RAM |
 | `STRATA_GLM_RAM_FRAC` | 0.73 | Linux・単体 GPU で `STRATA_GLM_RAM_GB` がないとき、RAM 層が pin する RAM の上限 (全体に対する割合)。94 GB 機で 73% を超えて pin するとスラッシングした |
 | `STRATA_GLM_STREAM_FETCH` | オン | SSD から読んだエキスパートを、読めた塊から順に VRAM へコピーする。PCIe のコピーが SSD の読みのすぐ後ろを走る（v1.3.31。DeepSeek V4.1 で 1 トークン −9%）。`0` で読み終わってからまとめてコピー |

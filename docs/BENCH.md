@@ -74,6 +74,11 @@ The benchmark names the likely bottleneck from those counters (rules of thumb, c
 | **pcie** | >= 10 experts a token copied over PCIe | a better slot (Gen4 x16 carries 4x an x4 / OCuLink link), `--calibrate` (AMD: `STRATA_GLM_PCIE_SHARE`) |
 | **gpu** | none of the above (or, with `--deep` and no drafter, the GPU busy >= 85%) | `./abyss.sh --gpu-tune`, and a report: the kernels for this GPU may have room |
 
+More RAM for the RAM tier moves expert reads off the SSD, but the experts it holds are run by the CPU lane, so the
+lane's time goes up by part of what the SSD waits go down. On a DDR4 desktop (123 GB, Gen5 x16, no iGPU, DeepSeek
+V4.1) `STRATA_GLM_RAM_GB=88` against 80 cut the SSD waits from 11.1 to 8.7 ms a token but raised the lane from 9.4 to
+10.6 ms; decode went 18.0 -> 18.6 tokens/s (+3%). Compare both lines before and after, not the SSD line alone.
+
 An SSD-bound run (DeepSeek V4.1 Flash 1017 UD-IQ2_XXS, 300 GB, on the same PC) reads like this:
 
 ```

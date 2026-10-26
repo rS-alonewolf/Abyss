@@ -7,6 +7,15 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.61 - 2026-10-26
+
+**Docs: what a larger RAM tier does on a DDR4 desktop.**
+
+- docs/BENCH and the `STRATA_GLM_RAM_GB` row in docs/MANUAL: a larger RAM tier moves expert reads off the SSD, but
+  the CPU lane runs those experts, so part of the gain moves to the lane's time. A user's DDR4 desktop (123 GB, Gen5
+  x16, no iGPU, DeepSeek V4.1), 80 -> 88 GB: SSD waits 11.1 -> 8.7 ms a token, the lane 9.4 -> 10.6 ms, decode 18.0 ->
+  18.6 tokens/s. No code changes.
+
 ## v1.3.60 - 2026-10-26
 
 **DeepSeek V4.1 long prompts another 2.5-3.2x faster: the rest of the attention and Engram batched.**

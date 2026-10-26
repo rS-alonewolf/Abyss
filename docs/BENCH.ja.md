@@ -68,6 +68,11 @@ Gen5 x16 | RAM 94 GB | SSD 4.9 GB/s | decode 56.4 tok/s | prompt 8k 960 tok/s | 
 | **pcie** | 1 トークンで 10 個以上のエキスパートを PCIe で送っている | もっと良いスロット（Gen4 x16 は x4 / OCuLink の 4 倍運べる）、`--calibrate`（AMD では `STRATA_GLM_PCIE_SHARE`） |
 | **gpu** | 上のどれでもない（または `--deep` でドラフトモデルなしのとき、GPU の稼働率が 85% 以上） | `./abyss.sh --gpu-tune` と報告。この GPU 用のカーネルに改善の余地があるかもしれない |
 
+RAM の層を増やすと SSD からの読み込みは減りますが、RAM に置いたエキスパートは CPU のレーンが計算するので、SSD の待ちが減った
+分の一部はレーンの時間に回ります。DDR4 のデスクトップ（123 GB、Gen5 x16、iGPU なし、DeepSeek V4.1）で `STRATA_GLM_RAM_GB` を
+80 → 88 にすると、SSD の待ちは 1 トークンあたり 11.1 → 8.7 ms に減り、レーンは 9.4 → 10.6 ms に増えて、生成は 18.0 →
+18.6 tokens/s（+3%）でした。SSD の行だけでなく、両方の行を前後で比べてください。
+
 SSD で詰まっている例です（同じ PC で DeepSeek V4.1 Flash 1017 UD-IQ2_XXS、300 GB）。
 
 ```
