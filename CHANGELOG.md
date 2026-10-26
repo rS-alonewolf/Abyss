@@ -7,6 +7,29 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.58 - 2026-10-26
+
+**DeepSeek V4.1 long prompts read 1.5-1.8x faster and every prompt row now uses its own selection; a late PCIe share
+for issue #14.**
+
+- DeepSeek V4.1 prompts (fix): in a prompt chunk, the layers that read another layer's top-k selection read the one
+  chosen for the sub-batch's last row, not their own row's. Each row now keeps its own selection and candidate mask
+  across the layers (~16 KB a row of prompt arena). Greedy answers after 16K / 32K prompts now follow the
+  token-by-token path's (`--prefill 0`) for their first 151 characters and stay on its content; before the fix they
+  left it at the 13th / 29th, in the heading.
+- DeepSeek V4.1 prompts (speed): layers 20-39 read the earlier positions only through layer 20's compressed KV and
+  index keys, and each looks back one window more than the one before, so only the prompt's last 2,668 rows need them.
+  The rows before stop at layer 20's attention (exact up to the experts' summing order). AI PRO R9700 + iGPU,
+  UD-IQ2_XXS, prompt tok/s at 8K / 16K / 32K / 60K: 66 / 68 / 64 / 57 -> 86 / 101 / 101 / 101.
+  `STRATA_GLM_PROMPT_SKIP=0` turns it off; one device only (not a split); the DSpark drafter's context ring reads the
+  prompt's last rows, which still run every layer.
+- `--bench --deep` (issue #14, thanks to its reporter): the sweep's lower shares run on a GPU pool the engine's own
+  share has already filled, so they can look faster than they are from a start. The sweep and docs/BENCH now say so,
+  and the advice is to keep a share only if a plain `--bench` gets faster.
+- New `STRATA_GLM_PCIE_SHARE_LATE=<share>[:<steps>]`: each request starts on the engine's share and moves to this one
+  after `<steps>` token steps (default 256), so the start of an answer refills the pool first. Off by default; a
+  request's own share overrides it.
+
 ## v1.3.57 - 2026-10-26
 
 **Ornith's NextN drafter runs on GGUFs whose token_embd the GPU cannot read, two contributed fixes merged.**

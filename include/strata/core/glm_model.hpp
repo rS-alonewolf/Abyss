@@ -614,6 +614,15 @@ public:
     // ---- the batched prompt path (src/core/glm_prefill.cu)
     struct PrefillState;
     PrefillState* pf_ = nullptr;
+    // a long deepseek41 prompt's skip (prefill_run): the chunks before the cut stop at this layer - its attention (its
+    // compressed KV and index keys, which the layers after it read) and no FFN, no layer after it (-1: every layer)
+    int pf_kv_cut_ = -1;
+    // deepseek41's prompt path: the row's own top-k selection and candidate mask (fast_dsv41_attn reads and writes
+    // these instead of the token path's ds_sel / v41_keep - the prompt runs a layer over every row before the next
+    // layer, and a layer that is no index source reads the selection the last index source made for the same row)
+    int* pf_sel_ = nullptr;
+    unsigned char* pf_keep_ = nullptr;
+    size_t prefill_v41_row() const;   // those two per row, in bytes (0: not deepseek41)
     bool prefill_setup(std::string& err);                  // in fast_setup: sizes, host buffers (no device memory)
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
     size_t prefill_trim_prestage(size_t max_borrow);       // ... at most this many: a smaller prestage buffer (the new bytes)

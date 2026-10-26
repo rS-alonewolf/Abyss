@@ -541,8 +541,10 @@ swe-bench の問題ごとに +16〜32%。これらの問題では下書きの 68
 | `STRATA_GLM_EXL3_DECODE` | GPU による | EXL3 の pack で、`new`（tensor core のタイル、RTX 30 以降）か `legacy`（CUDA コア）をどの GPU でも選ぶ |
 | `STRATA_GLM_CPU_PIN` | オフ | `<CPU の並び>`（例 `0-15`、`0,2,4-7`）: CPU レーンのワーカーをその CPU に固定し、スレッド数を並びの数までにする。GPU 1 枚でも分割でも、Linux でも Windows でも効く（v1.3.29）。`1` / `0` は従来どおり、分割の各部のプールを固定するかどうか |
 | `STRATA_GLM_PCIE_SHARE` | 起動時に測定 | RAM 層のエキスパートのうち、CPU で計算せずに PCIe で GPU に送る割合（`0` = すべて CPU、`1` = すべて GPU） |
+| `STRATA_GLM_PCIE_SHARE_LATE` | なし | `<分担率>[:<ステップ数>]`：各リクエストは上の分担率で始まり、`<ステップ数>` トークン分（既定 256）進んだらこの分担率に切り替えます。分担率が低いと PCIe で送るエキスパートが減り、GPU のエキスパートの置き場が埋まりにくくなります。そこで回答の最初だけ PCIe で埋めてから切り替えます（issue #14）。普通の `--bench` が速くなったときだけ残してください |
 | `STRATA_GLM_PREFILL` / `--prefill` | `auto` | prompt のまとめ処理の大きさ: `auto`、トークン数、`0`（1 トークンずつ） |
 | `STRATA_GLM_PREFILL_SUB` | auto（NVIDIA）、1024（HIP） | prompt の mixer と dense FFN のサブバッチ（16〜8192）。HIP の既定は v1.3.40 から 1024（以前は 256。AI PRO R9700 で DeepSeek V4 の 8K / 16K の prompt が +8% / +10%、GLM-5.3-Flash が +13% / +15%） |
+| `STRATA_GLM_PROMPT_SKIP` | on | DeepSeek V4.1、1 台の GPU：長い prompt の最後の 2,668 行より前の行は、20 層目の attention で止める（20〜39 層はそれらの行を 20 層目の圧縮 KV からしか読まない。エキスパートの足し算の順を除いて同じ結果。v1.3.58、AI PRO R9700 で 32K の prompt が 64 → 101 tok/s）。`0`：オフ |
 | `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | 起動をまたいで残すエキスパートの使用記録。`0` で無効 |
 | `STRATA_GLM_NO_REUSE` | オフ | `1`: 会話を再利用しない |
 | `STRATA_GLM_THINK_RESERVE` | 1024 | （サーバー）思考が回答のために必ず残すトークン数 |

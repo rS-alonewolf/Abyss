@@ -2659,6 +2659,19 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     }
     F->cpu_plan = plan;
     F->cpu_plan_start = plan;
+    // STRATA_GLM_PCIE_SHARE_LATE=<share>[:<steps>] (issue #14): each request starts on the plan above and moves to this
+    // share after <steps> token boundaries (default 256). A lower share copies fewer experts over PCIe, and so promotes
+    // fewer into VRAM: set from the start it leaves the startup's pool in place (Ornith on a DDR4 desktop: share 0
+    // from the start 21 tokens/s, the engine's own 24.7, share 0 once the own share had filled the pool 34.7)
+    if (const char* lv = getenv("STRATA_GLM_PCIE_SHARE_LATE")) {
+        const double ls = std::max(0.0, std::min(1.0, std::atof(lv)));
+        const char* colon = std::strchr(lv, ':');
+        F->late_after = colon != nullptr ? std::max(1, std::atoi(colon + 1)) : 256;
+        for (int f = 0; f <= 8; ++f) F->cpu_plan_late |= (unsigned long long) (f - (int) std::lround(ls * f)) << (4 * f);
+        F->late_done = false;
+        std::fprintf(stderr, "glm fast: CUDA%d CPU lane: share %.2f after %d token steps of each request "
+                             "(STRATA_GLM_PCIE_SHARE_LATE)\n", dev_, ls, F->late_after);
+    }
     F->md.cpu_seq = F->cpu_seq_d;
     F->md.cpu_ans = dp;
     // the route counts that pick the coldest RAM-tier experts for the host, seeded with the tiers' LFU counts
@@ -3333,6 +3346,9 @@ bool Glm5Model::set_pcie_share(double share) {
             for (int f = 0; f <= 8; ++f) plan |= (unsigned long long) (f - (int) std::lround(s * f)) << (4 * f);
         }
         F->cpu_plan = plan;   // (the next route reads it; the boundary's background moves follow it too)
+        // a request's own share holds for the whole request; the engine's starts the late switch's count again
+        F->late_n = 0;
+        F->late_done = share >= 0.0 || F->late_after == 0;
         any = true;
     }
     return any;
@@ -4238,6 +4254,10 @@ bool Glm5Model::fast_boundary(std::string& err) {
     const auto tb1 = std::chrono::steady_clock::now();
     while (F->processed.load(std::memory_order_acquire) < F->expected) cpu_relax();
     std::lock_guard<std::mutex> lk(F->mu);
+    if (!F->late_done && ++F->late_n >= F->late_after) {   // (STRATA_GLM_PCIE_SHARE_LATE)
+        F->cpu_plan = F->cpu_plan_late;
+        F->late_done = true;
+    }
     struct GapScan {   // the table scan's time, whichever way the function leaves
         FastState* F;
         std::chrono::steady_clock::time_point t;

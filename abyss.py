@@ -2473,10 +2473,10 @@ BENCH_ADVICE = {
 }
 # --calibrate measures the CUDA engine's lane only (issue #14): on HIP the advice names the setting itself
 BENCH_ADVICE_HIP = {
-    "cpu": f"{ME} --bench --deep's share sweep, then its best share as STRATA_GLM_PCIE_SHARE in the config's \"env\" "
-           "(--calibrate is CUDA-only), the CPU's power mode; on a PC with a Radeon iGPU the iGPU lane",
+    "cpu": f"STRATA_GLM_PCIE_SHARE in the config's \"env\" (--calibrate is CUDA-only; keep a share only if a plain "
+           f"{ME} --bench gets faster with it), the CPU's power mode; on a PC with a Radeon iGPU the iGPU lane",
     "pcie": "the GPU's slot (Gen4 x16 moves 4x what an x4 / OCuLink link does), STRATA_GLM_PCIE_SHARE in the config's "
-            "\"env\" (moves the share to the CPU lane; --bench --deep's sweep shows the best one)",
+            "\"env\" (moves the share to the CPU lane; keep it only if a plain --bench gets faster with it)",
 }
 
 
@@ -2939,7 +2939,8 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
         lines += [f"- likely bottleneck: {what}", f"- what moves it: {moves}"]
     if shares:
         best = max(shares, key=lambda x: x[1])
-        lines += ["", "PCIe / CPU-lane share sweep (--deep; 0 = all missed experts on the CPU lane, 1 = all over PCIe):"]
+        lines += ["", "PCIe / CPU-lane share sweep (--deep; 0 = all missed experts on the CPU lane, 1 = all over PCIe;",
+                  "  run on a warm GPU pool - see the note below):"]
         lines += [f"  share {s:.2f}: {v:6.1f} tokens/s" + ("  <- fastest" if (s, v) == best else "")
                   for s, v in shares]
         start = plan_share(log_lines)
@@ -2954,10 +2955,15 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
             now = _mean(r["ms"] for r in dec_recs)
             now = 1000.0 / now if now > 0 else _mean(dec)
         if best[1] > 1.05 * now:
-            how = (f"set \"STRATA_GLM_PCIE_SHARE\": \"{best[0]:.2f}\" in {cfg_path.name}'s \"env\" (--calibrate is "
-                   "CUDA-only)" if cfg.get("backend") == "hip" else
-                   f"{ME} --calibrate sets it for this PC (or STRATA_GLM_PCIE_SHARE={best[0]:.2f} in the config's \"env\")")
-            lines.append(f"  share {best[0]:.2f} beats the engine's own choice ({now:.1f} tokens/s): {how}")
+            # issue #14: the sweep runs after the engine's own share has filled the GPU's pool - the experts that go
+            # over PCIe are promoted into VRAM, and a lower share promotes fewer.  Set at startup, a lower share keeps
+            # the startup's pool much longer (Ornith on DDR4: share 0 34.7 tokens/s in the sweep, 21 from the start
+            # vs 24.7 for the engine's own), so this is a lead to try, not a setting to take
+            how = (f"\"STRATA_GLM_PCIE_SHARE\": \"{best[0]:.2f}\" in {cfg_path.name}'s \"env\"" if cfg.get("backend") == "hip"
+                   else f"STRATA_GLM_PCIE_SHARE={best[0]:.2f} in the config's \"env\"")
+            lines.append(f"  share {best[0]:.2f} beats the engine's own choice ({now:.1f} tokens/s) on this warm pool. "
+                         f"Set at startup it may not: a lower share fills the GPU's pool more slowly. Try {how} and keep "
+                         "it only if a plain --bench gets faster with it")
         elif max(v for _, v in shares) > 1.25 * min(v for _, v in shares):
             slow = min(shares, key=lambda x: x[1])
             lines.append(f"  the engine's own choice is already the fastest; share {slow[0]:.2f} is "

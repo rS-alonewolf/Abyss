@@ -877,6 +877,8 @@ bool Glm5Model::fast_dsv41_attn(int il, int64_t p64, std::string& err) {
     // 4. the keys: the window, and the slot's visible rows (all of them up to top_k; beyond, the top-k - this layer's
     // own when it is an index source, the last index source's otherwise: ds_sel is only written by index sources)
     const int n_raw = std::min(p + 1, g.n_swa);
+    int* const sel_buf = pf_sel_ != nullptr ? pf_sel_ : F->ds_sel;   // (the prompt path: the row's own)
+    unsigned char* const keep_buf = pf_keep_ != nullptr ? pf_keep_ : F->v41_keep;
     int n_comp = 0;
     const int* sel = nullptr;
     if (r != 0) {
@@ -886,14 +888,14 @@ bool Glm5Model::fast_dsv41_attn(int il, int64_t p64, std::string& err) {
                 ds::indexer_scores(F->iq, Ly.idx_cache, F->iw, g.idx_heads, n_vis, F->v41_score, s);
                 if (il == g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
                     d41::candidates(F->v41_score, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore, F->v41_bsel,
-                                    F->v41_keep, s);
+                                    keep_buf, s);
                 if (il > g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
-                    d41::candidate_mask(F->v41_score, n_vis, g.cand_bs, F->v41_keep, s);
-                ds::indexer_select(F->v41_score, n_vis, g.idx_top_k, F->ds_sel, s);
+                    d41::candidate_mask(F->v41_score, n_vis, g.cand_bs, keep_buf, s);
+                ds::indexer_select(F->v41_score, n_vis, g.idx_top_k, sel_buf, s);
                 if (F->prof_on) F->mark("ds_index");
             }
             n_comp = g.idx_top_k;
-            sel = F->ds_sel;
+            sel = sel_buf;
         } else {
             n_comp = n_vis;
         }

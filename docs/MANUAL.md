@@ -556,8 +556,10 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_EXL3_DECODE` | by GPU | an EXL3 pack: `new` (tensor-core tiles, RTX 30+) or `legacy` (CUDA cores) on any GPU |
 | `STRATA_GLM_CPU_PIN` | off | `<CPU list>` (e.g. `0-15`, `0,2,4-7`): pin the CPU lane's workers to those CPUs and cap their count at the list's size, one GPU or a split, Linux and Windows (v1.3.29); `1` / `0`: a split's per-part pools pinned or not, as before |
 | `STRATA_GLM_PCIE_SHARE` | measured at start | the share of RAM-tier experts copied over PCIe instead of computed on the CPU (`0` = all on the CPU, `1` = none) |
+| `STRATA_GLM_PCIE_SHARE_LATE` | off | `<share>[:<steps>]`: each request starts on the share above and moves to this one after `<steps>` token steps (default 256). A lower share copies fewer experts over PCIe and so refills the GPU's pool more slowly; this lets the start of each answer refill it first (issue #14). Keep it only if a plain `--bench` gets faster |
 | `STRATA_GLM_PREFILL` / `--prefill` | `auto` | the prompt chunk: `auto`, a number of tokens, or `0` (token by token) |
 | `STRATA_GLM_PREFILL_SUB` | auto (NVIDIA), 1024 (HIP) | the prompt's mixer and dense-FFN sub-batch (16-8192). HIP's default 1024 since v1.3.40 (it was 256: AI PRO R9700 DeepSeek V4 8K / 16K prompts +8% / +10%, GLM-5.3-Flash +13% / +15%) |
+| `STRATA_GLM_PROMPT_SKIP` | on | DeepSeek V4.1, one device: a long prompt's rows before its last 2,668 stop at layer 20's attention (layers 20-39 read them only through layer 20's compressed KV; exact up to the experts' summing order; v1.3.58, 32K prompts 64 -> 101 tok/s on an AI PRO R9700). `0`: off |
 | `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | your expert usage between starts; `0` = off |
 | `STRATA_GLM_NO_REUSE` | off | `1`: no conversation reuse |
 | `STRATA_GLM_THINK_RESERVE` | 1024 | (server) tokens a thinking block always leaves for the answer |

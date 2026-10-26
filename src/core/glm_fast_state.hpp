@@ -567,6 +567,11 @@ struct Glm5Model::FastState {
     double cpu_ps_ms = 0.0;                  // ... one in a stream of copies (the prompt's staging)
     unsigned long long cpu_plan = 0;
     unsigned long long cpu_plan_start = 0;   // ... the plan the engine started with (set_pcie_share(-1) restores it)
+    // STRATA_GLM_PCIE_SHARE_LATE (issue #14): a request starts on cpu_plan_start - its PCIe copies refill the GPU's
+    // pool after the prompt - and moves to cpu_plan_late after late_after boundaries (0: off)
+    unsigned long long cpu_plan_late = 0;
+    int late_after = 0, late_n = 0;
+    bool late_done = true;
     gf::CpuAnswer* cpu_ans_h = nullptr;                      // host-mapped
     unsigned int* cpu_seq_d = nullptr;
     unsigned int* dcnt_d = nullptr;                          // the device's route counts (the coldest go to the host)

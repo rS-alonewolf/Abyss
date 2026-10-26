@@ -412,6 +412,7 @@ struct Glm5Model::PrefillState {
     std::vector<int32_t> toks_h;                // ... and the chunk's token ids on the host (the Engram hashes)
     uint16_t* x16 = nullptr;
     int* iota = nullptr;
+    uint8_t* v41_rows = nullptr;     // deepseek41: each row's top-k selection and candidate mask (prefill_v41_row)
     uint8_t* uni = nullptr;          // the per-layer region (KDA | DSA | dense | MoE)
     // weight scratch
     uint16_t* w16 = nullptr;
@@ -990,7 +991,8 @@ bool Glm5Model::prefill_bind(uint8_t* region, size_t bytes, std::string& err) {
 // a chunk of T tokens' device buffers: {the rows kept across a layer, the largest of the mixers' / FFN's / NextN cache
 // fill's scratch} - the layout prefill_carve lays out
 static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bool has_kda, bool has_dsa,
-                                             bool has_dense, bool has_moe, int max_pools, int sub_env, bool mtp) {
+                                             bool has_dense, bool has_moe, int max_pools, int sub_env, bool mtp,
+                                             size_t v41_row = 0) {
     const size_t E = (size_t) g.n_embd;
     Carve a;
     a.take<float>(T * 4 * E);                    // R
@@ -1006,6 +1008,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     a.take<float>(T);
     a.take<float>(T * 24);
     a.take<int>(T * (size_t) g.n_exp_used);      // iota
+    if (v41_row) a.take<uint8_t>(T * v41_row);   // v41_rows
     size_t uni = 0;
     const size_t ts = std::min<size_t>(T, mixer_sub(T, g, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env));
     if (has_kda) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); }
@@ -1030,7 +1033,14 @@ Glm5Model::PinnedPrompt Glm5Model::prefill_pinned() const {
 
 std::pair<size_t, size_t> Glm5Model::prefill_bytes_for(size_t T) const {
     const PrefillState* S = pf_;
-    return chunk_bytes(g_, T, S->has_kda, S->has_dsa, S->has_dense, S->has_moe, S->max_pools, S->sub_env, mtp_il_ >= 0);
+    return chunk_bytes(g_, T, S->has_kda, S->has_dsa, S->has_dense, S->has_moe, S->max_pools, S->sub_env, mtp_il_ >= 0,
+                       prefill_v41_row());
+}
+
+size_t Glm5Model::prefill_v41_row() const {
+    if (!g_.v41) return 0;
+    const size_t keep = ((size_t) (max_ctx_ + g_.cand_bs) / (size_t) g_.cand_bs + 15) / 16 * 16;
+    return (size_t) g_.idx_top_k * sizeof(int) + keep;
 }
 
 
@@ -1090,6 +1100,7 @@ size_t Glm5Model::prefill_carve(int Tn) {
     S->ss = a.take<float>(T);
     S->mix = a.take<float>(T * 24);
     S->iota = a.take<int>(T * (size_t) g.n_exp_used);
+    S->v41_rows = prefill_v41_row() ? a.take<uint8_t>(T * prefill_v41_row()) : nullptr;
     S->uni = S->arena + a.off;
     cublasSetWorkspace(S->blas, S->ws, S->ws_bytes);
     S->T_bound = Tn;
@@ -1822,9 +1833,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
 
     // ---- PRESTAGING: layer il's predicted experts -> pbuf on the copy stream, behind what it carries (the layer
     //      before's staged groups) and once the layer before has read pbuf (ev_pfree)
+    // a long deepseek41 prompt's chunk before its cut (prefill_run): layers up to kv_cut only, kv_cut's FFN skipped
+    const int kv_cut = pf_kv_cut_;
+    const int moe_end = kv_cut >= 0 ? kv_cut : l1_;   // (MoE layers that read experts: before it)
     const auto next_moe = [&](int il) {
-        while (il < l1_ && !F->L[(size_t) il].moe) ++il;
-        return il;
+        while (il < moe_end && !F->L[(size_t) il].moe) ++il;
+        return il < moe_end ? il : l1_;
     };
     // whether layer il's host experts go to the iGPU (abyss_igpu_rows: glm_fast's light row kernels on the APU's
     // integrated GPU, reading the RAM tier in place - an expert of ~20 rows 0.22 ms against ~1.2 on the 16 CPU
@@ -1993,8 +2007,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     for (int il = l0_; il < l1_; ++il) {
         progress_at("the prompt: layer", il);   // a layer is the serve watchdog's heartbeat (issue #40)
         progress_beat();
+        if (kv_cut >= 0 && il > kv_cut) break;
         const auto& Ly = F->L[(size_t) il];
-        const bool skip_output = tail_skip && il == g.n_layers - 1;
+        const bool skip_output = (tail_skip && il == g.n_layers - 1) || il == kv_cut;
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].start, s);
         if (g.v41) {
             // deepseek41: an Engram layer writes the previous FFN alone, adds its rows, then reads without a write;
@@ -2026,11 +2041,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const uint16_t* x16 = S->x16 + (size_t) t0 * E;
             float* mixer = S->mixer + (size_t) t0 * E;
             if (g.v41) {
-                // a token at a time through the token path's attention (its caches and rings advance in order)
+                // a token at a time through the token path's attention (its caches and rings advance in order); the
+                // row's own top-k selection and candidate mask, kept across the layers (a reader layer reads what the
+                // last index source chose for that row, not for the sub-batch's last row)
+                const size_t vr = prefill_v41_row();
                 for (int t = 0; t < tn; ++t) {
                     cudaMemcpyAsync(F->x, xs + (size_t) t * E, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, s);
                     gf::quantize_q8_1(F->x, F->xq, E, s);
-                    if (!fast_dsv41_attn(il, p0 + t0 + t, err)) return false;
+                    pf_sel_ = (int*) (S->v41_rows + (size_t) (t0 + t) * vr);
+                    pf_keep_ = (unsigned char*) (pf_sel_ + g.idx_top_k);
+                    const bool ok = fast_dsv41_attn(il, p0 + t0 + t, err);
+                    pf_sel_ = nullptr;
+                    pf_keep_ = nullptr;
+                    if (!ok) return false;
                     cudaMemcpyAsync(mixer + (size_t) t * E, F->mixer, (size_t) E * sizeof(float),
                                     cudaMemcpyDeviceToDevice, s);
                 }
@@ -3298,7 +3321,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // the last layer's write half: R = post x ffn + comb . R (qwen35moe's plain residual has none: the NextN rows below
     // add the last FFN themselves - this update, run with the hyper-connections' unset post / comb, broke R and with it
     // every prompt position's draft cache, so the drafter's confidences stayed under its threshold after a prompt)
-    if (!tail_skip && !g.qwen35()) {
+    if (!tail_skip && !g.qwen35() && kv_cut < 0) {
         gb::hc_update(S->ffn, S->R, S->post, S->comb, nullptr, T, E, s);
         S->mark("hc", s);
         if (dsp_ != nullptr) {   // DSpark: the chunk's last rows into its context
@@ -3313,7 +3336,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // ---- the NextN block's caches for these positions (the half that carries it): position p reads h_p and the
     //      embedding of the token at p + 1, so only the cache-writing half of the block runs - eh_proj, the attention
     //      norm, kv_a and the indexer's key/gate - no queries, no attention, no FFN
-    if (mtp_il_ >= 0 && next_ids != nullptr) {
+    if (mtp_il_ >= 0 && next_ids != nullptr && kv_cut < 0) {
         int Tv = 0;   // rows whose next token is known (all but possibly the prompt's last)
         while (Tv < T && next_ids[Tv] >= 0) ++Tv;
         if (g.qwen35() && Tv > 0) {
@@ -3537,15 +3560,40 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     int Tc = pf_->T_bound;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tc = std::min(Tc, m->pf_->T_bound);
     const int64_t pos_start = pos_;
-    const int nc = (int) ((n + Tc - 1) / Tc);
-    const auto chunk_len = [&](int c) { return (int) std::min<int64_t>(Tc, n - (int64_t) c * Tc); };
+    // a long deepseek41 prompt's skip: the layers from the first compress-ratio-1 layer on (V4.1: 20-39) read the
+    // earlier positions only through that layer's compressed KV and index keys (they own none), and each looks back
+    // one window (n_swa - 1 positions) more than the layer before - so only the last keep = (n_layers - yl) (n_swa - 1)
+    // + n_swa rows need them for the prompt's last row and the window rings the decode reads (exact up to the
+    // experts' summing order).  The rows before the cut stop at layer yl's attention (pf_kv_cut_).  One device, the
+    // whole trunk; STRATA_GLM_PROMPT_SKIP=0: off
+    int yl = -1;
+    int64_t cut = 0;
+    static const bool skip_on = [] { const char* v = getenv("STRATA_GLM_PROMPT_SKIP"); return v == nullptr || std::atoi(v) != 0; }();
+    if (skip_on && g.v41 && split_next_ == nullptr && l0_ == 0 && l1_ == g.n_layers && mtp_il_ < 0) {
+        for (int il = 0; il < g.n_layers && yl < 0; ++il)
+            if (g.ratio(il) == 1) yl = il;
+        bool ok = yl > 0 && g.kv_src[(size_t) yl];
+        for (int il = yl + 1; ok && il < g.n_layers; ++il) ok = g.ratio(il) == 1 && !g.kv_src[(size_t) il];
+        const int64_t keep = (int64_t) (g.n_layers - yl) * (g.n_swa - 1) + g.n_swa;
+        if (ok && n - keep >= 1024) cut = n - keep;
+    }
+    // the chunks' starts (every Tc rows; with a cut, the chunks before it end at it)
+    std::vector<int64_t> cs;
+    for (int64_t x = 0; x < cut; x += Tc) cs.push_back(x);
+    for (int64_t x = cut; x < n; x += Tc) cs.push_back(x);
+    cs.push_back(n);
+    const int nc = (int) cs.size() - 1;
+    const auto chunk_len = [&](int c) { return (int) (cs[(size_t) c + 1] - cs[(size_t) c]); };
+    if (cut > 0 && getenv("STRATA_GLM_PREFILL_VERBOSE") != nullptr)
+        std::fprintf(stderr, "glm prefill: prompt skip - %lld of %lld rows stop at layer %d's attention\n",
+                     (long long) cut, (long long) n, yl);
     // the token after every position of chunk c (the draft block's caches read it): the prompt's own next token,
     // the caller's for the last position (-1: unknown - that position is filled by the first draft of the decode)
     const auto next_of = [&](int c, std::vector<int32_t>& out) {
         const int T = chunk_len(c);
         out.resize((size_t) T);
         for (int t = 0; t < T; ++t) {
-            const int64_t j = (int64_t) c * Tc + t + 1;
+            const int64_t j = cs[(size_t) c] + t + 1;
             out[(size_t) t] = j < n ? tokens[(size_t) j] : prefill_next_;
         }
     };
@@ -3553,7 +3601,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     const auto embed = [&](int c) -> bool {
         PrefillState* S = pf_;
         const int T = chunk_len(c);
-        const int64_t i = (int64_t) c * Tc;
+        const int64_t i = cs[(size_t) c];
         if (!glmfast::cuda_ok(cudaStreamSynchronize(fast_->cs), "glm prompt embedding", err)) return false;
         // the rows by the disk workers' threads (a 32K chunk's rows took ~100 ms on one thread, the GPU idle);
         // STRATA_GLM_PREFILL_EMB_PAR=0: one thread
@@ -3582,7 +3630,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     // those layers by whatever its buffer held.)
     const auto toks_to = [&](Glm5Model* m, int c) {
         if (m->pf_ == nullptr || m->pf_->toks_d == nullptr) return;
-        cudaMemcpyAsync(m->pf_->toks_d, tokens.data() + (int64_t) c * Tc, (size_t) chunk_len(c) * sizeof(int),
+        cudaMemcpyAsync(m->pf_->toks_d, tokens.data() + cs[(size_t) c], (size_t) chunk_len(c) * sizeof(int),
                         cudaMemcpyHostToDevice, m->fast_->cs);
     };
     std::vector<Glm5Model*> parts;
@@ -3594,12 +3642,15 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         // one half after the other, chunk by chunk
         for (int c = 0; c < nc; ++c) {
             const int T = chunk_len(c);
-            const int64_t p0 = pos_start + (int64_t) c * Tc;
+            const int64_t p0 = pos_start + cs[(size_t) c];
             cudaSetDevice(dev_);
             if (!embed(c)) return false;
             std::vector<int32_t> nx0;
             if (mtp_il_ >= 0) next_of(c, nx0);   // a single device carries the draft block itself
-            if (!prefill_half(p0, T, err, nx0.empty() ? nullptr : nx0.data())) return false;
+            pf_kv_cut_ = cs[(size_t) c + 1] <= cut ? yl : -1;
+            const bool half_ok = prefill_half(p0, T, err, nx0.empty() ? nullptr : nx0.data());
+            pf_kv_cut_ = -1;
+            if (!half_ok) return false;
             Glm5Model* prev = this;
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
                 PrefillState* SP = prev->pf_;
@@ -3677,7 +3728,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         if (stop) return;
                     }
                     const int T = chunk_len(c);
-                    const int64_t p0 = pos_start + (int64_t) c * Tc;
+                    const int64_t p0 = pos_start + cs[(size_t) c];
                     cudaMemcpyAsync(m->pf_->R, up->pf_->hop_h + (size_t) (c & 1) * slot,
                                     (size_t) T * 4 * E * sizeof(float), cudaMemcpyHostToDevice, m->fast_->cs);
                     std::string e2;
@@ -3707,7 +3758,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         return;
                     }
                     if (prefill_progress && c + 1 < nc &&
-                        !prefill_progress(std::min<int64_t>(n, (int64_t) (c + 1) * Tc), n)) {
+                        !prefill_progress(cs[(size_t) c + 1], n)) {
                         fail("cancelled");
                         return;
                     }
@@ -3720,7 +3771,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 if (stop) break;
             }
             const int T = chunk_len(c);
-            const int64_t p0 = pos_start + (int64_t) c * Tc;
+            const int64_t p0 = pos_start + cs[(size_t) c];
             if (!embed(c)) { fail(err); break; }
             std::string e1;
             if (!prefill_half(p0, T, e1)) {

@@ -101,8 +101,11 @@ those two runs, not with the decode):
   the engine's own choice is already the fastest; share 1.00 is 4.8x slower - PCIe is the narrow path here
 ```
 
-- The fastest share well above the engine's own share: `./abyss.sh --calibrate` sets it for this PC on NVIDIA; on
-  AMD (`--calibrate` is CUDA-only) put it in the config's `"env"` as `"STRATA_GLM_PCIE_SHARE": "<share>"`.
+- The fastest share well above the engine's own share: a lead, not a setting yet. The sweep runs after the engine's
+  own share has filled the GPU's pool (the experts that go over PCIe are promoted into VRAM, and a lower share
+  promotes fewer), so a lower share set at startup can be slower than the engine's own: on a DDR4 desktop, Ornith's
+  share 0 gave 34.7 tokens/s in the sweep and 21 from the start, against 24.7 for the engine's own (issue #14). Try it
+  in the config's `"env"` as `"STRATA_GLM_PCIE_SHARE": "<share>"` and keep it only if a plain `--bench` gets faster.
 - The engine already the fastest, and the curve steep: one path is much narrower - here PCIe (Gen4 x4 over OCuLink):
   every expert moved to it costs more than the lane's work.
 - A flat curve: neither PCIe nor the lane limits the speed; look at the GPU (or the SSD).
