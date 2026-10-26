@@ -268,7 +268,8 @@ GGUF_PY=~/llm/apps/llama.cpp/gguf-py LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin
 - **ツール呼び出し:** OpenAI の `tools`、Anthropic の `tools` が使える。1 回の応答で複数の呼び出しも可。モデルは
   DeepSeek の DSML 形式で書き、サーバーがそれを `tool_calls` に変換する。過去の呼び出しと `tool` の結果は
   prompt に描画し直す。
-- **会話の再利用:** 前のリクエストの続き（同じメッセージ + 新しいメッセージ）は、新しいトークンだけを読む。
+- **会話の再利用:** 前のリクエストの続き（同じメッセージ + 新しいメッセージ）は、新しいトークンだけを読む。同じプロンプトをもう一度送ると、最後のトークンだけを読む（V4.1：5K と 23K のトークンで、最初のトークンまで 0.04 秒）。
+  残すのは直前の会話 1 つだけで、間に別のリクエストが入るか、再起動すると置き換わる。トークンは先頭から一致している必要があり、システムプロンプト・推論レベル・ツールの一覧が違う場合や、リクエストごとに変わるもの（タイムスタンプなど）が入る場合は、プロンプトを読み直す。再利用されたかは `usage.prompt_tokens_details.cached_tokens`（OpenAI）、`cache_read_input_tokens`（Anthropic）、ストリームの `timings.cache_n` で分かる。Ornith は v1.3.65 から再利用する。
 - **リクエストは 1 つずつ**処理する。ほかは順番待ち。
 
 ### Strata-tools の strata.sh を使う場合

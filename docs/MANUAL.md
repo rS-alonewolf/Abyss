@@ -271,7 +271,11 @@ in the browser, `--gpu 0` picks the GPU.
   in DeepSeek's DSML form; the server turns them into `tool_calls` and renders past calls and `tool` results back into
   the prompt.
 - **Conversation reuse:** a request that continues the previous one (the same messages plus new ones) reads only the
-  new tokens.
+  new tokens; the same prompt again reads only its last one (V4.1: 5K and 23K tokens to the first token in 0.04 s).
+  Only the last conversation is kept: another request in between replaces it, and so does a restart. The tokens must
+  match from the start - a different system prompt, reasoning level or tool list, or anything that changes per
+  request (a timestamp), reads the prompt again. Whether a request was reused: `usage.prompt_tokens_details.cached_tokens`
+  (OpenAI), `cache_read_input_tokens` (Anthropic) or `timings.cache_n` in the stream. Ornith reuses it from v1.3.65.
 - **One request at a time;** others wait in line.
 
 ### With Strata-tools' strata.sh

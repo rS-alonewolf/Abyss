@@ -7,6 +7,14 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.66 - 2026-10-26
+
+**Docs: when the conversation is reused and how to see it (issue #14).**
+
+- docs/MANUAL: the same prompt again reads only its last token (V4.1: 5K and 23K tokens, 0.04 s to the first token,
+  no size cap); only the last conversation is kept (another request in between or a restart replaces it); the tokens
+  must match from the start; `cached_tokens` / `cache_read_input_tokens` / `timings.cache_n` say whether it was reused.
+
 ## v1.3.65 - 2026-10-26
 
 **Ornith (Qwen3.5-MoE): long-context decode ~40% faster at 115K tokens, and the conversation is reused.**
