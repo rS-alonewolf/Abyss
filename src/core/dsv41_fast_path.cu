@@ -745,6 +745,10 @@ bool Glm5Model::dsv41_engram_prompt(int il, int T, float* R, std::string& err) {
                 rr[(size_t) t * kEngCols + c] = E->chunk[(size_t) (b0 + t) * 2 * kEngCols + (size_t) k * kEngCols + c];
         if (!engram_rows_par(*E, bn * kEngCols, rr.data(), k, nullptr, F->v41_pblk_h, err)) return false;
         cudaMemcpyAsync(F->v41_pblk, F->v41_pblk_h, (size_t) bn * per * 4, cudaMemcpyHostToDevice, F->cs);
+        if (prefill_v41_engram_gemm()) {
+            if (!prefill_v41_engram_block(il, bn, (int) per, F->v41_pblk, R + (size_t) b0 * 4 * g.n_embd, err)) return false;
+            continue;
+        }
         for (int t = 0; t < bn; ++t)
             if (!dsv41_engram_add(il, R + (size_t) (b0 + t) * 4 * g.n_embd, err, F->v41_pblk + (size_t) t * per))
                 return false;

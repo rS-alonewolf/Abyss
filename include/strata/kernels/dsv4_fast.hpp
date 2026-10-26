@@ -135,11 +135,20 @@ void q_prep_batch(float* q, int n_head, int head_dim, int n_rot, const Rope& rop
 void indexer_batch(float* iq, const uint16_t* K, const float* w, int idx_heads, int ratio, int p0, int T, int top_k,
                    float* score, int ld, int* sel, cudaStream_t s);
 
+/// indexer_batch's two halves (deepseek41 masks the scores in between): the scores of every token's visible rows,
+/// then each token's top min(top_k, visible) into sel[t * sel_ld ..].  idx_heads <= 64; the plain kernel (32 heads).
+void indexer_batch_scores(const float* iq, const uint16_t* K, const float* w, int idx_heads, int ratio, int p0, int T,
+                          float* score, int ld, cudaStream_t s);
+void indexer_batch_select(const float* score, int ld, int ratio, int p0, int T, int top_k, int* sel, int sel_ld,
+                          cudaStream_t s);
+
 /// Attention per token t at p = p0 + t over its window (keys rows of positions max(0, p - n_swa + 1) .. p) and its
-/// compressed rows (ratio 128: every visible one; ratio 4: sel[t][0 .. min(top_k, visible))), sinks, de-roped.
+/// compressed rows (ratio 128: every visible one; ratio 4: sel[t][0 .. min(top_k, visible)); deepseek41, ratio
+/// passed as -1 / -2: every visible row while they fit top_k, else sel[t][0 .. top_k)), sinks, de-roped.  sel_ld:
+/// sel's row stride in ints (0: top_k).
 void attend_batch(const float* q, const uint16_t* keys, int n_hist, int n_swa, const uint16_t* comp, const int* sel,
                   int top_k, int ratio, const float* sinks, int n_head, int head_dim, int n_rot, const Rope& rope, int p0,
-                  int T, float* out, cudaStream_t s);
+                  int T, float* out, cudaStream_t s, int sel_ld = 0);
 
 /// x (n floats) -> FP16.
 void to_f16(const float* x, uint16_t* y, int64_t n, cudaStream_t s);

@@ -79,33 +79,26 @@ __device__ __forceinline__ void rope_pair(float* v, int dim, int n_rot, const Ro
 
 // ---------------------------------------------------------------- the compressed row of a KV source
 constexpr int PUB_THREADS = 512;
-__global__ void __launch_bounds__(PUB_THREADS) publish_kernel(const PublishArgs a) {
-    __shared__ float sh[32];
-    __shared__ float c[512];
-    __shared__ float ik[128];
+// the row a completed position p writes (rows c, ik: shared scratch): ratio 2 pools (pv, pg) - the pair's even token -
+// with (v, g); ratio 1 takes v
+__device__ void publish_row(const PublishArgs& a, int p, const float* v, const float* g, const float* pv,
+                            const float* pg, float* c, float* ik, float* sh) {
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int D = a.D;
     int row, rpos;
     if (a.ratio == 2) {
-        if ((a.p & 1) == 0) {   // the pair's first token: park it
-            for (int d = tid; d < D; d += PUB_THREADS) {
-                a.pend[d] = a.v[d];
-                a.pend[D + d] = a.g[d];
-            }
-            return;
-        }
         for (int d = tid; d < D; d += PUB_THREADS) {
-            const float g0 = a.pend[D + d], g1 = a.g[d];
+            const float g0 = pg[d], g1 = g[d];
             const float m = fmaxf(g0, g1);
             const float e0 = expf(g0 - m), e1 = expf(g1 - m);
-            c[d] = (a.pend[d] * e0 + a.v[d] * e1) / (e0 + e1);
+            c[d] = (pv[d] * e0 + v[d] * e1) / (e0 + e1);
         }
-        row = a.p / 2;
-        rpos = a.p - 1;
+        row = p / 2;
+        rpos = p - 1;
     } else {
-        for (int d = tid; d < D; d += PUB_THREADS) c[d] = a.v[d];
-        row = a.p;
-        rpos = a.p;
+        for (int d = tid; d < D; d += PUB_THREADS) c[d] = v[d];
+        row = p;
+        rpos = p;
     }
     __syncthreads();
     float ss = 0.0f;
@@ -135,6 +128,41 @@ __global__ void __launch_bounds__(PUB_THREADS) publish_kernel(const PublishArgs 
     uint16_t* cr = a.comp_cache + (size_t) row * D;
     for (int d = tid; d < D; d += PUB_THREADS) cr[d] = __half_as_ushort(__float2half(c[d]));
 }
+__global__ void __launch_bounds__(PUB_THREADS) publish_kernel(const PublishArgs a) {
+    __shared__ float sh[32];
+    __shared__ float c[512];
+    __shared__ float ik[128];
+    const int D = a.D;
+    if (a.ratio == 2 && (a.p & 1) == 0) {   // the pair's first token: park it
+        for (int d = threadIdx.x; d < D; d += PUB_THREADS) {
+            a.pend[d] = a.v[d];
+            a.pend[D + d] = a.g[d];
+        }
+        return;
+    }
+    publish_row(a, a.p, a.v, a.g, a.pend, a.pend + D, c, ik, sh);
+}
+// a block a token of the batch: v / g rows D apart, the pend ring (ring entries of 2 x D, by p / 2) for a pair whose
+// even token came before the batch, and for the batch's last token when it parks
+__global__ void __launch_bounds__(PUB_THREADS) publish_batch_kernel(const PublishArgs a, int p0, int ring) {
+    __shared__ float sh[32];
+    __shared__ float c[512];
+    __shared__ float ik[128];
+    const int D = a.D, t = blockIdx.x, p = p0 + t;
+    const float* v = a.v + (size_t) t * D;
+    const float* g = a.ratio == 2 ? a.g + (size_t) t * D : nullptr;
+    float* pend = a.pend + (size_t) ((p / 2) % ring) * 2 * D;
+    if (a.ratio == 2 && (p & 1) == 0) {
+        if (t == (int) gridDim.x - 1)
+            for (int d = threadIdx.x; d < D; d += PUB_THREADS) {
+                pend[d] = v[d];
+                pend[D + d] = g[d];
+            }
+        return;
+    }
+    const bool in = t > 0;
+    publish_row(a, p, v, g, in ? v - D : pend, in ? g - D : pend + D, c, ik, sh);
+}
 
 // ---------------------------------------------------------------- q / iq RoPE (no norm)
 __global__ void __launch_bounds__(128) q_rope_kernel(float* q, int n_head, int head_dim, int n_rot, Rope rope, float* iq,
@@ -149,6 +177,24 @@ __global__ void __launch_bounds__(128) q_rope_kernel(float* q, int n_head, int h
     for (int i = tid; i < n_rot; i += blockDim.x) v[base + i] = x[base + i];
     __syncthreads();
     if (tid < n_rot / 2) rope_pair(v, dim, n_rot, isq ? rope : comp_rope, p, tid);
+    __syncthreads();
+    for (int i = tid; i < n_rot; i += blockDim.x) x[base + i] = v[base + i];
+}
+
+// q_rope_kernel over T tokens: blockIdx.y the token (q rows hq floats apart, iq rows hi apart), at p0 + t
+__global__ void __launch_bounds__(128) q_rope_batch_kernel(float* q, size_t hq, int n_head, int head_dim, int n_rot,
+                                                           Rope rope, float* iq, size_t hi, int idx_dim, Rope comp_rope,
+                                                           int p0) {
+    __shared__ float v[512];
+    const int tid = threadIdx.x, t = blockIdx.y;
+    const bool isq = (int) blockIdx.x < n_head;
+    const int dim = isq ? head_dim : idx_dim;
+    float* x = isq ? q + (size_t) t * hq + (size_t) blockIdx.x * head_dim
+                   : iq + (size_t) t * hi + (size_t) (blockIdx.x - n_head) * idx_dim;
+    const int base = dim - n_rot;
+    for (int i = tid; i < n_rot; i += blockDim.x) v[base + i] = x[base + i];
+    __syncthreads();
+    if (tid < n_rot / 2) rope_pair(v, dim, n_rot, isq ? rope : comp_rope, p0 + t, tid);
     __syncthreads();
     for (int i = tid; i < n_rot; i += blockDim.x) x[base + i] = v[base + i];
 }
@@ -186,6 +232,8 @@ __global__ void __launch_bounds__(512) engram_kernel(float* __restrict__ R, cons
                                                      int n_embd, float eps) {
     __shared__ float sh[32];
     const int h = blockIdx.x, tid = threadIdx.x;
+    R += (size_t) blockIdx.y * 4 * n_embd;   // (a batch: blockIdx.y the token)
+    kv += (size_t) blockIdx.y * 5 * n_embd;
     float* x = R + (size_t) h * n_embd;
     const float* key = kv + (size_t) h * n_embd;
     const float* val = kv + (size_t) 4 * n_embd;
@@ -267,6 +315,22 @@ void q_rope(float* q, int n_head, int head_dim, int n_rot, const Rope& rope, flo
     check("q_rope");
 }
 
+void publish_batch(const PublishArgs& a, int p0, int T, int ring, cudaStream_t s) {
+    if (T <= 0) return;
+    publish_batch_kernel<<<T, PUB_THREADS, 0, s>>>(a, p0, ring);
+    check("publish_batch");
+}
+
+void q_rope_batch(float* q, int n_head, int head_dim, int n_rot, const Rope& rope, float* iq, int idx_heads,
+                  int idx_dim, const Rope& comp_rope, int p0, int T, cudaStream_t s) {
+    if (T <= 0) return;
+    const int blocks = n_head + (iq != nullptr ? idx_heads : 0);
+    q_rope_batch_kernel<<<dim3((unsigned) blocks, (unsigned) T), 128, 0, s>>>(
+        q, (size_t) n_head * head_dim, n_head, head_dim, n_rot, rope, iq, (size_t) idx_heads * idx_dim, idx_dim,
+        comp_rope, p0);
+    check("q_rope_batch");
+}
+
 void candidates(const float* score, int n_vis, int block, int top_blocks, float* bscore, int* bsel, unsigned char* keep,
                 cudaStream_t s) {
     if (n_vis <= 0) return;
@@ -308,6 +372,13 @@ void engram_wait(const unsigned int* flag, unsigned int want, const float* src, 
 void engram_add(float* R, const float* kv, const float* qn, const float* kn, int n_embd, float eps, cudaStream_t s) {
     engram_kernel<<<4, 512, 0, s>>>(R, kv, qn, kn, n_embd, eps);
     check("engram");
+}
+
+void engram_add_rows(float* R, const float* kv, const float* qn, const float* kn, int n_embd, float eps, int T,
+                     cudaStream_t s) {
+    if (T <= 0) return;
+    engram_kernel<<<dim3(4u, (unsigned) T), 512, 0, s>>>(R, kv, qn, kn, n_embd, eps);
+    check("engram_rows");
 }
 
 void head_prep(const float* R, const float* pre, const float* norm_w, float eps, int n_embd, float* x, void* xq,

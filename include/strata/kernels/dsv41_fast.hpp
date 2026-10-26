@@ -35,6 +35,13 @@ struct PublishArgs {
 };
 void publish(const PublishArgs& a, cudaStream_t s);
 
+/// publish for the T tokens p0 .. p0 + T - 1 of a prompt sub-batch: a.v / a.g their rows (D apart), a.pend the slot's
+/// pend ring (ring entries of 2 x D by p / 2: a pair's even token from before the batch, and the last token's park).
+void publish_batch(const PublishArgs& a, int p0, int T, int ring, cudaStream_t s);
+/// q_rope for T tokens at p0 + t: q rows n_head * head_dim floats apart, iq rows idx_heads * idx_dim.
+void q_rope_batch(float* q, int n_head, int head_dim, int n_rot, const Rope& rope, float* iq, int idx_heads,
+                  int idx_dim, const Rope& comp_rope, int p0, int T, cudaStream_t s);
+
 /// q (n_head x head_dim): RoPE on the last n_rot dims at p (V4.1 has no per-head q norm); iq (may be null): RoPE on
 /// its last n_rot dims at p with comp_rope.
 void q_rope(float* q, int n_head, int head_dim, int n_rot, const Rope& rope, float* iq, int idx_heads, int idx_dim,
@@ -52,6 +59,9 @@ void candidate_mask(float* score, int n_vis, int block, const unsigned char* kee
 /// qn / kn = [4][n_embd] norm weights; per stream h: s = rms(R_h) * qn_h . rms(key_h) * kn_h / sqrt(n_embd),
 /// g = sigmoid(sign(s) sqrt(max(|s|, 1e-6))), R_h += g * value.
 void engram_add(float* R, const float* kv, const float* qn, const float* kn, int n_embd, float eps, cudaStream_t s);
+/// engram_add for T tokens: R rows 4 x n_embd apart, kv rows 5 x n_embd apart.
+void engram_add_rows(float* R, const float* kv, const float* qn, const float* kn, int n_embd, float eps, int T,
+                     cudaStream_t s);
 /// Waits on the device until the host-pinned *flag == want, then copies n floats from the pinned src to dst.
 void engram_wait(const unsigned int* flag, unsigned int want, const float* src, float* dst, int n, cudaStream_t s);
 

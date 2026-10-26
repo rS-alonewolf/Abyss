@@ -7,6 +7,26 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.60 - 2026-10-26
+
+**DeepSeek V4.1 long prompts another 2.5-3.2x faster: the rest of the attention and Engram batched.**
+
+- DeepSeek V4.1 prompts: what v1.3.59 left a token at a time now runs over each 1,024-token sub-batch - the window
+  keys (the token path's prep over the batch), the KV source's compressed rows and index keys (a pair's first token
+  from the batch or, across sub-batches, the pend ring), q's RoPE, the indexer (scores of every row's visible
+  compressed rows in row groups the score buffer holds, the candidate blocks / mask a row at a time past 16K, each
+  row's top 512 into its own selection slot) and the attention (deepseek4's batched kernels, taught V4.1's ratios 1 /
+  2: every visible row while they fit the top 512, else the row's selection). 32K: the attention 62 -> ~10 s.
+- DeepSeek V4.1 prompts: Engram's engram_kv as one FP16 GEMM over each 256-token block instead of a GEMV a token (it
+  read its ~160 MB again for every token; 32K: 20 -> 3.9 s).
+- AI PRO R9700 + iGPU, prompt tok/s at 2K / 8K / 16K / 32K / 60K: UD-IQ2_XXS 127 / 237 / 292 / 314 / 277 ->
+  140 / 363 / 596 / 781 / 896; Maya-XS 209 / 192 / 334 / 327 / 288 -> 478 / 964 / 1,055 / 1,093 / 1,028 (Project
+  Maya v1.1.28 on the same file, same client: 159 / 506 / 694 / 948 / 1,235). Decode unchanged. KL of 255 tokens
+  after 8K / 20K / 40K contexts against the token-at-a-time attention: 0.0039 / 0.0040 / 0.0038 (the run-to-run floor
+  is 0.0032); DeepSeek V4's prompt path, which shares the attention kernels, 0.0030 against its token path.
+  `STRATA_GLM_V41_ATTN_TOK=1` / `STRATA_GLM_V41_ENG_GEMM=0` go back to a token at a time.
+- Not yet run on an RTX 5090 (the CUDA build compiles; v1.3.58 and v1.3.59 are in the same state).
+
 ## v1.3.59 - 2026-10-26
 
 **DeepSeek V4.1 prompts another 2.2-2.7x faster: the attention's projections batched.**

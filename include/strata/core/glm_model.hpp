@@ -492,6 +492,9 @@ public:
     // deepseek41's: the projections batched, the caches' order a token at a time (glm_prefill.cu)
     bool prefill_v41_mixer(int il, int64_t p0, int tn, int row0, const uint16_t* x16, const float* xs, float* mixer,
                            bool skip_output, void* uni, std::string& err);
+    // ... and one Engram block's adds as a GEMM (false: the token path's GEMV a token at a time)
+    bool prefill_v41_engram_block(int il, int bn, int kd, const float* rows, float* R, std::string& err);
+    bool prefill_v41_engram_gemm() const;
     bool fast_setup(std::string& err);
     void fast_destroy();
     bool forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err);

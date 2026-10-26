@@ -399,6 +399,7 @@ struct Glm5Model::PrefillState {
     size_t borrow_bytes = 0, ws_bytes = 0, gbuf_bytes = 0;
     bool lent = false;
     bool has_kda = false, has_dsa = false, has_dense = false, has_moe = false;
+    bool v41_eng_gemm = false;       // deepseek41: Engram's engram_kv as a GEMM over a block (prefill_v41_engram_block)
     uint8_t* region = nullptr;       // the pool's lendable tail
     size_t region_bytes = 0;
     int T_bound = 0;                 // the chunk the pointers are carved for (<= T)
@@ -626,6 +627,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     bool has_kda = false, has_dsa = false, has_moe = false, has_dense = false, has_deq = false, v41_tok = false;
+    bool v41_eng_tok = false;
     size_t gstride = 0;
     std::string why;
     const auto deq_ok = [&](const WSlot& w, const char* nm, int il) {
@@ -664,6 +666,13 @@ bool Glm5Model::prefill_setup(std::string& err) {
             if (why.size() != before) {
                 v41_tok = true;
                 why.resize(before);
+            }
+            if (Ly.eng >= 0) {
+                deq_ok(Ly.eng_kv, "engram_kv", il);
+                if (why.size() != before) {
+                    v41_eng_tok = true;
+                    why.resize(before);
+                }
             }
         } else if (g.dsv4()) {
             has_dsa = true;
@@ -736,6 +745,10 @@ bool Glm5Model::prefill_setup(std::string& err) {
     S->has_dsa = has_dsa;
     S->has_dense = has_dense;
     S->has_moe = has_moe;
+    if (g.v41) {   // STRATA_GLM_V41_ENG_GEMM=0: Engram's adds a token at a time (the token path's GEMV)
+        static const bool eng_env = [] { const char* v = getenv("STRATA_GLM_V41_ENG_GEMM"); return v == nullptr || std::atoi(v) != 0; }();
+        S->v41_eng_gemm = has_dsa && eng_env && !v41_eng_tok;
+    }
     S->max_pools = (int) std::max<int64_t>(1, max_ctx_ / g.idx_kpool);
     S->sub_env = prefill_sub_env();
     S->prof = getenv("STRATA_GLM_PREFILL_PROF") != nullptr;
@@ -1648,84 +1661,172 @@ bool Glm5Model::prefill_v41_mixer(int il, int64_t p0_64, int tn, int row0, const
                             &zero, B.iw, g.idx_heads),
                 "v41 indexer weights");
     }
-    // 2. q_a's norm (its q8_1 rows into o16, free until step 5), q_b and the indexer's q
-    if (attn) {
-        d41::rms_rows(B.qr_raw, tn, Ly.q_a_norm, g.norm_eps, g.q_lora, B.qr, (void*) B.o16, s);
-        ds::to_f16(B.qr, B.qr16, (int64_t) tn * g.q_lora, s);
-        hgemm(Ly.q_b, HD, g.q_lora, B.qr16, g.q_lora, B.q, HD);
-        if (Ly.idx_src) hgemm(Ly.idx_q_b_q, IQ, g.q_lora, B.qr16, g.q_lora, B.iq, IQ);
-    }
-    S->mark("v41_proj", s);
-    // 3. a token at a time: the window ring, the KV source's row, q's RoPE, the indexer, the attention
+    // STRATA_GLM_V41_ATTN_TOK=1: steps 2-3 a token at a time on the token path's kernels (A/B, v1.3.59's path)
+    static const bool attn_tok = [] { const char* v = getenv("STRATA_GLM_V41_ATTN_TOK"); return v && std::atoi(v) != 0; }();
     const size_t vr = prefill_v41_row();
-    for (int t = 0; t < tn; ++t) {
-        if ((t & 255) == 255) progress_beat();   // (the watchdog: a slow layer is not a stuck one)
-        const int p = p0 + t;
-        ds::PrepArgs a;   // (its qr half on row t too: F->qr / qr_q, which nothing reads after)
-        a.qr_raw = B.qr_raw + (size_t) t * g.q_lora;
+    if (!attn_tok) {
+        S->mark("v41_proj", s);
+        // 2. the window keys (the ring's last positions, then this sub-batch's: prep over the batch), q_a's norm, the
+        // KV source's compressed rows
+        const int n_hist = std::min(p0, g.n_swa - 1);
+        ds::win_load(Ly.raw, ds_ring_, B.keys, n_hist, p0, D, s);
+        ds::BatchPrepArgs a;
+        a.qr_raw = B.qr_raw;
         a.q_a_norm = Ly.q_a_norm;
-        a.qr = F->qr;
-        a.qr_q = F->qr_q;
+        a.qr = B.qr;
+        a.qr16 = B.qr16;
         a.q_lora = g.q_lora;
-        a.kv_raw = B.kv_raw + (size_t) t * D;
+        a.kv_raw = B.kv_raw;
         a.kv_norm = Ly.kv_a_norm;
-        a.raw = Ly.raw;
-        a.ring = ds_ring_;
+        a.keys = B.keys;
+        a.n_hist = n_hist;
         a.head_dim = D;
         a.n_rot = g.n_rot;
         a.rope = rope;
-        a.comp_rope = crope;
-        a.p = p;
+        a.p0 = p0;
+        a.T = tn;
         a.eps = g.norm_eps;
-        ds::prep(a, s);
+        ds::prep_batch(a, s);
+        ds::win_store(Ly.raw, ds_ring_, B.keys, n_hist, p0, tn, D, s);
         if (Ly.kv_src) {
             d41::PublishArgs pa;
-            pa.v = B.ckv + (size_t) t * D;
-            pa.g = r == 2 ? B.csc + (size_t) t * D : nullptr;
-            pa.pend = F->v41_pend[Ly.slot] + (size_t) ((p / 2) % FastState::kV41PendRing) * 2 * D;
+            pa.v = B.ckv;
+            pa.g = r == 2 ? B.csc : nullptr;
+            pa.pend = F->v41_pend[Ly.slot];
             pa.norm = Ly.comp_norm;
             pa.idx_k = (const uint16_t*) Ly.idx_k_w.q;
             pa.idx_k_norm = Ly.idx_k_norm;
             pa.comp_cache = Ly.comp_cache;
             pa.idx_cache = Ly.idx_cache;
             pa.ratio = r;
-            pa.p = p;
             pa.D = D;
             pa.idx_dim = g.idx_key;
             pa.n_rot = g.n_rot;
             pa.rope = crope;
             pa.eps = g.norm_eps;
-            d41::publish(pa, s);
+            d41::publish_batch(pa, p0, tn, FastState::kV41PendRing, s);
         }
-        if (!attn) continue;
-        float* const q = B.q + (size_t) t * HD;
-        float* const iq = Ly.idx_src ? B.iq + (size_t) t * IQ : nullptr;
-        d41::q_rope(q, g.n_head, D, g.n_rot, rope, iq, g.idx_heads, g.idx_key, crope, p, s);
-        int* const sel_buf = (int*) (S->v41_rows + (size_t) (row0 + t) * vr);
-        unsigned char* const keep_buf = (unsigned char*) (sel_buf + g.idx_top_k);
-        int n_comp = 0;
-        const int* sel = nullptr;
-        if (r != 0) {
-            const int n_vis = (p + 1) / r;
-            if (n_vis > g.idx_top_k) {
-                if (Ly.idx_src) {
-                    ds::indexer_scores(iq, Ly.idx_cache, B.iw + (size_t) t * g.idx_heads, g.idx_heads, n_vis,
-                                       F->v41_score, s);
-                    if (il == g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
-                        d41::candidates(F->v41_score, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore, F->v41_bsel,
-                                        keep_buf, s);
-                    if (il > g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
-                        d41::candidate_mask(F->v41_score, n_vis, g.cand_bs, keep_buf, s);
-                    ds::indexer_select(F->v41_score, n_vis, g.idx_top_k, sel_buf, s);
-                }
-                n_comp = g.idx_top_k;
-                sel = sel_buf;
-            } else {
-                n_comp = n_vis;
+        if (!attn) {
+            S->mark("v41_attn", s);
+            return true;
+        }
+        // 3. q, the indexer's q, their RoPE
+        hgemm(Ly.q_b, HD, g.q_lora, B.qr16, g.q_lora, B.q, HD);
+        if (Ly.idx_src) hgemm(Ly.idx_q_b_q, IQ, g.q_lora, B.qr16, g.q_lora, B.iq, IQ);
+        d41::q_rope_batch(B.q, g.n_head, D, g.n_rot, rope, Ly.idx_src ? B.iq : nullptr, g.idx_heads, g.idx_key, crope,
+                          p0, tn, s);
+        S->mark("v41_q", s);
+        // 4. the indexer (rows whose visible compressed rows outgrow top_k), in row groups the score buffer holds;
+        // the candidate blocks / mask a row at a time on the rows past them; the selection into each row's own
+        // slot, which the layers reading this source's selection take
+        int* const sel0 = (int*) (S->v41_rows + (size_t) row0 * vr);
+        const int sel_ld = (int) (vr / sizeof(int));
+        if (r != 0 && Ly.idx_src && (p0 + tn) / r > g.idx_top_k) {
+            const size_t cap = (size_t) tn * (size_t) B.score_ld;
+            const int cand_min = g.cand_blocks * g.cand_bs;
+            for (int g0 = 0; g0 < tn;) {
+                int gn = (int) std::max<size_t>(1, std::min<size_t>((size_t) (tn - g0), cap / (size_t) std::max(1, (p0 + tn) / r)));
+                const int ld = std::max(1, (p0 + g0 + gn) / r);
+                ds::indexer_batch_scores(B.iq + (size_t) g0 * IQ, Ly.idx_cache, B.iw + (size_t) g0 * g.idx_heads,
+                                         g.idx_heads, r, p0 + g0, gn, B.score, ld, s);
+                if (il >= g.cand_layer)
+                    for (int t = g0; t < g0 + gn; ++t) {
+                        const int n_vis = (p0 + t + 1) / r;
+                        if (n_vis <= cand_min) continue;
+                        float* const sc = B.score + (size_t) (t - g0) * ld;
+                        unsigned char* const keep = (unsigned char*) (sel0 + (size_t) t * sel_ld + g.idx_top_k);
+                        if (il == g.cand_layer)
+                            d41::candidates(sc, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore, F->v41_bsel, keep, s);
+                        else
+                            d41::candidate_mask(sc, n_vis, g.cand_bs, keep, s);
+                    }
+                ds::indexer_batch_select(B.score, ld, r, p0 + g0, gn, g.idx_top_k, sel0 + (size_t) g0 * sel_ld, sel_ld, s);
+                g0 += gn;
             }
         }
-        ds::attend(q, Ly.raw, ds_ring_, std::min(p + 1, g.n_swa), Ly.comp_cache, sel, n_comp, Ly.sinks, g.n_head, D,
-                   g.n_rot, rope, p, B.o + (size_t) t * HD, s);
+        S->mark("v41_index", s);
+        // 5. attention over each row's window and compressed rows (all visible ones while they fit top_k)
+        ds::attend_batch(B.q, B.keys, n_hist, g.n_swa, Ly.comp_cache, sel0, g.idx_top_k, r == 0 ? 0 : -r, Ly.sinks,
+                         g.n_head, D, g.n_rot, rope, p0, tn, B.o, s, sel_ld);
+    } else {
+        // 2. q_a's norm (its q8_1 rows into o16, free until step 5), q_b and the indexer's q
+        if (attn) {
+            d41::rms_rows(B.qr_raw, tn, Ly.q_a_norm, g.norm_eps, g.q_lora, B.qr, (void*) B.o16, s);
+            ds::to_f16(B.qr, B.qr16, (int64_t) tn * g.q_lora, s);
+            hgemm(Ly.q_b, HD, g.q_lora, B.qr16, g.q_lora, B.q, HD);
+            if (Ly.idx_src) hgemm(Ly.idx_q_b_q, IQ, g.q_lora, B.qr16, g.q_lora, B.iq, IQ);
+        }
+        S->mark("v41_proj", s);
+        // 3. a token at a time: the window ring, the KV source's row, q's RoPE, the indexer, the attention
+        for (int t = 0; t < tn; ++t) {
+            if ((t & 255) == 255) progress_beat();   // (the watchdog: a slow layer is not a stuck one)
+            const int p = p0 + t;
+            ds::PrepArgs a;   // (its qr half on row t too: F->qr / qr_q, which nothing reads after)
+            a.qr_raw = B.qr_raw + (size_t) t * g.q_lora;
+            a.q_a_norm = Ly.q_a_norm;
+            a.qr = F->qr;
+            a.qr_q = F->qr_q;
+            a.q_lora = g.q_lora;
+            a.kv_raw = B.kv_raw + (size_t) t * D;
+            a.kv_norm = Ly.kv_a_norm;
+            a.raw = Ly.raw;
+            a.ring = ds_ring_;
+            a.head_dim = D;
+            a.n_rot = g.n_rot;
+            a.rope = rope;
+            a.comp_rope = crope;
+            a.p = p;
+            a.eps = g.norm_eps;
+            ds::prep(a, s);
+            if (Ly.kv_src) {
+                d41::PublishArgs pa;
+                pa.v = B.ckv + (size_t) t * D;
+                pa.g = r == 2 ? B.csc + (size_t) t * D : nullptr;
+                pa.pend = F->v41_pend[Ly.slot] + (size_t) ((p / 2) % FastState::kV41PendRing) * 2 * D;
+                pa.norm = Ly.comp_norm;
+                pa.idx_k = (const uint16_t*) Ly.idx_k_w.q;
+                pa.idx_k_norm = Ly.idx_k_norm;
+                pa.comp_cache = Ly.comp_cache;
+                pa.idx_cache = Ly.idx_cache;
+                pa.ratio = r;
+                pa.p = p;
+                pa.D = D;
+                pa.idx_dim = g.idx_key;
+                pa.n_rot = g.n_rot;
+                pa.rope = crope;
+                pa.eps = g.norm_eps;
+                d41::publish(pa, s);
+            }
+            if (!attn) continue;
+            float* const q = B.q + (size_t) t * HD;
+            float* const iq = Ly.idx_src ? B.iq + (size_t) t * IQ : nullptr;
+            d41::q_rope(q, g.n_head, D, g.n_rot, rope, iq, g.idx_heads, g.idx_key, crope, p, s);
+            int* const sel_buf = (int*) (S->v41_rows + (size_t) (row0 + t) * vr);
+            unsigned char* const keep_buf = (unsigned char*) (sel_buf + g.idx_top_k);
+            int n_comp = 0;
+            const int* sel = nullptr;
+            if (r != 0) {
+                const int n_vis = (p + 1) / r;
+                if (n_vis > g.idx_top_k) {
+                    if (Ly.idx_src) {
+                        ds::indexer_scores(iq, Ly.idx_cache, B.iw + (size_t) t * g.idx_heads, g.idx_heads, n_vis,
+                                           F->v41_score, s);
+                        if (il == g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
+                            d41::candidates(F->v41_score, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore, F->v41_bsel,
+                                            keep_buf, s);
+                        if (il > g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
+                            d41::candidate_mask(F->v41_score, n_vis, g.cand_bs, keep_buf, s);
+                        ds::indexer_select(F->v41_score, n_vis, g.idx_top_k, sel_buf, s);
+                    }
+                    n_comp = g.idx_top_k;
+                    sel = sel_buf;
+                } else {
+                    n_comp = n_vis;
+                }
+            }
+            ds::attend(q, Ly.raw, ds_ring_, std::min(p + 1, g.n_swa), Ly.comp_cache, sel, n_comp, Ly.sinks, g.n_head, D,
+                       g.n_rot, rope, p, B.o + (size_t) t * HD, s);
+        }
     }
     S->mark("v41_attn", s);
     if (skip_output) return true;
@@ -1746,6 +1847,42 @@ bool Glm5Model::prefill_v41_mixer(int il, int64_t p0_64, int tn, int row0, const
     hgemm(Ly.out_b, E, OL, B.oa16, OL, mixer, E);
     abl_apply(il, 0, mixer, tn, E, s);
     S->mark("v41_out", s);
+    return true;
+}
+
+// deepseek41: one Engram block's adds (bn tokens, their rows kd floats apart, R's rows 4 x n_embd apart): engram_kv
+// as an FP16 GEMM on its dequantized weight - the token path's GEMV read its ~160 MB again for every token, ~0.3 ms a
+// token and layer on an AI PRO R9700 - then the gate and add a token a block.  The mixer's sub-batch buffers are free
+// here (the Engram add comes before the layer's attention)
+bool Glm5Model::prefill_v41_engram_gemm() const { return pf_ != nullptr && pf_->v41_eng_gemm; }
+
+bool Glm5Model::prefill_v41_engram_block(int il, int bn, int kd, const float* rows, float* R, std::string& err) {
+    FastState* F = fast_;
+    PrefillState* S = pf_;
+    const Glm5Geometry& g = g_;
+    const cudaStream_t s = F->cs;
+    const auto& Ly = F->L[(size_t) il];
+    const int N = 5 * g.n_embd;
+    const float one = 1.0f, zero = 0.0f;
+    Carve c{(uint8_t*) S->uni};
+    uint16_t* const x16 = c.take<uint16_t>((size_t) bn * kd);
+    float* const kv = c.take<float>((size_t) bn * N);
+    strata::kernels::dsv4::to_f16(rows, x16, (int64_t) bn * kd, s);
+    const WSlot& w = Ly.eng_kv;
+    const int step = (int) std::max<int64_t>(1, std::min<int64_t>(N, S->w16_elems / kd));
+    for (int r0 = 0; r0 < N; r0 += step) {
+        const int n = std::min(step, N - r0);
+        if (w.type == gf::kTypeBF16)
+            gb::bf16_to_f16((const uint16_t*) w.q + (size_t) r0 * kd, S->w16, (int64_t) n * kd, s);
+        else
+            strata::kernels::dequant_f16(w.type, w.q, r0, n, kd, S->w16, s);
+        blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, bn, kd, &one, S->w16, CUDA_R_16F, kd, x16,
+                             CUDA_R_16F, kd, &zero, kv + r0, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
+                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                "v41 engram gemm");
+    }
+    (void) err;
+    strata::kernels::dsv41::engram_add_rows(R, kv, Ly.eng_qn, Ly.eng_kn, g.n_embd, g.norm_eps, bn, s);
     return true;
 }
 

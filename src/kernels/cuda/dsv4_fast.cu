@@ -1080,19 +1080,37 @@ __global__ void __launch_bounds__(IWB2_WAVES * 32) idx_score_batch_wmma2_kernel(
 }
 #endif
 __global__ void __launch_bounds__(1024) idx_select_batch_kernel(const float* __restrict__ score, int ld, int ratio, int p0,
-                                                                int top_k, int* __restrict__ sel) {
+                                                                int top_k, int* __restrict__ sel, int sel_ld) {
     const int t = blockIdx.x;
     const int n_vis = (p0 + t + 1) / ratio;
     if (n_vis <= 0) return;
-    strata::kernels::dsa::select_top_pools(score + (size_t) t * ld, n_vis, min(top_k, n_vis), 1, sel + (size_t) t * top_k);
+    strata::kernels::dsa::select_top_pools(score + (size_t) t * ld, n_vis, min(top_k, n_vis), 1, sel + (size_t) t * sel_ld);
 
+}
+
+// The compressed rows token p attends: deepseek4's ratio 128 every visible row, ratio 4 sel's min(top_k, visible);
+// deepseek41 (ratio passed negated: -1 / -2) every visible row while they fit top_k, else sel's top_k - the token
+// path's rule (dsv41_fast_path.cu).  use_sel: the rows come from sel
+__device__ __forceinline__ int comp_rows(int ratio, int p, int top_k, bool& use_sel) {
+    use_sel = false;
+    if (ratio == 128) return (p + 1) / 128;
+    if (ratio == 4) {
+        use_sel = true;
+        return min(top_k, (p + 1) / 4);
+    }
+    if (ratio < 0) {
+        const int vis = (p + 1) / -ratio;
+        use_sel = vis > top_k;
+        return use_sel ? top_k : vis;
+    }
+    return 0;
 }
 
 // 8 heads of one token per block, online softmax over tiles of 32 keys (the sink seeds the max and the sum)
 constexpr int AB_H = 8, AB_TILE = 32;
 __global__ void __launch_bounds__(256) attend_batch_kernel(const float* __restrict__ q, const uint16_t* __restrict__ keys,
                                                            int n_hist, int n_swa, const uint16_t* __restrict__ comp,
-                                                           const int* __restrict__ sel, int top_k, int ratio,
+                                                           const int* __restrict__ sel, int top_k, int sel_ld, int ratio,
                                                            const float* __restrict__ sinks, int n_head, int n_rot,
                                                            Rope rope, int p0, float scale, float* __restrict__ out) {
     constexpr int D = 512;
@@ -1109,13 +1127,12 @@ __global__ void __launch_bounds__(256) attend_batch_kernel(const float* __restri
     }
     const int n_raw = min(p + 1, n_swa);
     const int raw0 = p - n_raw + 1 - (p0 - n_hist);   // the window's first row in keys
-    int n_c = 0;
-    if (ratio == 128) n_c = (p + 1) / 128;
-    else if (ratio == 4) n_c = min(top_k, (p + 1) / 4);
+    bool use_sel;
+    const int n_c = comp_rows(ratio, p, top_k, use_sel);
     const int n = n_raw + n_c;
     const auto key = [&](int j) -> const __half2* {
         if (j < n_raw) return (const __half2*) (keys + (size_t) (raw0 + j) * D);
-        const int r = ratio == 4 ? sel[(size_t) t * top_k + (j - n_raw)] : j - n_raw;
+        const int r = use_sel ? sel[(size_t) t * sel_ld + (j - n_raw)] : j - n_raw;
         return (const __half2*) (comp + (size_t) r * D);
     };
     float acc[AB_H][2];
@@ -1220,7 +1237,7 @@ __device__ __forceinline__ unsigned abm_h2(float x, float y) {
 constexpr int ABM_H = 16, ABM_TILE = 32, ABM_KS = 136;   // heads a block, keys a tile, a key row's stride (halves)
 __global__ void __launch_bounds__(128) attend_batch_mma_kernel(const float* __restrict__ q, const uint16_t* __restrict__ keys,
                                                                int n_hist, int n_swa, const uint16_t* __restrict__ comp,
-                                                               const int* __restrict__ sel, int top_k, int ratio,
+                                                               const int* __restrict__ sel, int top_k, int sel_ld, int ratio,
                                                                const float* __restrict__ sinks, int n_head, int n_rot,
                                                                Rope rope, int p0, float scale, float* __restrict__ out) {
     constexpr int D = 512;
@@ -1233,9 +1250,8 @@ __global__ void __launch_bounds__(128) attend_batch_mma_kernel(const float* __re
     const int p = p0 + t;
     const int n_raw = min(p + 1, n_swa);
     const int raw0 = p - n_raw + 1 - (p0 - n_hist);
-    int n_c = 0;
-    if (ratio == 128) n_c = (p + 1) / 128;
-    else if (ratio == 4) n_c = min(top_k, (p + 1) / 4);
+    bool use_sel;
+    const int n_c = comp_rows(ratio, p, top_k, use_sel);
     const int n = n_raw + n_c;
     // Q's A fragments for this warp's dims: [k step 8][4], hi (and lo)
     unsigned qa[8][4], ql[8][4];
@@ -1271,7 +1287,7 @@ __global__ void __launch_bounds__(128) attend_batch_mma_kernel(const float* __re
             uint4 v = make_uint4(0u, 0u, 0u, 0u);
             if (j < n) {
                 const uint16_t* row = j < n_raw ? keys + (size_t) (raw0 + j) * D
-                                                : comp + (size_t) (ratio == 4 ? sel[(size_t) t * top_k + (j - n_raw)] : j - n_raw) * D;
+                                                : comp + (size_t) (use_sel ? sel[(size_t) t * sel_ld + (j - n_raw)] : j - n_raw) * D;
                 v = *reinterpret_cast<const uint4*>(row + w * 128 + ch * 8);
             }
             *reinterpret_cast<uint4*>(&s_k[w][kk][ch * 8]) = v;
@@ -1393,7 +1409,7 @@ __global__ void __launch_bounds__(128) attend_batch_mma_kernel(const float* __re
 constexpr int AW_H = 16;
 __global__ void __launch_bounds__(256) attend_batch_wmma_kernel(const float* __restrict__ q, const uint16_t* __restrict__ keys,
                                                                 int n_hist, int n_swa, const uint16_t* __restrict__ comp,
-                                                                const int* __restrict__ sel, int top_k, int ratio,
+                                                                const int* __restrict__ sel, int top_k, int sel_ld, int ratio,
                                                                 const float* __restrict__ sinks, int n_head, int n_rot,
                                                                 Rope rope, int p0, float scale, float* __restrict__ out) {
     constexpr int D = 512;
@@ -1407,9 +1423,8 @@ __global__ void __launch_bounds__(256) attend_batch_wmma_kernel(const float* __r
     const int t = blockIdx.x, h0 = blockIdx.y * AW_H, p = p0 + t;
     const int n_raw = min(p + 1, n_swa);
     const int raw0 = p - n_raw + 1 - (p0 - n_hist);
-    int n_c = 0;
-    if (ratio == 128) n_c = (p + 1) / 128;
-    else if (ratio == 4) n_c = min(top_k, (p + 1) / 4);
+    bool use_sel;
+    const int n_c = comp_rows(ratio, p, top_k, use_sel);
     const int n = n_raw + n_c;
     // Q: head l16, dims [64 wave, +64), scaled into FP16's range (the scale's inverse undoes it on the scores)
     const float* qr = q + ((size_t) t * n_head + h0 + l16) * D + wave * 64;
@@ -1437,7 +1452,7 @@ __global__ void __launch_bounds__(256) attend_batch_wmma_kernel(const float* __r
             const int j = s0 + tid;
             rows[tid] = j >= n ? nullptr
                         : j < n_raw ? keys + (size_t) (raw0 + j) * D
-                                    : comp + (size_t) (ratio == 4 ? sel[(size_t) t * top_k + (j - n_raw)] : j - n_raw) * D;
+                                    : comp + (size_t) (use_sel ? sel[(size_t) t * sel_ld + (j - n_raw)] : j - n_raw) * D;
         }
         __syncthreads();
         for (int i = tid; i < 16 * D / 8; i += 256) {
@@ -1999,7 +2014,7 @@ void indexer_batch(float* iq, const uint16_t* K, const float* w, int idx_heads, 
         const dim3 grid((unsigned) ((max_vis + IWB2_ROWS - 1) / IWB2_ROWS), (unsigned) ((T + IWB2_TT - 1) / IWB2_TT));
         idx_score_batch_wmma2_kernel<<<grid, IWB2_WAVES * 32, 0, s>>>(iq, K, w, ratio, p0, T, score, ld);
         check("idx_score_batch_wmma");
-        idx_select_batch_kernel<<<T, 1024, 0, s>>>(score, ld, ratio, p0, top_k, sel);
+        idx_select_batch_kernel<<<T, 1024, 0, s>>>(score, ld, ratio, p0, top_k, sel, top_k);
         check("idx_select_batch");
         return;
     }
@@ -2013,7 +2028,22 @@ void indexer_batch(float* iq, const uint16_t* K, const float* w, int idx_heads, 
         idx_score_batch_kernel<<<grid, 256, 0, s>>>(iq, K, w, idx_heads, ratio, p0, T, score, ld);
         check("idx_score_batch");
     }
-    idx_select_batch_kernel<<<T, 1024, 0, s>>>(score, ld, ratio, p0, top_k, sel);
+    idx_select_batch_kernel<<<T, 1024, 0, s>>>(score, ld, ratio, p0, top_k, sel, top_k);
+    check("idx_select_batch");
+}
+void indexer_batch_scores(const float* iq, const uint16_t* K, const float* w, int idx_heads, int ratio, int p0, int T,
+                          float* score, int ld, cudaStream_t s) {
+    const int max_vis = (p0 + T) / ratio;
+    if (T <= 0 || max_vis <= 0) return;
+    // (the WMMA / mma kernels are 64 heads: deepseek41's 32 take the plain one)
+    const dim3 grid((unsigned) ((max_vis + IRT - 1) / IRT), (unsigned) ((T + IQT - 1) / IQT));
+    idx_score_batch_kernel<<<grid, 256, 0, s>>>(iq, K, w, idx_heads, ratio, p0, T, score, ld);
+    check("idx_score_batch");
+}
+void indexer_batch_select(const float* score, int ld, int ratio, int p0, int T, int top_k, int* sel, int sel_ld,
+                          cudaStream_t s) {
+    if (T <= 0) return;
+    idx_select_batch_kernel<<<T, 1024, 0, s>>>(score, ld, ratio, p0, top_k, sel, sel_ld);
     check("idx_select_batch");
 }
 // the prompt path's tensor-core attention: sm_80+ in a CUDA build, head_dim 512, 16 | n_head, unless STRATA_DS4_ATTN=1
@@ -2039,13 +2069,14 @@ static bool attn_use_mma(int n_head, int head_dim) {
 }
 void attend_batch(const float* q, const uint16_t* keys, int n_hist, int n_swa, const uint16_t* comp, const int* sel,
                   int top_k, int ratio, const float* sinks, int n_head, int head_dim, int n_rot, const Rope& rope, int p0,
-                  int T, float* out, cudaStream_t s) {
+                  int T, float* out, cudaStream_t s, int sel_ld) {
     if (T <= 0) return;
+    if (sel_ld <= 0) sel_ld = top_k;
 #if defined(STRATA_USE_HIP)
     static const bool old_attn = [] { const char* v = getenv("STRATA_DS4_ATTN"); return v && std::atoi(v) == 1; }();
     if (!old_attn && head_dim == 512 && n_head % AW_H == 0 && n_rot <= 512 && hip_wmma_arch()) {
         attend_batch_wmma_kernel<<<dim3((unsigned) T, (unsigned) (n_head / AW_H)), 256, 0, s>>>(
-            q, keys, n_hist, n_swa, comp, sel, top_k, ratio, sinks, n_head, n_rot, rope, p0, 1.0f / sqrtf((float) head_dim),
+            q, keys, n_hist, n_swa, comp, sel, top_k, sel_ld, ratio, sinks, n_head, n_rot, rope, p0, 1.0f / sqrtf((float) head_dim),
             out);
         check("attend_batch_wmma");
         return;
@@ -2053,13 +2084,13 @@ void attend_batch(const float* q, const uint16_t* keys, int n_hist, int n_swa, c
 #endif
     if (attn_use_mma(n_head, head_dim)) {
         attend_batch_mma_kernel<<<dim3((unsigned) T, (unsigned) (n_head / ABM_H)), 128, 0, s>>>(
-            q, keys, n_hist, n_swa, comp, sel, top_k, ratio, sinks, n_head, n_rot, rope, p0, 1.0f / sqrtf((float) head_dim),
+            q, keys, n_hist, n_swa, comp, sel, top_k, sel_ld, ratio, sinks, n_head, n_rot, rope, p0, 1.0f / sqrtf((float) head_dim),
             out);
         check("attend_batch_mma");
         return;
     }
     attend_batch_kernel<<<dim3((unsigned) T, (unsigned) (n_head / AB_H)), 256, 0, s>>>(
-        q, keys, n_hist, n_swa, comp, sel, top_k, ratio, sinks, n_head, n_rot, rope, p0, 1.0f / sqrtf((float) head_dim),
+        q, keys, n_hist, n_swa, comp, sel, top_k, sel_ld, ratio, sinks, n_head, n_rot, rope, p0, 1.0f / sqrtf((float) head_dim),
         out);
     check("attend_batch");
 }
