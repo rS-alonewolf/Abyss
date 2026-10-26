@@ -18,6 +18,7 @@
 // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
 #include "glm_fast_state.hpp"
 #include "strata/kernels/dsv4_fast.hpp"
+#include "strata/kernels/dsv41_fast.hpp"
 
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
@@ -624,7 +625,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     }
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
-    bool has_kda = false, has_dsa = false, has_moe = false, has_dense = false, has_deq = false;
+    bool has_kda = false, has_dsa = false, has_moe = false, has_dense = false, has_deq = false, v41_tok = false;
     size_t gstride = 0;
     std::string why;
     const auto deq_ok = [&](const WSlot& w, const char* nm, int il) {
@@ -647,8 +648,23 @@ bool Glm5Model::prefill_setup(std::string& err) {
                 deq_ok(Ly.av, "attn_v", il);
             }
         } else if (g.v41) {
-            // deepseek41: the attention runs the token path's kernels a token at a time (fast_dsv41_attn), the
-            // rest batched - nothing of the attention to dequantize
+            // deepseek41: the attention's projections batched (prefill_v41_mixer) when every one dequantizes, else
+            // the token path's attention a token at a time (fast_dsv41_attn); STRATA_GLM_V41_BATCH=0: always the latter
+            const size_t before = why.size();
+            deq_ok(Ly.q_a, "attn_q_a", il);
+            deq_ok(Ly.q_b, "attn_q_b", il);
+            deq_ok(Ly.kv, "attn_kv", il);
+            deq_ok(Ly.out_a, "attn_output_a", il);
+            deq_ok(Ly.out_b, "attn_output_b", il);
+            if (Ly.kv_src) {
+                deq_ok(Ly.comp_kv, "attn_compressor_kv", il);
+                if (Ly.ratio == 2) deq_ok(Ly.comp_gate, "attn_compressor_gate", il);
+            }
+            if (Ly.idx_src) deq_ok(Ly.idx_q_b_q, "indexer.attn_q_b", il);
+            if (why.size() != before) {
+                v41_tok = true;
+                why.resize(before);
+            }
         } else if (g.dsv4()) {
             has_dsa = true;
             deq_ok(Ly.q_a, "attn_q_a", il);
@@ -706,6 +722,13 @@ bool Glm5Model::prefill_setup(std::string& err) {
     if (has_dsa && !g.dsv4() && (g.kv_lora != 512 || g.n_head % 16 != 0 || g.kda_head_dim != 128)) {
         std::fprintf(stderr, "glm prefill: geometry not covered by the batched kernels - token by token\n");
         return true;
+    }
+    if (g.v41) {
+        static const bool batch_env = [] { const char* v = getenv("STRATA_GLM_V41_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+        has_dsa = batch_env && !v41_tok;   // (the mixer's buffers: carve_ds4's)
+        std::fprintf(stderr, "glm prefill: CUDA%d deepseek41 attention %s\n", dev_,
+                     has_dsa ? "projections batched" : v41_tok ? "a token at a time (a weight type without an FP16 decode)"
+                                                               : "a token at a time (STRATA_GLM_V41_BATCH=0)");
     }
     auto* S = new PrefillState();
     pf_ = S;
@@ -1571,6 +1594,161 @@ bool Glm5Model::prefill_ds4_mixer(int il, int64_t p0_64, int tn, const uint16_t*
     return true;
 }
 
+// ---------------------------------------------------------------- deepseek41: the attention mixer of a sub-batch
+// fast_dsv41_attn for tn tokens: its projections as FP16 GEMMs on dequantized weights (a token at a time each read
+// the layer's ~136 MB of attention weights again: ~0.24 of its 0.31 ms on an AI PRO R9700), q_a's norm and q_b over
+// the sub-batch; what has an order stays a token at a time with the token path's kernels - the window ring, the
+// KV source's compressed row, q's RoPE, the indexer (the row's own selection and candidate mask: rows row0..), the
+// attention - then the grouped output LoRA and wo_b batched again.  skip_output (the layer a prompt skip cuts at, the
+// tail): its ring and compressed rows only, which is all a later row reads of it
+bool Glm5Model::prefill_v41_mixer(int il, int64_t p0_64, int tn, int row0, const uint16_t* x16, const float* xs,
+                                  float* mixer, bool skip_output, void* uni, std::string& err) {
+    namespace ds = strata::kernels::dsv4;
+    namespace d41 = strata::kernels::dsv41;
+    FastState* F = fast_;
+    PrefillState* S = pf_;
+    const Glm5Geometry& g = g_;
+    const cudaStream_t s = F->cs;
+    const auto& Ly = F->L[(size_t) il];
+    const int E = g.n_embd, D = g.head_dim, r = Ly.ratio, p0 = (int) p0_64;
+    const int HD = g.n_head * D, OL = g.o_groups * g.o_lora, IQ = g.idx_heads * g.idx_key;
+    const float one = 1.0f, zero = 0.0f;
+    const auto hgemm = [&](const WSlot& w, int N, int Kd, const uint16_t* X16, int ldx, float* Y, int ldy) {
+        const int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, S->w16_elems / Kd));
+        for (int r0 = 0; r0 < N; r0 += rows) {
+            const int n = std::min(rows, N - r0);
+            if (w.type == gf::kTypeBF16)
+                gb::bf16_to_f16((const uint16_t*) w.q + (size_t) r0 * Kd, S->w16, (int64_t) n * Kd, s);
+            else
+                strata::kernels::dequant_f16(w.type, w.q, r0, n, Kd, S->w16, s);
+            blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, tn, Kd, &one, S->w16, CUDA_R_16F, Kd, X16,
+                                 CUDA_R_16F, ldx, &zero, Y + r0, CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F,
+                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "v41 gemm f16");
+        }
+    };
+    const ds::Rope rope = r != 0 ? ds::make_rope(g.n_rot, g.comp_rope_base, 1.0f / g.yarn_factor, 1.0f, g.yarn_orig_ctx,
+                                                 g.yarn_beta_fast, g.yarn_beta_slow)
+                                 : ds::make_rope(g.n_rot, g.rope_base, 1.0f, 0.0f, 0, 0.0f, 0.0f);
+    const ds::Rope crope = ds::make_rope(g.n_rot, g.comp_rope_base, 1.0f / g.yarn_factor, 1.0f, g.yarn_orig_ctx,
+                                         g.yarn_beta_fast, g.yarn_beta_slow);
+    Carve c{(uint8_t*) uni};
+    Ds4Bufs B = carve_ds4(c, (size_t) tn, g, S->max_pools);
+    const bool attn = !skip_output;   // (a skipped output: no reader of this layer's queries either)
+    // 1. the projections of x
+    hgemm(Ly.q_a, g.q_lora, E, x16, E, B.qr_raw, g.q_lora);   // (prep reads it whether or not a query follows)
+    hgemm(Ly.kv, D, E, x16, E, B.kv_raw, D);
+    if (Ly.kv_src) {
+        hgemm(Ly.comp_kv, D, E, x16, E, B.ckv, D);
+        if (r == 2) hgemm(Ly.comp_gate, D, E, x16, E, B.csc, D);
+    }
+    if (attn && Ly.idx_src) {
+        const float alpha = 1.0f / std::sqrt((float) (g.idx_key * g.idx_heads));
+        blas_ck(cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, g.idx_heads, tn, E, &alpha, Ly.idx_proj_f, E, xs, E,
+                            &zero, B.iw, g.idx_heads),
+                "v41 indexer weights");
+    }
+    // 2. q_a's norm (its q8_1 rows into o16, free until step 5), q_b and the indexer's q
+    if (attn) {
+        d41::rms_rows(B.qr_raw, tn, Ly.q_a_norm, g.norm_eps, g.q_lora, B.qr, (void*) B.o16, s);
+        ds::to_f16(B.qr, B.qr16, (int64_t) tn * g.q_lora, s);
+        hgemm(Ly.q_b, HD, g.q_lora, B.qr16, g.q_lora, B.q, HD);
+        if (Ly.idx_src) hgemm(Ly.idx_q_b_q, IQ, g.q_lora, B.qr16, g.q_lora, B.iq, IQ);
+    }
+    S->mark("v41_proj", s);
+    // 3. a token at a time: the window ring, the KV source's row, q's RoPE, the indexer, the attention
+    const size_t vr = prefill_v41_row();
+    for (int t = 0; t < tn; ++t) {
+        if ((t & 255) == 255) progress_beat();   // (the watchdog: a slow layer is not a stuck one)
+        const int p = p0 + t;
+        ds::PrepArgs a;   // (its qr half on row t too: F->qr / qr_q, which nothing reads after)
+        a.qr_raw = B.qr_raw + (size_t) t * g.q_lora;
+        a.q_a_norm = Ly.q_a_norm;
+        a.qr = F->qr;
+        a.qr_q = F->qr_q;
+        a.q_lora = g.q_lora;
+        a.kv_raw = B.kv_raw + (size_t) t * D;
+        a.kv_norm = Ly.kv_a_norm;
+        a.raw = Ly.raw;
+        a.ring = ds_ring_;
+        a.head_dim = D;
+        a.n_rot = g.n_rot;
+        a.rope = rope;
+        a.comp_rope = crope;
+        a.p = p;
+        a.eps = g.norm_eps;
+        ds::prep(a, s);
+        if (Ly.kv_src) {
+            d41::PublishArgs pa;
+            pa.v = B.ckv + (size_t) t * D;
+            pa.g = r == 2 ? B.csc + (size_t) t * D : nullptr;
+            pa.pend = F->v41_pend[Ly.slot] + (size_t) ((p / 2) % FastState::kV41PendRing) * 2 * D;
+            pa.norm = Ly.comp_norm;
+            pa.idx_k = (const uint16_t*) Ly.idx_k_w.q;
+            pa.idx_k_norm = Ly.idx_k_norm;
+            pa.comp_cache = Ly.comp_cache;
+            pa.idx_cache = Ly.idx_cache;
+            pa.ratio = r;
+            pa.p = p;
+            pa.D = D;
+            pa.idx_dim = g.idx_key;
+            pa.n_rot = g.n_rot;
+            pa.rope = crope;
+            pa.eps = g.norm_eps;
+            d41::publish(pa, s);
+        }
+        if (!attn) continue;
+        float* const q = B.q + (size_t) t * HD;
+        float* const iq = Ly.idx_src ? B.iq + (size_t) t * IQ : nullptr;
+        d41::q_rope(q, g.n_head, D, g.n_rot, rope, iq, g.idx_heads, g.idx_key, crope, p, s);
+        int* const sel_buf = (int*) (S->v41_rows + (size_t) (row0 + t) * vr);
+        unsigned char* const keep_buf = (unsigned char*) (sel_buf + g.idx_top_k);
+        int n_comp = 0;
+        const int* sel = nullptr;
+        if (r != 0) {
+            const int n_vis = (p + 1) / r;
+            if (n_vis > g.idx_top_k) {
+                if (Ly.idx_src) {
+                    ds::indexer_scores(iq, Ly.idx_cache, B.iw + (size_t) t * g.idx_heads, g.idx_heads, n_vis,
+                                       F->v41_score, s);
+                    if (il == g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
+                        d41::candidates(F->v41_score, n_vis, g.cand_bs, g.cand_blocks, F->v41_bscore, F->v41_bsel,
+                                        keep_buf, s);
+                    if (il > g.cand_layer && n_vis > g.cand_blocks * g.cand_bs)
+                        d41::candidate_mask(F->v41_score, n_vis, g.cand_bs, keep_buf, s);
+                    ds::indexer_select(F->v41_score, n_vis, g.idx_top_k, sel_buf, s);
+                }
+                n_comp = g.idx_top_k;
+                sel = sel_buf;
+            } else {
+                n_comp = n_vis;
+            }
+        }
+        ds::attend(q, Ly.raw, ds_ring_, std::min(p + 1, g.n_swa), Ly.comp_cache, sel, n_comp, Ly.sinks, g.n_head, D,
+                   g.n_rot, rope, p, B.o + (size_t) t * HD, s);
+    }
+    S->mark("v41_attn", s);
+    if (skip_output) return true;
+    // 4. the grouped output LoRA, then wo_b
+    ds::to_f16(B.o, B.o16, (int64_t) tn * HD, s);
+    const int gin = HD / g.o_groups;
+    const size_t wrow = gf::row_bytes(Ly.out_a.type, gin);
+    if (wrow == 0) {
+        err = "deepseek41 prefill: wo_a type " + std::to_string(Ly.out_a.type);
+        return false;
+    }
+    for (int gi = 0; gi < g.o_groups; ++gi) {
+        WSlot sl = Ly.out_a;
+        sl.q = (const uint8_t*) Ly.out_a.q + (size_t) gi * g.o_lora * wrow;
+        hgemm(sl, g.o_lora, gin, B.o16 + (size_t) gi * gin, HD, B.oa + (size_t) gi * g.o_lora, OL);
+    }
+    ds::to_f16(B.oa, B.oa16, (int64_t) tn * OL, s);
+    hgemm(Ly.out_b, E, OL, B.oa16, OL, mixer, E);
+    abl_apply(il, 0, mixer, tn, E, s);
+    S->mark("v41_out", s);
+    return true;
+}
+
 // ---------------------------------------------------------------- one half's layers over a chunk
 bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t* next_ids) {
     FastState* F = fast_;
@@ -2040,12 +2218,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const float* xs = S->x + (size_t) t0 * E;
             const uint16_t* x16 = S->x16 + (size_t) t0 * E;
             float* mixer = S->mixer + (size_t) t0 * E;
-            if (g.v41) {
+            if (g.v41 && S->has_dsa) {
+                if (!prefill_v41_mixer(il, p0 + t0, tn, t0, x16, xs, mixer, skip_output, (void*) S->uni, err))
+                    return false;
+            } else if (g.v41) {
                 // a token at a time through the token path's attention (its caches and rings advance in order); the
                 // row's own top-k selection and candidate mask, kept across the layers (a reader layer reads what the
                 // last index source chose for that row, not for the sub-batch's last row)
                 const size_t vr = prefill_v41_row();
                 for (int t = 0; t < tn; ++t) {
+                    // the watchdog's heartbeat every 256 rows too: under memory pressure (a big copy to a network
+                    // share) a layer of this loop took 210 s against 5, its launches held up, and the per-layer beat
+                    // alone read that as stuck
+                    if ((t & 255) == 255) progress_beat();
                     cudaMemcpyAsync(F->x, xs + (size_t) t * E, (size_t) E * sizeof(float), cudaMemcpyDeviceToDevice, s);
                     gf::quantize_q8_1(F->x, F->xq, E, s);
                     pf_sel_ = (int*) (S->v41_rows + (size_t) (t0 + t) * vr);

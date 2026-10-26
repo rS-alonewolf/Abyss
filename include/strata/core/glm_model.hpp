@@ -489,6 +489,9 @@ public:
     // the prompt path's attention mixer over a sub-batch of tn tokens at positions p0.. (glm_prefill.cu)
     bool prefill_ds4_mixer(int il, int64_t p0, int tn, const uint16_t* x16, const float* xs, float* mixer,
                            bool skip_output, void* uni, std::string& err);
+    // deepseek41's: the projections batched, the caches' order a token at a time (glm_prefill.cu)
+    bool prefill_v41_mixer(int il, int64_t p0, int tn, int row0, const uint16_t* x16, const float* xs, float* mixer,
+                           bool skip_output, void* uni, std::string& err);
     bool fast_setup(std::string& err);
     void fast_destroy();
     bool forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err);

@@ -543,8 +543,10 @@ swe-bench の問題ごとに +16〜32%。これらの問題では下書きの 68
 | `STRATA_GLM_PCIE_SHARE` | 起動時に測定 | RAM 層のエキスパートのうち、CPU で計算せずに PCIe で GPU に送る割合（`0` = すべて CPU、`1` = すべて GPU） |
 | `STRATA_GLM_PCIE_SHARE_LATE` | なし | `<分担率>[:<ステップ数>]`：各リクエストは上の分担率で始まり、`<ステップ数>` トークン分（既定 256）進んだらこの分担率に切り替えます。分担率が低いと PCIe で送るエキスパートが減り、GPU のエキスパートの置き場が埋まりにくくなります。そこで回答の最初だけ PCIe で埋めてから切り替えます（issue #14）。普通の `--bench` が速くなったときだけ残してください |
 | `STRATA_GLM_PREFILL` / `--prefill` | `auto` | prompt のまとめ処理の大きさ: `auto`、トークン数、`0`（1 トークンずつ） |
+| `STRATA_WATCHDOG_S` | 180 | serve の見張り役：この秒数のあいだ進みのないリクエストはエンジンを終了させ、サーバーが起動し直す（`0` でオフ）。長いプロンプトの最中に大きなファイルをコピーすると（メモリの逼迫。ここではネットワーク共有へ 200 GB）、エンジンが 1 か所で数分待たされ、見張り役が止まったと判断することがある。値を上げる（`600`）か、コピーを別の時間にする |
 | `STRATA_GLM_PREFILL_SUB` | auto（NVIDIA）、1024（HIP） | prompt の mixer と dense FFN のサブバッチ（16〜8192）。HIP の既定は v1.3.40 から 1024（以前は 256。AI PRO R9700 で DeepSeek V4 の 8K / 16K の prompt が +8% / +10%、GLM-5.3-Flash が +13% / +15%） |
 | `STRATA_GLM_PROMPT_SKIP` | on | DeepSeek V4.1、1 台の GPU：長い prompt の最後の 2,668 行より前の行は、20 層目の attention で止める（20〜39 層はそれらの行を 20 層目の圧縮 KV からしか読まない。エキスパートの足し算の順を除いて同じ結果。v1.3.58、AI PRO R9700 で 32K の prompt が 64 → 101 tok/s）。`0`：オフ |
+| `STRATA_GLM_V41_BATCH` | on | DeepSeek V4.1 の prompt の attention：射影（q_a、kv、圧縮器、q_b、出力の LoRA）をサブバッチまとめて行列計算し、リング・圧縮行・indexer・attention は 1 トークンずつのまま（v1.3.59。skip と合わせて AI PRO R9700 の 8K / 16K / 32K / 60K の prompt が 86 / 101 / 101 / 101 → 185 / 242 / 273 / 262 tok/s、KL は同じ設定を 2 回回したときの揺れと同じ）。`0`：1 トークンずつの attention |
 | `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | 起動をまたいで残すエキスパートの使用記録。`0` で無効 |
 | `STRATA_GLM_NO_REUSE` | オフ | `1`: 会話を再利用しない |
 | `STRATA_GLM_THINK_RESERVE` | 1024 | （サーバー）思考が回答のために必ず残すトークン数 |

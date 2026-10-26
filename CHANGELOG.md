@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.59 - 2026-10-26
+
+**DeepSeek V4.1 prompts another 2.2-2.7x faster: the attention's projections batched.**
+
+- DeepSeek V4.1 prompts: the attention ran a token at a time, and each token read the layer's ~136 MB of attention
+  weights again (~0.24 of its 0.31 ms a layer on an AI PRO R9700; the attention was 9/10 of a 16K prompt). Its
+  projections - q_a, kv, the compressor, the indexer's weights, q_b, the grouped output LoRA and wo_b - now run as
+  FP16 GEMMs over each 1,024-token sub-batch; what has an order (the window ring, the KV source's compressed row, q's
+  RoPE, the indexer with the row's own selection, the attention) stays a token at a time on the token path's kernels.
+  The layer the prompt skip cuts at writes only its ring and compressed rows. AI PRO R9700 + iGPU, UD-IQ2_XXS, prompt
+  tok/s at 8K / 16K / 32K / 60K: 86 / 101 / 101 / 101 -> 185 / 242 / 273 / 262 (v1.3.57: 66 / 68 / 64 / 57). KL of
+  255 tokens after an 8K context against the token-at-a-time attention: 0.0034 (0.0039 without the skip), the same as
+  that attention against itself run twice (0.0032). `STRATA_GLM_V41_BATCH=0` goes back to a token at a time; a pack
+  with an attention weight type that has no FP16 decode does so by itself, and the engine log says which.
+- The serve watchdog: a V4.1 prompt layer beats every 256 rows too. Under heavy memory pressure (a 200 GB copy to a
+  network share) one layer of the token-at-a-time attention took 210 s against 5, and the per-layer heartbeat alone
+  read that as stuck after 180 s. A big copy can still hold the engine up for minutes at one place (a single
+  wait of 191-238 s here); docs/MANUAL now lists `STRATA_WATCHDOG_S` (default 180) for that.
+
 ## v1.3.58 - 2026-10-26
 
 **DeepSeek V4.1 long prompts read 1.5-1.8x faster and every prompt row now uses its own selection; a late PCIe share
