@@ -7,6 +7,24 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.67 - 2026-10-27
+
+**Ornith (Qwen3.5-MoE) prompts: the attention on tensor cores - a 115K-token prompt 685 -> 154 s.**
+
+- The prompt path's attention was the plain FP32 kernel: each block of 4 queries walked every key with a shuffle sum a
+  key, ~90% of a 115K-token prompt. It now runs on WMMA (rocWMMA on AMD gfx11 / gfx12, nvcuda::wmma on NVIDIA; one
+  source): a block takes 8 tokens, a warp one token's 16 heads of a KV group as a 16-row tile, so a K / V tile in shared
+  memory serves 128 rows; Q K^T and P V in FP16 with FP32 sums; two passes over the keys (each row's max and sum, then
+  P V with P normalized), so the accumulators are never rescaled.
+- AI PRO R9700, a 1,024-token sub-batch, a layer: at 32K / 64K / 114K positions 222 / 544 / 918 -> 38 / 85 / 156 ms.
+  IQ3_XXS-B on 16 GB of VRAM with no lane: 57.6K / 115K-token prompts 324 / 168 -> 1,076 / 747 tok/s (time to the first
+  token 178 / 685 -> 54 / 154 s); decode after them 40.7 / 32.1 tok/s. UD-Q4_K_XL `--bench`: 8K 948 -> 1,348 tok/s, 2K
+  695 -> 728, decode 59.1 (unchanged), quality check OK (KL 0.0049).
+- Quality: 255 tokens scored after a 24K-token context read through the prompt path, KL 0.0054 against the FP32 kernel
+  (same top token 98.8%); two runs of the FP32 kernel differ by 0.0064. The attention output is within 0.08% of each
+  row's scale of FP32 (tests/hip/q35_attn_window.cpp). `STRATA_Q35_PATTN=1` goes back to the FP32 kernel.
+- Not yet run on an RTX 5090 (the CUDA build compiles for sm_120a and sm_86).
+
 ## v1.3.66 - 2026-10-26
 
 **Docs: when the conversation is reused and how to see it (issue #14).**

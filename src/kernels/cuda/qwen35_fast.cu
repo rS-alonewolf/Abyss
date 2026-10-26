@@ -1,8 +1,27 @@
 // src/kernels/cuda/qwen35_fast.cu - see include/strata/kernels/qwen35_fast.hpp.
+#if defined(STRATA_USE_HIP)
+// (as glm_batch.cu: the headers rocWMMA pulls in define the __shfl_*_sync names the hip_compat macros remap)
+#pragma push_macro("__shfl_xor_sync")
+#undef __shfl_xor_sync
+#pragma push_macro("__shfl_down_sync")
+#undef __shfl_down_sync
+#pragma push_macro("__shfl_up_sync")
+#undef __shfl_up_sync
+#pragma push_macro("__shfl_sync")
+#undef __shfl_sync
+#include <rocwmma/rocwmma.hpp>
+#pragma pop_macro("__shfl_xor_sync")
+#pragma pop_macro("__shfl_down_sync")
+#pragma pop_macro("__shfl_up_sync")
+#pragma pop_macro("__shfl_sync")
+#endif
 #include "strata/kernels/qwen35_fast.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if !defined(STRATA_USE_HIP)
+#include <mma.h>
+#endif
 
 #include <cmath>
 #include <cstdio>
@@ -452,6 +471,151 @@ __global__ void __launch_bounds__(256) attn_prompt_kernel(const float* __restric
         }
     }
 }
+// ---------------------------------------------------------------- the prompt's attention on tensor cores
+// A block takes 8 tokens (a warp each) and one KV head's group of 16 heads: a warp's 16 rows are its token's heads, so
+// one K / V tile in shared memory serves the 8 tokens' 128 rows.  WMMA 16x16x16 (rocWMMA on HIP, nvcuda::wmma on
+// CUDA): FP16 operands (q scaled, then rounded; the caches are FP16), F32 sums.  Two passes over the keys: the first
+// takes each row's max and sum, the second P = exp(s - max) / sum in FP16 against V - so the accumulators never need a
+// rescale (their element-to-row layout is the library's).  grid (ceil(T / 8), n_head_kv)
+#if defined(STRATA_USE_HIP)
+namespace q35wm = rocwmma;
+using wh16 = _Float16;
+__device__ __forceinline__ wh16 to_wh16(float x) { return (wh16) x; }
+#else
+namespace q35wm = nvcuda::wmma;
+using wh16 = __half;
+__device__ __forceinline__ wh16 to_wh16(float x) { return __float2half(x); }
+#endif
+constexpr int kPT = 8;          // tokens a block
+constexpr int kPB = 32;         // keys a tile
+constexpr int kKP = kD + 16;    // sK's row pitch in halves (spreads the banks; keeps 32-byte fragment rows)
+constexpr size_t kPromptTcSmem = (size_t) kPB * kKP * 2 + (size_t) kPB * kD * 2 + (size_t) kPT * 16 * kPB * 4 +
+                                 (size_t) kPT * 16 * kPB * 2;
+
+__global__ void q16_scale_kernel(const float* __restrict__ q, size_t n, float scale, wh16* __restrict__ q16) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) q16[i] = to_wh16(q[i] * scale);
+}
+
+__global__ void __launch_bounds__(256) attn_prompt_tc_kernel(const wh16* __restrict__ q16, const uint16_t* __restrict__ kc,
+                                                             const uint16_t* __restrict__ vc, int n_head, int n_head_kv,
+                                                             int64_t p0, int T, float* __restrict__ out) {
+    namespace wm = q35wm;
+    extern __shared__ __align__(128) unsigned char q35_tc_sm[];
+    wh16* sK = (wh16*) q35_tc_sm;                     // [kPB][kKP]
+    wh16* sV = sK + kPB * kKP;                         // [kPB][kD]
+    float* sS = (float*) (sV + kPB * kD);              // [warp][16][kPB]
+    wh16* sP = (wh16*) (sS + kPT * 16 * kPB);          // [warp][16][kPB]
+    const int g = blockIdx.y, t0 = blockIdx.x * kPT, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int nt = min(kPT, T - t0), t = t0 + warp;
+    const bool active = warp < nt;
+    const int64_t lim = p0 + t;                        // the warp's last key
+    const int64_t kend = p0 + t0 + nt;                 // the block's keys: [0, kend)
+    float* wS = sS + warp * 16 * kPB;
+    wh16* wP = sP + warp * 16 * kPB;
+    wm::fragment<wm::matrix_a, 16, 16, 16, wh16, wm::row_major> qf[kD / 16];
+    if (active) {
+        const wh16* qa = q16 + ((size_t) t * n_head + (size_t) g * 16) * kD;
+#pragma unroll
+        for (int k = 0; k < kD / 16; ++k) wm::load_matrix_sync(qf[k], qa + k * 16, kD);
+    }
+    const int r = lane >> 1, hf = lane & 1;            // the softmax: a row a lane pair, 16 keys a lane
+    const auto load_tile = [&](int64_t kt, bool with_v) {
+#pragma unroll
+        for (int it = 0; it < kPB * (kD / 8) / 256; ++it) {
+            const int idx = it * 256 + tid, row = idx / (kD / 8), col = idx % (kD / 8);
+            const int64_t kp = kt + row;
+            const size_t off = ((size_t) kp * n_head_kv + g) * kD + col * 8;
+            const uint4 z = make_uint4(0, 0, 0, 0);
+            *reinterpret_cast<uint4*>(sK + row * kKP + col * 8) = kp < kend ? *reinterpret_cast<const uint4*>(kc + off) : z;
+            if (with_v)
+                *reinterpret_cast<uint4*>(sV + row * kD + col * 8) =
+                    kp < kend ? *reinterpret_cast<const uint4*>(vc + off) : z;
+        }
+    };
+    const auto scores = [&] {   // S = Q K^T over the tile into wS [16][kPB]
+#pragma unroll
+        for (int n = 0; n < kPB / 16; ++n) {
+            wm::fragment<wm::accumulator, 16, 16, 16, float> acc;
+            wm::fill_fragment(acc, 0.0f);
+#pragma unroll
+            for (int k = 0; k < kD / 16; ++k) {
+                wm::fragment<wm::matrix_b, 16, 16, 16, wh16, wm::col_major> b;
+                wm::load_matrix_sync(b, sK + n * 16 * kKP + k * 16, kKP);
+                wm::mma_sync(acc, qf[k], b, acc);
+            }
+            wm::store_matrix_sync(wS + n * 16, acc, kPB, wm::mem_row_major);
+        }
+    };
+    // pass 1: each row's max and sum
+    float m = -INFINITY, l = 0.0f;
+    for (int64_t kt = 0; kt < kend; kt += kPB) {
+        __syncthreads();
+        load_tile(kt, false);
+        __syncthreads();
+        const bool on = active && kt <= lim;
+        if (on) scores();
+        __syncthreads();
+        if (on) {
+            float sv[16], mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int64_t kp = kt + hf * 16 + j;
+                sv[j] = kp <= lim ? wS[r * kPB + hf * 16 + j] : -INFINITY;
+                mx = fmaxf(mx, sv[j]);
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            const float mn = fmaxf(m, mx);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) sum += expf(sv[j] - mn);
+            sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+            l = (m == -INFINITY ? 0.0f : l * expf(m - mn)) + sum;
+            m = mn;
+        }
+    }
+    // pass 2: O = sum P V with P normalized
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    wm::fragment<wm::accumulator, 16, 16, 16, float> of[kD / 16];
+#pragma unroll
+    for (int n = 0; n < kD / 16; ++n) wm::fill_fragment(of[n], 0.0f);
+    for (int64_t kt = 0; kt < kend; kt += kPB) {
+        __syncthreads();
+        load_tile(kt, true);
+        __syncthreads();
+        const bool on = active && kt <= lim;
+        if (on) scores();
+        __syncthreads();
+        if (on) {
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int64_t kp = kt + hf * 16 + j;
+                const float pv = kp <= lim ? expf(wS[r * kPB + hf * 16 + j] - m) * inv : 0.0f;
+                wP[r * kPB + hf * 16 + j] = to_wh16(pv);
+            }
+        }
+        __syncthreads();
+        if (on) {
+            wm::fragment<wm::matrix_a, 16, 16, 16, wh16, wm::row_major> pa[kPB / 16];
+#pragma unroll
+            for (int kk = 0; kk < kPB / 16; ++kk) wm::load_matrix_sync(pa[kk], wP + kk * 16, kPB);
+#pragma unroll
+            for (int n = 0; n < kD / 16; ++n)
+#pragma unroll
+                for (int kk = 0; kk < kPB / 16; ++kk) {
+                    wm::fragment<wm::matrix_b, 16, 16, 16, wh16, wm::row_major> vb;
+                    wm::load_matrix_sync(vb, sV + kk * 16 * kD + n * 16, kD);
+                    wm::mma_sync(of[n], pa[kk], vb, of[n]);
+                }
+        }
+    }
+    if (active) {
+        float* op = out + ((size_t) t * n_head + (size_t) g * 16) * kD;
+#pragma unroll
+        for (int n = 0; n < kD / 16; ++n) wm::store_matrix_sync(op + n * 16, of[n], kD, wm::mem_row_major);
+    }
+}
+
 // a verify window's attention (T <= 8 rows): attn_prompt_kernel's block (4 queries x one KV head's group) over one
 // chunk of kWinChunk key positions, its partials (max, sum, the unnormalized accumulator) into part
 // [row][head][chunk] for attn_merge_kernel - the window's few rows alone gave attn_prompt 1-4 blocks, each walking
@@ -882,6 +1046,32 @@ void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
         std::fprintf(stderr, "qwen35 attn_prompt: head_dim %d, heads %d / %d (a group of 8, 16 or 32)\n", head_dim,
                      n_head, n_head_kv);
         return;
+    }
+    static const int pmode = [] { const char* v = getenv("STRATA_Q35_PATTN"); return v ? std::atoi(v) : 0; }();
+    if (pmode != 1 && G == 16) {
+        // the scaled q in FP16 for the tensor-core kernel (a scratch kept between calls; qwen35moe runs on one GPU)
+        static wh16* q16 = nullptr;
+        static size_t cap = 0;
+        static bool smem_ok = false;
+        const size_t n = (size_t) T * n_head * kD;
+        if (n > cap) {
+            if (q16 != nullptr) cudaFree(q16);
+            q16 = nullptr;
+            cap = 0;
+            if (cudaMalloc(&q16, n * sizeof(wh16)) == cudaSuccess) cap = n;
+            else cudaGetLastError();
+        }
+        if (!smem_ok)
+            smem_ok = cudaFuncSetAttribute(attn_prompt_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                           (int) kPromptTcSmem) == cudaSuccess;
+        if (q16 != nullptr && smem_ok) {
+            q16_scale_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(q, n, scale, q16);
+            attn_prompt_tc_kernel<<<dim3((unsigned) ((T + kPT - 1) / kPT), (unsigned) n_head_kv), 256, kPromptTcSmem, s>>>(
+                q16, kc, vc, n_head, n_head_kv, p0, T, out);
+            check("attn_prompt");
+            return;
+        }
+        cudaGetLastError();
     }
     const dim3 grid((unsigned) ((T + 3) / 4), (unsigned) n_head_kv);
     if (G == 8) attn_prompt_kernel<1><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
