@@ -2661,7 +2661,8 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         plan |= (unsigned long long) k << (4 * f);
         tab += " " + std::to_string(k);
     }
-    if (plan == 0ull) {
+    // (kept with STRATA_GLM_PCIE_SHARE_LATE: a request can start with the lane idle and move to it later)
+    if (plan == 0ull && getenv("STRATA_GLM_PCIE_SHARE_LATE") == nullptr) {
         std::fprintf(stderr, "glm fast: CUDA%d CPU lane off: an expert %.3f ms on the CPU vs %.3f ms over PCIe\n", dev_,
                      c_ms, pd_ms);
         F->cpu_pool.reset();
@@ -2676,11 +2677,31 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     if (const char* lv = getenv("STRATA_GLM_PCIE_SHARE_LATE")) {
         const double ls = std::max(0.0, std::min(1.0, std::atof(lv)));
         const char* colon = std::strchr(lv, ':');
-        F->late_after = colon != nullptr ? std::max(1, std::atoi(colon + 1)) : 256;
         for (int f = 0; f <= 8; ++f) F->cpu_plan_late |= (unsigned long long) (f - (int) std::lround(ls * f)) << (4 * f);
-        F->late_done = false;
-        std::fprintf(stderr, "glm fast: CUDA%d CPU lane: share %.2f after %d token steps of each request "
-                             "(STRATA_GLM_PCIE_SHARE_LATE)\n", dev_, ls, F->late_after);
+        // <share>:settle[:<window>[:<gain>[:<drop>]]]: the switch follows the pool, not the request (#14: the warm
+        // state the --deep sweep measures builds over several answers, and the per-request switch never reached it)
+        if (colon != nullptr && std::strncmp(colon + 1, "settle", 6) == 0) {
+            F->settle = true;
+            const char* p = colon + 7;
+            double v[3] = {(double) F->settle_win, F->settle_eps * 100.0, F->settle_drop * 100.0};
+            for (int i = 0; i < 3 && *p == ':'; ++i) {
+                v[i] = std::atof(p + 1);
+                p = std::strchr(p + 1, ':');
+                if (p == nullptr) break;
+            }
+            F->settle_win = std::max(16, (int) v[0]);
+            F->settle_eps = std::max(0.0, v[1]) / 100.0;
+            F->settle_drop = std::max(0.0, v[2]) / 100.0;
+            std::fprintf(stderr, "glm fast: CUDA%d CPU lane: share %.2f once the VRAM hit rate settles (windows of %d "
+                                 "token steps, gain < %.1f points; back when it falls %.1f points) "
+                                 "(STRATA_GLM_PCIE_SHARE_LATE)\n", dev_, ls, F->settle_win, F->settle_eps * 100.0,
+                         F->settle_drop * 100.0);
+        } else {
+            F->late_after = colon != nullptr ? std::max(1, std::atoi(colon + 1)) : 256;
+            F->late_done = false;
+            std::fprintf(stderr, "glm fast: CUDA%d CPU lane: share %.2f after %d token steps of each request "
+                                 "(STRATA_GLM_PCIE_SHARE_LATE)\n", dev_, ls, F->late_after);
+        }
     }
     F->md.cpu_seq = F->cpu_seq_d;
     F->md.cpu_ans = dp;
@@ -3353,7 +3374,7 @@ bool Glm5Model::set_pcie_share(double share) {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         FastState* F = m->fast_;
         if (F == nullptr || F->cpu_pool == nullptr) continue;
-        unsigned long long plan = F->cpu_plan_start;
+        unsigned long long plan = F->settle && F->settle_late ? F->cpu_plan_late : F->cpu_plan_start;
         if (share >= 0.0) {
             plan = 0;
             const double s = std::min(1.0, share);
@@ -4271,6 +4292,32 @@ bool Glm5Model::fast_boundary(std::string& err) {
     if (!F->late_done && ++F->late_n >= F->late_after) {   // (STRATA_GLM_PCIE_SHARE_LATE)
         F->cpu_plan = F->cpu_plan_late;
         F->late_done = true;
+    }
+    if (F->settle && ++F->settle_n >= F->settle_win) {   // (STRATA_GLM_PCIE_SHARE_LATE=<share>:settle)
+        const uint64_t h = F->hits.load(std::memory_order_relaxed), t = h + F->misses.load(std::memory_order_relaxed);
+        const double r = t > F->settle_t0 ? (double) (h - F->settle_h0) / (double) (t - F->settle_t0) : -1.0;
+        F->settle_n = 0;
+        F->settle_h0 = h;
+        F->settle_t0 = t;
+        if (r >= 0.0) {
+            const bool own = F->cpu_plan == F->cpu_plan_start || F->cpu_plan == F->cpu_plan_late;
+            if (!F->settle_late && F->settle_prev >= 0.0 && r - F->settle_prev < F->settle_eps) {
+                F->settle_late = true;
+                F->settle_level = r;
+                if (own) F->cpu_plan = F->cpu_plan_late;   // (a request's own share stays)
+                ++F->settle_moves;
+                std::fprintf(stderr, "glm fast: CUDA%d CPU lane: the pool settled at %.1f%% VRAM hits - the late share "
+                                     "(switch %llu)\n", dev_, 100.0 * r, (unsigned long long) F->settle_moves);
+            } else if (F->settle_late && r < F->settle_level - F->settle_drop) {
+                F->settle_late = false;
+                if (own) F->cpu_plan = F->cpu_plan_start;
+                ++F->settle_moves;
+                std::fprintf(stderr, "glm fast: CUDA%d CPU lane: VRAM hits fell to %.1f%% (from %.1f%%) - the engine's "
+                                     "share again (switch %llu)\n", dev_, 100.0 * r, 100.0 * F->settle_level,
+                             (unsigned long long) F->settle_moves);
+            }
+            F->settle_prev = r;
+        }
     }
     struct GapScan {   // the table scan's time, whichever way the function leaves
         FastState* F;

@@ -572,6 +572,13 @@ struct Glm5Model::FastState {
     unsigned long long cpu_plan_late = 0;
     int late_after = 0, late_n = 0;
     bool late_done = true;
+    // ... or, with ":settle", once per session instead of per request: the VRAM hit rate is measured over windows of
+    // settle_win boundaries; the late plan starts when a window gains less than settle_eps on the one before (the
+    // pool has settled) and the start plan comes back when one falls settle_drop below that level (a new topic)
+    bool settle = false, settle_late = false;
+    int settle_win = 128, settle_n = 0;
+    double settle_eps = 0.01, settle_drop = 0.05, settle_prev = -1.0, settle_level = 0.0;
+    uint64_t settle_h0 = 0, settle_t0 = 0, settle_moves = 0;
     gf::CpuAnswer* cpu_ans_h = nullptr;                      // host-mapped
     unsigned int* cpu_seq_d = nullptr;
     unsigned int* dcnt_d = nullptr;                          // the device's route counts (the coldest go to the host)

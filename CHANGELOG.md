@@ -7,6 +7,27 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.70 - 2026-10-27
+
+**DeepSeek V4.1: one Engram worker instead of one a token (#20), and a session-wide late share for the CPU lane (#14).**
+
+- The async Engram reader (`STRATA_DS41_ENGRAM_ASYNC`, on by default) started a new waiting thread on every decode
+  token: it was detached right after starting, and a detached `std::thread` is never joinable, which is what the start
+  test checked. The threads piled up for as long as the engine ran and each token woke all of them, so decode slowed
+  answer by answer. A flag now starts the worker once. Measured on an AI PRO R9700 (UD-IQ2_XXS, one server session,
+  eight 256-token answers): 44 -> 2,188 threads and 16.1 tok/s on average before, 45 threads and 20.6 tok/s (+28%)
+  after; the reporter's RTX PRO 4500 went 40.3 -> 37.5 -> 33.0 tok/s over three 2K answers before and held 45 after.
+  Long-session V4.1 numbers measured before this release were low by this.
+- `STRATA_GLM_PCIE_SHARE_LATE=<share>:settle[:<window>[:<gain>[:<drop>]]]`: the late share follows the pool instead of
+  the request - every `<window>` token steps (default 128) the VRAM hit rate is measured, the lane moves to the late
+  share once a window gains less than `<gain>` points (default 1), and back when the rate falls `<drop>` points (default
+  5) below that level. The CPU lane is now kept even when the start share is 1 if a late share is set. On an R9700
+  (Ornith IQ3_XXS-B, 16 GB config, 8 answers) share 0.5 -> 0 went 11.5 -> 18.1 tok/s (+57%) and share 1 -> 0 7.8 ->
+  10.8 (+38%) against the fixed share; share 0 from the start (35.9) stays the best there, so it is for boxes where the
+  `--deep` sweep picks a share above 0 (docs/MANUAL).
+- README: the supported-models table lists the other GGUFs that run (Ornith-1.5-122B, Qwen3.5-122B-A10B, the
+  orcarouter V4.1 abliterated mix, Qwen3.8-Flash-Next).
+
 ## v1.3.69 - 2026-10-27
 
 **DeepSeek V4.1 UD-IQ2_XXS: where its ~20 tok/s goes, the speed setting for it, and a read-chunk fix.**

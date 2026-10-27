@@ -152,7 +152,7 @@ struct V41Engram {
     float* a_dst = nullptr;
     unsigned int* a_flag = nullptr;
     unsigned int a_seq = 0;
-    std::thread a_th;
+    bool a_started = false;   // the worker, started once (detached like the pools: it lives as long as the process)
     // a prompt chunk's rows PREFETCHED into the row cache (table 0's while layer 0 runs, then table 1's for layer 14)
     // (STRATA_DS41_ENGRAM_PREFETCH, default on; needs the row cache): its own few threads, stopped at the next chunk or
     // token - the rows are read the same way, so the prompt's sums are unchanged
@@ -686,9 +686,9 @@ bool Glm5Model::dsv41_engram_token(int32_t tok, std::string& err) {
         E->a_seq = F->v41_eng_seq;
         E->a_have = true;
         E->a_busy = true;
-        if (!E->a_th.joinable()) {
-            E->a_th = std::thread(engram_async_loop, E);
-            E->a_th.detach();
+        if (!E->a_started) {   // (a detached std::thread is never joinable: testing that started one a token, #20)
+            E->a_started = true;
+            std::thread(engram_async_loop, E).detach();
         }
         E->acv.notify_all();
         return true;
