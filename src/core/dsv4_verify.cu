@@ -754,7 +754,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         return v != nullptr && std::atoi(v) != 0;
 #endif
     }();
-    const bool hc_cpu = lane && hc_cpu_env && !F->defer && !Ly.mtp && !F->prof_on && il != l1_ - 1 &&
+    const bool hc_cpu = lane && hc_cpu_env && !F->defer && !Ly.mtp && !F->prof_on && il != l1_ - 1 && !abl_full() &&
                         !(g.v41 && F->L[(size_t) il + 1].eng >= 0) && gf::hc_fuses_cpu(E);   // (as fast_moe)
     if (F->defer && Ly.moe && !Ly.mtp && il != l1_ - 1) {
         if (lane)
@@ -765,6 +765,7 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
         for (int t = tb; t < tb + T; ++t) gf::moe_cpu_wait(V->md[(size_t) t], E, V->ffn + (size_t) t * E, s);
         if (F->prof_on) F->mark("vm_cpu_wait");
     }
+    abl_out(il, 1, V->ffn + (size_t) tb * E, T, (int) E, s);   // (complete: an edit keeps hc_cpu off)
     if (hc_cpu) V->bg_after[tb] = true;
     else F->bg_drain(s, F->bg_pace);   // the paced promotions' next bytes, as fast_moe
     return true;
@@ -862,6 +863,7 @@ bool Glm5Model::verify(const std::vector<int32_t>& toks, std::string& err) {
                          V->emb_h + (size_t) t * E, g.n_embd);
         cudaMemcpyAsync(V->emb, V->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, s);
     }
+    abl_res(V->emb, T, (int) E, s);
     for (int t = 0; t < T; ++t) {
         if (g.qwen35())   // a plain residual: column t's first stream (embed_streams writes four)
             cudaMemcpyAsync(V->R + (size_t) t * 2 * HCE, V->emb + (size_t) t * E, E * sizeof(float),
@@ -1039,6 +1041,7 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
                 for (int t = c0; t < c0 + nc; ++t) defer_add(il, t, st);
                 if (dsp_ != nullptr && il > l0_)   // DSpark's features: the layer before's complete output
                     for (int t = c0; t < c0 + nc; ++t) dspark_capture(il - 1, Rc[(size_t) t], t, st);
+                abl_out(il, 0, V->mixer + (size_t) c0 * E, nc, (int) E, st);
                 for (int t = c0; t < c0 + nc; ++t) hc_read(il, t, V->mixer + (size_t) t * E, false, st);
                 cudaEvent_t after = gi > 0 ? V->ev_route[gi - 1] : il > l0_ ? V->ev_route[n_grp - 1] : nullptr;
                 if (!verify_moe(il, c0, nc, toks, st, after, V->ev_route[gi], err)) return false;
@@ -1052,6 +1055,7 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
             for (int t = 0; t < T; ++t) defer_add(il, t, s);
             if (dsp_ != nullptr && il > l0_)
                 for (int t = 0; t < T; ++t) dspark_capture(il - 1, Rc[(size_t) t], t, s);
+            abl_out(il, 0, V->mixer, T, (int) E, s);
             for (int t = 0; t < T; ++t) hc_read(il, t, V->mixer + (size_t) t * E, false, s);
             mark(2);
             if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
@@ -1213,6 +1217,7 @@ bool Glm5Model::verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, st
                     wrote = false;
                 }
                 if (!dsv41_engram_window_add(il, t, Rc[(size_t) t], err)) return false;
+                abl_res(Rc[(size_t) t], g.hc, g.n_embd, s);   // (Engram's rows are a residual write too)
             }
             hc_read(il, t, wrote ? V->ffn + (size_t) t * E : nullptr, true);
         }
@@ -1221,6 +1226,7 @@ bool Glm5Model::verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, st
         mark(1);
         if (dsp_ != nullptr && il > l0_)   // DSpark's features: the layer before's output, each column's
             for (int t = 0; t < T; ++t) dspark_capture(il - 1, Rc[(size_t) t], t, s);
+        abl_out(il, 0, V->mixer, T, (int) E, s);
         for (int t = 0; t < T; ++t) hc_read(il, t, V->mixer + (size_t) t * E, false);
         mark(2);
         if (!verify_moe(il, 0, T, toks, s, nullptr, nullptr, err)) return false;
@@ -1346,6 +1352,7 @@ bool Glm5Model::verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, st
             if (!gf::mvn(&o, 1, T, s)) { err = "qwen35 verify: attn_output"; return false; }
         }
         mark(1);
+        abl_out(il, 0, V->mixer, T, (int) E, s);
         for (int t = 0; t < T; ++t)
             gf::rms_q8(Rt(t), V->mixer + (size_t) t * E, Ly.post_norm, g.norm_eps, (int) E, V->x + (size_t) t * E,
                        (uint8_t*) V->xq + (size_t) t * q8e, s);

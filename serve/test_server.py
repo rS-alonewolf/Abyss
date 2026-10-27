@@ -364,6 +364,18 @@ class SamplingKeys(unittest.TestCase):
         bad = self.keys(strata_tune={"pcie_frac": 3, "spec_min_p": True, "pool_workers": 2})
         self.assertFalse([x for x in bad if x.split("=")[0] in ("pcie_frac", "spec_min_p", "pool_workers")])
 
+    def test_uncensor_key(self):
+        # the refusal-direction edit's per-request switch: a bool only, greedy and sampled lines alike
+        self.assertIn("abl=0", self.keys(temperature=0, uncensor=False))
+        self.assertIn("abl=1", self.keys(temperature=0.7, uncensor=True))
+        for bad in (None, 1, "true"):
+            self.assertFalse([k for k in self.keys(temperature=0.7, uncensor=bad) if k.startswith("abl=")], bad)
+
+    def test_uncensor_arg(self):
+        from serve.server import engine_args
+        self.assertEqual(engine_args({"args": ["--glm-pack", "p"], "uncensor": "m.abl"})[-2:], ["--uncensor", "m.abl"])
+        self.assertNotIn("--uncensor", engine_args({"args": ["--glm-pack", "p"]}))
+
     def test_penalty_window(self):
         self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))
         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))

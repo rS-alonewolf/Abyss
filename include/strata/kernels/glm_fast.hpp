@@ -102,8 +102,14 @@ void hc_post(const float* block_out, const float* R_old, const float* post, cons
 void head_prep(const float* R, const float* norm_w, float eps, int n_embd, float* x, void* xq, cudaStream_t s);
 /// R[s][e] = emb[e] for the 4 streams.
 void embed_streams(const float* emb, float* R, int n_embd, cudaStream_t s);
-// rows of x (n floats each, ld apart): x -= s Q (Q^T x), Q [n][r] row-major on the device, r <= 4 (STRATA_GLM_ABL)
-void abl_project(float* x, int rows, int ld, int n, const float* q, int r, float s, cudaStream_t st);
+// rows of x (n floats each, ld apart): x -= s Q (Q^T x), Q [n][r] row-major on the device, r <= 4 (STRATA_GLM_ABL /
+// --uncensor); a no-op while the device flag `on` (if given) is 0 - the per-request switch, read on the device so a
+// captured graph follows it too
+void abl_project(float* x, int rows, int ld, int n, const float* q, int r, float s, cudaStream_t st,
+                 const int* on = nullptr);
+// rows x ([rows][n], ld apart) into cap [rows][n] (the residual's capture for --abl-build): the mean of `streams`
+// consecutive n-float streams of each row
+void abl_capture(const float* x, int rows, int ld, int n, int streams, float* cap, cudaStream_t st);
 // out[t] = the token_embd row of toks[t] (ids read on the device; the table may be host-mapped), t < T; Q8_0 and
 // Q5_K rows (false: another type)
 bool embed_rows_q(int ggml_type, const void* table, const int* toks, int T, int n_embd, float* out, cudaStream_t s);

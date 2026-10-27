@@ -542,41 +542,6 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->gap_on = getenv("STRATA_GLM_GAP_PROF") != nullptr && std::atoi(getenv("STRATA_GLM_GAP_PROF")) != 0;
     F->token_spin = getenv("STRATA_GLM_TOKEN_SPIN") != nullptr && std::atoi(getenv("STRATA_GLM_TOKEN_SPIN")) != 0;
     if (F->prof_on) F->pskip = (uint64_t) std::max(0, std::atoi(getenv("STRATA_GLM_PROF")));
-    // STRATA_GLM_ABL=<file> (tools/dense_overlay.py --abl-export): a refusal-direction edit (an abliteration's subspace
-    // Q and its strengths a layer) applied to the attention and shared-expert outputs as they are written - the same as
-    // the edit baked into attn_output_b / ffn_down_shexp, without their re-quantization.  File: "ABL1", int32 n_embd,
-    // rank, layers, then float32 Q [n_embd][rank] and strengths [layers][2]
-    if (const char* ap = getenv("STRATA_GLM_ABL"); ap != nullptr && ap[0]) {
-        bool ok = false;
-        if (FILE* f = std::fopen(ap, "rb")) {
-            char magic[4];
-            int32_t hd[3];
-            if (std::fread(magic, 1, 4, f) == 4 && std::memcmp(magic, "ABL1", 4) == 0 && std::fread(hd, 4, 3, f) == 3 &&
-                hd[0] == (int32_t) g.n_embd && hd[1] >= 1 && hd[1] <= 4 && hd[2] >= 1 && hd[2] <= 1024) {
-                std::vector<float> q((size_t) hd[0] * hd[1]);
-                F->abl_s.resize((size_t) hd[2] * 2);
-                if (std::fread(q.data(), 4, q.size(), f) == q.size() &&
-                    std::fread(F->abl_s.data(), 4, F->abl_s.size(), f) == F->abl_s.size() &&
-                    cudaMalloc((void**) &F->abl_q, q.size() * sizeof(float)) == cudaSuccess &&
-                    cudaMemcpy(F->abl_q, q.data(), q.size() * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess) {
-                    F->abl_r = hd[1];
-                    ok = true;
-                    int na = 0, ns = 0;
-                    for (int l = 0; l < hd[2]; ++l) {
-                        na += F->abl_s[(size_t) l * 2] != 0.0f;
-                        ns += F->abl_s[(size_t) l * 2 + 1] != 0.0f;
-                    }
-                    std::fprintf(stderr, "glm fast: refusal-direction edit at run time (%s): rank %d, attention outputs "
-                                         "of %d layers, shared-expert outputs of %d\n", ap, hd[1], na, ns);
-                }
-            }
-            std::fclose(f);
-        }
-        if (!ok) {
-            err = std::string("glm fast: STRATA_GLM_ABL=") + ap + " is not an ABL1 file for n_embd " + std::to_string(g.n_embd);
-            return false;
-        }
-    }
     if (const char* pn = getenv("STRATA_GLM_PREFETCH_N")) F->max_pf = std::max(0, std::min(gf::kSpares - 1, std::atoi(pn)));
     if (const char* bp = getenv("STRATA_GLM_BG_PACE_KB")) F->bg_pace = (size_t) std::max(0, std::atoi(bp)) << 10;
     else F->bg_pace = (size_t) 1024 << 10;   // (FastState::bg_drain)
@@ -602,6 +567,12 @@ bool Glm5Model::fast_setup(std::string& err) {
                       cudaEventCreate(&F->ev_ge[1]) != cudaSuccess || cudaEventCreate(&F->ev_g0) != cudaSuccess)) {
         err = "glm fast: gap profile events did not create";
         return false;
+    }
+    // STRATA_GLM_ABL=<file> (--uncensor <file>): the refusal-direction edit at run time (src/core/glm_abl.cu)
+    if (const char* ap = getenv("STRATA_GLM_ABL"); ap != nullptr && ap[0]) {
+        if (!abl_load(ap, err)) return false;
+        // STRATA_GLM_ABL_ON=0: loaded but switched off (what a request with abl=0 runs; the check that off = no file)
+        if (const char* on = getenv("STRATA_GLM_ABL_ON"); on != nullptr && on[0] == '0') abl_enable(false);
     }
     // an EXL3 pack: its kernels' scratch on the compute stream now (a graph capture cannot allocate it)
     if (exl3_ && !strata::kernels::exl3::prepare(F->cs)) {
@@ -5269,7 +5240,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     }();
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     // (deepseek41: not before an Engram layer - its separate hc_post writes the FFN's output before the next read)
-    const bool hc_cpu = lane && hc_cpu_env && g.dsv4() && !F->defer && !Ly.mtp && !Ly.exl3 && !F->prof_on &&
+    const bool hc_cpu = lane && hc_cpu_env && g.dsv4() && !F->defer && !Ly.mtp && !Ly.exl3 && !F->prof_on && !abl_full() &&
                         !dumps && il + 1 < l1_ && !(g.v41 && F->L[(size_t) il + 1].eng >= 0) && !(pf && pf_at == 2) &&
                         !F->kda_graph_on && gf::hc_fuses_cpu(g.n_embd);
     if (F->defer && !Ly.mtp) {
@@ -5359,6 +5330,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
                 wrote = false;
             }
             if (!dsv41_engram_add(il, Rc, err)) return false;
+            abl_res(Rc, g.hc, g.n_embd, s);   // (Engram's rows are a residual write too)
         }
         // ---- the attention-side read (fused with the previous FFN's write)
         gf::HcArgs h;
@@ -5400,6 +5372,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         }
         if (F->prof_on) F->mark("hc_attn");
         if (wrote) std::swap(Rc, Ro);
+        abl_cap(il, Rc, g.hc, s);
         if (il > l0_) fast_dump_feat(il - 1, Rc);   // (the layer before's output: the residual entering this one)
         if (dumps) {
             const std::string Ls = std::to_string(il);
@@ -5462,6 +5435,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         // DSpark's features: the layer before's complete output (its deferred part added above)
         if (dsp_ != nullptr && il > l0_) dspark_capture(il - 1, Rc, 0, s);
         // ---- the FFN-side read (fused with the mixer's write)
+        abl_out(il, 0, F->mixer, 1, g.n_embd, s);
         h.block_out = F->mixer;
         h.R_old = Rc;
         h.R_new = Ro;
@@ -5498,6 +5472,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         } else {
             if (!fast_moe(il, pf_pending, err)) return false;
         }
+        abl_out(il, 1, F->ffn, 1, g.n_embd, s);   // (complete: an edit keeps the CPU lane's answer out of the read)
         if (dumps) fast_dump(s, "ffn_out-" + std::to_string(il), F->ffn, g.n_embd);
         return true;
         };
@@ -5530,6 +5505,7 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         F->bg_drain(s, F->bg_pace);
     }
     gf::hc_post(F->ffn, Rc, F->post, F->comb, g.n_embd, Ro, s);
+    if (l1_ == g.n_layers) abl_cap(g.n_layers, Ro, g.hc, s);
     if (F->prof_on) F->mark("hc_post_end");
     fast_dump_feat(l1_ - 1, Ro);
     if (dsp_ != nullptr) dspark_capture(l1_ - 1, Ro, 0, s);
@@ -5576,6 +5552,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         if (img) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
         cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
     }
+    abl_res(F->emb, 1, g.n_embd, F->cs);
     if (g.qwen35())   // one residual stream
         cudaMemcpyAsync(state_, F->emb, (size_t) g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
     else
@@ -5763,13 +5740,6 @@ int Glm5Model::fast_sample(strata::kernels::SamplerParams& sp, std::string& err)
         ++F->gap_sample_n;
     }
     return F->tok_h[0];
-}
-
-void Glm5Model::abl_apply(int il, int which, float* x, int rows, int ld, cudaStream_t s) {
-    const FastState* F = fast_;
-    if (F == nullptr || F->abl_q == nullptr || il < 0 || (size_t) il * 2 + 1 >= F->abl_s.size()) return;
-    const float sc = F->abl_s[(size_t) il * 2 + which];
-    if (sc != 0.0f) gf::abl_project(x, rows, ld, g_.n_embd, F->abl_q, F->abl_r, sc, s);
 }
 
 // STRATA_GLM_GAP_PROF: a token (or window) is ready at the host - the spin since `tw` ends, the GPU's idle gap before
@@ -5987,6 +5957,7 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
                  g.n_embd);
     if (const float* img = image_row(p)) std::memcpy(F->emb_h, img, (size_t) g.n_embd * sizeof(float));   // an image
     cudaMemcpyAsync(F->emb, F->emb_h, (size_t) g.n_embd * sizeof(float), cudaMemcpyHostToDevice, F->cs);
+    abl_res(F->emb, 1, g.n_embd, F->cs);
     gf::embed_streams(F->emb, state_, g.n_embd, F->cs);
     lap(2);
     if (!fast_layers(p, false, err)) return false;

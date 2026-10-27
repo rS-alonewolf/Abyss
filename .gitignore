@@ -62,3 +62,4 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+/old-configs/

@@ -425,9 +425,17 @@ public:
     void dsv41_reset();                                    // a new sequence: the Engram history, the pending pairs
     void dsv41_engram_report() const;                      // STRATA_GLM_TIMING: the Engram rows and the cache's share
     bool dsv41_head(std::string& err);                     // the collapse with the last sublayer's pre -> head_x / xq
-    // STRATA_GLM_ABL: rows of a layer's attention (which 0) or shared-expert (1) output, ld floats apart, minus their
-    // refusal-direction part (a no-op without the file, past its layers or at a zero strength)
+    // ---- the refusal-direction edit (src/core/glm_abl.cu; STRATA_GLM_ABL / --uncensor).  Each is a no-op without an
+    // edit, past its layers or at a zero strength.  abl_apply: an ABL1 edit's sites - rows of a layer's attention
+    // (which 0) or shared-expert (1) output, ld floats apart.  abl_out: an ABL2 edit's - the attention (0) or the
+    // whole FFN (1: routed + shared + the CPU lane's) output.  abl_res: an ABL2 edit on rows going into the residual
+    // whole (the embedding, a residual after Engram's add).  abl_cap: --abl-build's capture of the residual entering
+    // layer `slot` (slot n_layers: the last layer's output), `streams` streams of n_embd averaged
     void abl_apply(int il, int which, float* x, int rows, int ld, cudaStream_t s);
+    void abl_out(int il, int which, float* x, int rows, int ld, cudaStream_t s);
+    void abl_res(float* x, int rows, int ld, cudaStream_t s);
+    void abl_cap(int slot, const float* R, int streams, cudaStream_t s);
+    bool abl_full() const;   // an ABL2 edit is loaded: the CPU lane's answer joins the FFN output before the read
     // ---- qwen35moe (src/core/qwen35_fast_path.cu): the token path (the prompt path, the verify windows and the
     // conversation snapshot are elsewhere; no layer splits yet)
     void* qwen35_state_ = nullptr;                         // the GDN states, conv states, KV caches and activations
@@ -588,6 +596,19 @@ public:
     /// after part (each part's columns hop to the next through pinned host memory, as a token's residual does).
     static constexpr int kVerifyMax = 8;
     bool verify_ready() const;
+    /// The refusal-direction edit (src/core/glm_abl.cu) - uncensoring at run time, on every write into the residual
+    /// (or, an ABL1 file, the attention / shared-expert outputs it names).  abl_load: an ABL1 / ABL2 file (--uncensor;
+    /// STRATA_GLM_ABL); abl_set: an ABL2 edit from memory (--abl-build tries its candidates); abl_clear drops it.
+    /// abl_enable: the per-request switch (on after a load).  abl_capture: --abl-build's residuals - the next
+    /// forward() of one token records the residual entering every layer and the last one's output, read with
+    /// abl_captured ([n_layers + 1][n_embd]).  A layer split: every part gets the edit; the capture is single-part.
+    bool abl_load(const std::string& path, std::string& err);
+    bool abl_set(const std::vector<float>& q, int rank, const std::vector<float>& strengths, float emb, std::string& err);
+    void abl_clear();
+    bool abl_loaded() const;
+    void abl_enable(bool on);
+    bool abl_capture(bool on, std::string& err);
+    bool abl_captured(std::vector<float>& out);
     bool verify(const std::vector<int32_t>& toks, std::string& err);
     int verify_argmax(int i) const;
     int verify_sample(int i, strata::kernels::SamplerParams& sp, std::string& err);

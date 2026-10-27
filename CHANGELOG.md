@@ -7,6 +7,40 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.71 - 2026-10-28
+
+**Uncensoring at run time (opt-in): `--uncensor <file>` takes a model's refusal direction out of the residual stream
+while it runs - no new GGUF, switchable per request.**
+
+- The edit removes a few directions from every write into the residual stream: the embedding, each layer's attention
+  output, the whole FFN output (routed + shared experts + the CPU lane's answer) and V4.1's Engram add (`w - s Q Q^T w`,
+  Arditi et al.'s directional ablation). The routed experts on the SSD are not touched. It runs on the token path, the
+  prompt path and the speculative verify windows of GLM, DeepSeek V4 / V4.1 and the qwen35moe models.
+- Turning it on: `"uncensor": "<file.abl>"` in the config (engine: `--uncensor <file>` or `STRATA_GLM_ABL=<file>`). A
+  request's `"uncensor": false` runs without it, `true` with it (engine: `GEN ... abl=0|1`); it is also one of the shared
+  settings other apps get (`POST /settings`). A conversation computed with the other setting is not reused. While a file is loaded the
+  CPU lane's hc3 fusion and `STRATA_GLM_DEFER` are off. mrfakename's ABL1 files (attention and shared-expert outputs
+  only) still load.
+- Off is unchanged: with the file loaded and switched off (`STRATA_GLM_ABL_ON=0`) the score path's logits match a run
+  without the file bit for bit (V4.1, KL 0, the same CPU-lane count); speed with it on stays within run-to-run noise.
+- `--abl-build <out.abl> --abl-prompts <file>` makes the file (16-82 KB) from the model itself in under an hour:
+  harmful minus harmless mean residuals per layer, made orthogonal to the harmless means (without that the direction
+  carries the residual's huge fixed channels and breaks the model), then candidate layers tried on held-out prompts.
+  `--abl-gen N` judges a candidate by N generated tokens (GLM opens with a heading and refuses in its second line),
+  `--abl-rank`, `--abl-scale`, `--abl-range`, `--abl-candidates`, `--abl-max-kl`, `--abl-layer`, `--abl-dirs` (reuse a
+  build's measurement). `tools/abl_prompts.py` writes the prompt file from public sets (AdvBench, MaliciousInstruct,
+  ForbiddenQuestions, SimpleSafetyTests, JailbreakBench, XSTest), mixed evenly, never the evaluation's prompts.
+- Measured on an AI PRO R9700 with 101 held-out prompts (66 harmful, 35 harmless), greedy:
+
+  | Model | Harmful refused (off -> on) | Harmless refused (off -> on) | Text KL |
+  | --- | :---: | :---: | :---: |
+  | DeepSeek V4.1 Flash 1017 UD-IQ2_XXS | 86% -> 3% | 17% -> 3% | 0.023 |
+  | DeepSeek V4 Flash 0731 UD-Q2_K_XL attn-q5k | 85% -> 6% | 11% -> 3% | 0.013 |
+  | GLM-5.3-Flash Maya-S-v2-IQ2_XXS | 88% -> 8% | 11% -> 3% | 0.053 |
+
+  For comparison, orcarouter's abliterated V4.1 Mix-256G (rebuilt weights) has a text KL of 0.083. docs/MANUAL has the
+  steps; the edit removes refusals, it adds no knowledge.
+
 ## v1.3.70 - 2026-10-27
 
 **DeepSeek V4.1: one Engram worker instead of one a token (#20), and a session-wide late share for the CPU lane (#14).**

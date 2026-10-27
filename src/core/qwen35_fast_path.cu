@@ -476,6 +476,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
         const auto& Ly = F->L[(size_t) il];
         // the residual R (state_) takes the last FFN's output, then x = rms(R) * attn_norm (and its q8_1)
         gf::rms_q8(state_, il == l0_ ? nullptr : F->ffn, Ly.attn_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
+        abl_cap(il, state_, 1, s);
         if (F->prof_on) F->mark("q35_norm");
         if (dumps) {
             if (il > l0_) q35_dump(s, "l_out", il - 1, state_, g.n_embd);
@@ -487,6 +488,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
         } else {
             if (!fast_qwen35_attn(il, p, err)) return false;
         }
+        abl_out(il, 0, F->mixer, 1, g.n_embd, s);
         gf::rms_q8(state_, F->mixer, Ly.post_norm, g.norm_eps, g.n_embd, F->x, F->xq, s);
         if (F->prof_on) F->mark("q35_norm");
         if (dumps) {
@@ -495,6 +497,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
         }
         if (!Ly.moe) { err = "qwen35moe: a dense FFN layer (not supported)"; return false; }
         if (!fast_moe(il, pf_pending, err)) return false;
+        abl_out(il, 1, F->ffn, 1, g.n_embd, s);
         if (dumps) {
             q35_dump(s, "ffn_shexp_gated", il, F->sh_out, g.n_embd);
             q35_dump(s, "ffn_out", il, F->ffn, g.n_embd);
@@ -504,6 +507,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
     const auto nw = w_.find("output_norm.weight");
     if (nw == w_.end()) { err = "qwen35moe: output_norm.weight"; return false; }
     gf::rms_q8(state_, F->ffn, nw->second, g.norm_eps, g.n_embd, F->head_x, F->head_xq, s);
+    if (l1_ == g.n_layers) abl_cap(g.n_layers, state_, 1, s);
     if (F->prof_on) F->mark("q35_head");
     if (dumps) {
         q35_dump(s, "l_out", l1_ - 1, state_, g.n_embd);

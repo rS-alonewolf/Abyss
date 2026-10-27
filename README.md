@@ -56,6 +56,9 @@ the APU's iGPU as a lane).
 - **DeepSeek's DSpark drafter (opt-in)** — three DeepSeek V4 layers read the model's own layer 40–42 outputs and draft
   5 tokens a step, verified in windows of up to 6 tokens: +28% on swe-bench tasks on an AI PRO R9700 (48.4 → 61.9
   tok/s without an iGPU). It takes ~6.5 GB of VRAM.
+- **Uncensoring at run time (opt-in)** — `--uncensor <file>` takes the refusal direction out of every residual write
+  while it runs, switchable per request; `--abl-build` makes the 16-82 KB file from public prompt sets. V4.1 / V4 /
+  GLM-5.3-Flash: harmful prompts refused 85-88% → 3-8%, text KL 0.013-0.053 ([MANUAL](docs/MANUAL.md#uncensoring-at-run-time---uncensor)).
 - **Checked against llama.cpp** — same next-token accuracy over 3,000 tokens (KL 0.009).
 - **Full DeepSeek V4 / V4.1 attention** — sliding window, CSA/HCA compressed KV (V4.1: four shared slots and candidate
   blocks past 16K), the lightning indexer's top-512, sinks.

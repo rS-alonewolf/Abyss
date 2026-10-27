@@ -85,6 +85,7 @@
 #include <csignal>
 #include <filesystem>
 #include <fstream>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <set>
@@ -314,6 +315,18 @@ struct Options {
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
     int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
+    /// --glm-pack: uncensoring at run time (src/core/glm_abl.cu) - --uncensor FILE loads a refusal-direction edit
+    /// (= STRATA_GLM_ABL; --serve requests switch it, abl=0|1); --abl-build OUT finds one from --abl-prompts (lines
+    /// "H|B|h|b <ids>": harmful / harmless prompts to measure, then to check; "R <ids>": the refusals' first tokens)
+    std::string uncensor, abl_build, abl_prompts;
+    double abl_max_kl = 0.2;   ///< --abl-max-kl: the harmless check's KL a candidate may cost at most
+    int abl_candidates = 8;    ///< --abl-candidates: the layers whose directions are tried (20%..80% of the depth)
+    int abl_layer = -1;        ///< --abl-layer: try this layer's direction only
+    int abl_gen = 0;           ///< --abl-gen: harmful check answers generated this far, refusal words looked for in them
+    std::string abl_dirs;      ///< --abl-dirs: an earlier build's OUT.dirs (the measurement skipped)
+    int abl_rank = 1;          ///< --abl-rank: also try the best N candidates' directions together (1..4)
+    float abl_scale = 1.0f;    ///< --abl-scale: the edit's strength (1 takes the component out; above 1 over-projects)
+    double abl_lo = 0.2, abl_hi = 0.8;   ///< --abl-range LO,HI: the candidates' depth (fractions of the layers)
 };
 
 void usage() {
@@ -394,6 +407,14 @@ void usage() {
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
                  "                       when it pays (default 3; 0 = MTP only)\n"
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
+                 "  --uncensor FILE      --glm-pack: a refusal-direction edit (.abl) out of every residual write at run\n"
+                 "                       time (= STRATA_GLM_ABL).  --serve: requests switch it (abl=0|1; on by default)\n"
+                 "  --abl-build OUT      --glm-pack: find the refusal direction from --abl-prompts FILE (tools/abl_prompts.py)\n"
+                 "                       and write it as OUT (ABL2); --abl-candidates N (8) layers tried, --abl-layer L\n"
+                 "                       one, --abl-max-kl K (0.2) the harmless prompts' first-token KL it may cost,\n"
+                 "                       --abl-range LO,HI (0.2,0.8) their depth, --abl-scale S (1) the strength,\n"
+                 "                       --abl-rank N (1) the best N together too, --abl-dirs F an earlier OUT.dirs,\n"
+                 "                       --abl-gen N: judge refusals by the W words in N greedy answer tokens\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -982,6 +1003,339 @@ static void set_env(const char* k, const char* v) {
 #endif
 }
 
+// --abl-build OUT --abl-prompts FILE: the refusal direction from the model's own residual stream (Arditi et al.'s
+// difference of means, the candidate chosen by trying it).  FILE (tools/abl_prompts.py): "H <ids>" / "B <ids>" the
+// harmful / harmless prompts measured, "h" / "b" the ones each candidate is checked on, "R <ids>" the refusals' first
+// tokens - every prompt rendered by the chat template, ending where the answer starts (thinking off).
+//   1. every measured prompt's last token runs the token path with the capture on: the residual entering each layer
+//      and the last one's output (slot n_layers), the streams averaged; their means a class, d_l = mean H - mean B
+//   2. the candidates: --abl-candidates layers evenly over 20%..80% of the depth (or --abl-layer); each one's unit d_l
+//      goes out of every residual write (an ABL2 edit, strength 1) and the check prompts run: the harmful ones' mass
+//      on the refusal tokens at the answer's first position, the harmless ones' KL from the unedited logits there
+//   3. the candidate with the least refusal mass among those within --abl-max-kl (none: the lowest KL) -> OUT, and
+//      every slot's direction (n_layers + 1 rows of n_embd floats) -> OUT.dirs for another pick (--abl-layer)
+static int glm_abl_build(strata::core::Glm5Model& model, const Options& o) {
+    const auto& g = model.geometry();
+    const int L = g.n_layers;
+    const size_t E = (size_t) g.n_embd, V = (size_t) g.n_vocab;
+    std::vector<std::vector<int32_t>> H, B, Hc, Bc;
+    std::vector<int32_t> R;
+    std::vector<std::vector<int32_t>> W;   // the refusal words (token runs) --abl-gen looks for
+    {
+        std::ifstream in(o.abl_prompts);
+        if (!in) { std::fprintf(stderr, "abl build: cannot read --abl-prompts %s\n", o.abl_prompts.c_str()); return 2; }
+        std::string line, e;
+        while (std::getline(in, line)) {
+            if (line.size() < 3 || line[1] != ' ') continue;
+            std::vector<int64_t> ids;
+            if (!parse_i64_list(line.c_str() + 2, ids, e) || ids.empty()) continue;
+            std::vector<int32_t> t;
+            for (int64_t v : ids)
+                if (v >= 0 && v < (int64_t) V) t.push_back((int32_t) v);
+            if (t.size() != ids.size()) continue;
+            switch (line[0]) {
+                case 'H': H.push_back(t); break;
+                case 'B': B.push_back(t); break;
+                case 'h': Hc.push_back(t); break;
+                case 'b': Bc.push_back(t); break;
+                case 'R': R = t; break;
+                case 'W': W.push_back(t); break;
+                default: break;
+            }
+        }
+    }
+    if (H.empty() || B.empty() || Hc.empty() || Bc.empty() || R.empty()) {
+        std::fprintf(stderr, "abl build: --abl-prompts needs H, B, h, b lines and an R line (%zu %zu %zu %zu, R %zu)\n",
+                     H.size(), B.size(), Hc.size(), Bc.size(), R.size());
+        return 2;
+    }
+    std::string err;
+    model.abl_clear();
+    model.set_host_logits(true);
+    // a prompt: all but its last token through the prompt path, the last through the token path (the capture's)
+    std::vector<float> lg;
+    const auto run = [&](const std::vector<int32_t>& p) -> bool {
+        model.reset();
+        size_t i0 = 0;
+        if (model.fast() && model.prefill_chunk() > 0 && p.size() > 2) {
+            const std::vector<int32_t> head(p.begin(), p.end() - 1);
+            err.clear();
+            if (model.prefill(head, err, p.back())) i0 = p.size() - 1;
+            else if (!err.empty()) return false;   // (empty: no prompt path for this one - the token path takes it all)
+            else model.reset();
+        }
+        for (size_t i = i0; i < p.size(); ++i)
+            if (!model.forward({p[i]}, lg, err)) return false;
+        if (lg.size() < V) err = "the token path gave " + std::to_string(lg.size()) + " logits for a vocabulary of " +
+                                 std::to_string(V);
+        return lg.size() >= V;
+    };
+    const auto log_softmax = [&](std::vector<float>& x) {
+        float mx = x[0];
+        for (size_t v = 1; v < V; ++v) mx = std::max(mx, x[v]);
+        double se = 0.0;
+        for (size_t v = 0; v < V; ++v) se += std::exp((double) x[v] - mx);
+        const float lse = (float) (mx + std::log(se));
+        for (size_t v = 0; v < V; ++v) x[v] -= lse;
+    };
+    const auto refusal = [&](const std::vector<float>& ls) {   // log of the mass on the refusal tokens
+        double m = 0.0;
+        for (int32_t r : R) m += std::exp((double) ls[(size_t) r]);
+        return std::log(std::max(m, 1e-30));
+    };
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto secs = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); };
+    const size_t slots = (size_t) L + 1;
+    std::vector<float> dirs(slots * E);
+    if (!o.abl_dirs.empty()) {   // (an earlier build's directions: the candidates only)
+        std::FILE* f = std::fopen(o.abl_dirs.c_str(), "rb");
+        const bool ok = f != nullptr && std::fread(dirs.data(), sizeof(float), dirs.size(), f) == dirs.size() &&
+                        std::fgetc(f) == EOF;
+        if (f) std::fclose(f);
+        if (!ok) {
+            std::fprintf(stderr, "abl build: %s is not a .dirs file of %zu x %zu floats\n", o.abl_dirs.c_str(), slots, E);
+            return 2;
+        }
+    } else {
+    // ---- 1. the means
+    if (!model.abl_capture(true, err)) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
+    std::vector<double> mh(slots * E, 0.0), mb(slots * E, 0.0);
+    std::vector<float> cap;
+    for (int cls = 0; cls < 2; ++cls) {
+        const auto& set = cls == 0 ? H : B;
+        auto& m = cls == 0 ? mh : mb;
+        for (size_t i = 0; i < set.size(); ++i) {
+            if (!run(set[i]) || !model.abl_captured(cap)) {
+                std::fprintf(stderr, "abl build: %s\n", err.empty() ? "the capture could not be read" : err.c_str());
+                return 1;
+            }
+            for (size_t k = 0; k < m.size(); ++k) m[k] += cap[k];
+            std::fprintf(stderr, "abl build: measured %s %zu / %zu (%.0f s)\n", cls == 0 ? "harmful" : "harmless", i + 1,
+                         set.size(), secs());
+        }
+        for (double& v : m) v /= (double) set.size();
+    }
+    model.abl_capture(false, err);
+    // the harmless means' span (every slot's, Gram-Schmidt): the residual's large shared part - its massive-activation
+    // channels among it.  A direction with a component there takes a slice of those huge values out of every write
+    // and breaks the model (a random unit direction cost KL 0.12 on MiniMax); each slot's d_l is made orthogonal to
+    // the span before it is normalized (as projected abliteration takes out the harmless mean)
+    std::vector<std::vector<double>> basis;
+    for (size_t l = 0; l < slots; ++l) {
+        std::vector<double> b(mb.begin() + (long) (l * E), mb.begin() + (long) ((l + 1) * E));
+        const double n0 = std::sqrt(std::inner_product(b.begin(), b.end(), b.begin(), 0.0));
+        for (int pass = 0; pass < 2; ++pass)
+            for (const auto& u : basis) {
+                const double c = std::inner_product(b.begin(), b.end(), u.begin(), 0.0);
+                for (size_t k = 0; k < E; ++k) b[k] -= c * u[k];
+            }
+        const double n = std::sqrt(std::inner_product(b.begin(), b.end(), b.begin(), 0.0));
+        if (n > 1e-3 * n0 && n > 0.0) {
+            for (double& v : b) v /= n;
+            basis.push_back(std::move(b));
+        }
+    }
+    std::vector<double> dnorm(slots), rnorm(slots), kept(slots);
+    for (size_t l = 0; l < slots; ++l) {
+        std::vector<double> d(E);
+        for (size_t k = 0; k < E; ++k) d[k] = mh[l * E + k] - mb[l * E + k];
+        const double n2 = std::inner_product(d.begin(), d.end(), d.begin(), 0.0);
+        dnorm[l] = std::sqrt(n2);
+        rnorm[l] = std::sqrt(std::inner_product(mb.begin() + (long) (l * E), mb.begin() + (long) ((l + 1) * E),
+                                                mb.begin() + (long) (l * E), 0.0));
+        for (int pass = 0; pass < 2; ++pass)
+            for (const auto& u : basis) {
+                const double c = std::inner_product(d.begin(), d.end(), u.begin(), 0.0);
+                for (size_t k = 0; k < E; ++k) d[k] -= c * u[k];
+            }
+        const double nn = std::sqrt(std::inner_product(d.begin(), d.end(), d.begin(), 0.0));
+        kept[l] = n2 > 0.0 ? nn / std::sqrt(n2) : 0.0;
+        for (size_t k = 0; k < E; ++k) dirs[l * E + k] = (float) (d[k] / std::max(nn, 1e-12));
+    }
+    {
+        std::FILE* f = std::fopen((o.abl_build + ".dirs").c_str(), "wb");
+        if (f) {
+            std::fwrite(dirs.data(), sizeof(float), dirs.size(), f);
+            std::fclose(f);
+        }
+        std::vector<float> means(mb.begin(), mb.end());
+        if ((f = std::fopen((o.abl_build + ".means").c_str(), "wb")) != nullptr) {   // (the harmless means, slots x n_embd)
+            std::fwrite(means.data(), sizeof(float), means.size(), f);
+            std::fclose(f);
+        }
+    }
+    std::fprintf(stderr, "abl build: by layer, |mean harmful - mean harmless| / |mean harmless| and (the share of the "
+                         "difference left orthogonal to the %zu harmless means):", basis.size());
+    for (size_t l = 0; l < slots; ++l)
+        std::fprintf(stderr, "%s%zu:%.3f(%.2f)", l % 8 ? " " : "\n  ", l, dnorm[l] / std::max(rnorm[l], 1e-12), kept[l]);
+    std::fprintf(stderr, "\n");
+    }
+    // ---- 2. the check prompts unedited, then each candidate
+    std::vector<std::vector<float>> base(Bc.size());
+    double ref0 = 0.0;
+    for (size_t i = 0; i < Hc.size(); ++i) {
+        if (!run(Hc[i])) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
+        log_softmax(lg);
+        ref0 += refusal(lg);
+    }
+    ref0 /= (double) Hc.size();
+    for (size_t i = 0; i < Bc.size(); ++i) {
+        if (!run(Bc[i])) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
+        log_softmax(lg);
+        base[i].assign(lg.begin(), lg.begin() + (long) V);
+    }
+    std::printf("ABL unedited: refusal mass %.4f (log %.3f) on %zu harmful check prompts\n", std::exp(ref0), ref0, Hc.size());
+    std::fflush(stdout);
+    std::vector<int> cand;
+    if (o.abl_layer >= 0 && o.abl_layer <= L) cand.push_back(o.abl_layer);
+    else {
+        const int lo = (int) std::lround(o.abl_lo * L), hi = (int) std::lround(o.abl_hi * L), n = std::max(1, o.abl_candidates);
+        for (int i = 0; i < n; ++i) {
+            const int l = n == 1 ? (lo + hi) / 2 : lo + (int) std::lround((double) (hi - lo) * i / (n - 1));
+            if (cand.empty() || cand.back() != l) cand.push_back(l);
+        }
+    }
+    const std::vector<float> strengths((size_t) L * 2, o.abl_scale);
+    // one edit (Q: rank orthonormal directions) on the check prompts -> refusal (log mass), harmless KL, refusals first
+    struct Res { double ref, kl; int top, gen; };
+    // --abl-gen N: the answer's first N tokens (greedy, from lg - the prompt's logits): a refusal word anywhere in them
+    const auto gen_refuses = [&]() -> int {
+        std::vector<int32_t> a;
+        for (int n = 0; n < o.abl_gen; ++n) {
+            const int32_t t = (int32_t) (std::max_element(lg.begin(), lg.begin() + (long) V) - lg.begin());
+            a.push_back(t);
+            if (n + 1 < o.abl_gen && !model.forward({t}, lg, err)) return -1;
+        }
+        for (const auto& w : W)
+            if (!w.empty() && std::search(a.begin(), a.end(), w.begin(), w.end()) != a.end()) return 1;
+        return 0;
+    };
+    const auto check = [&](const std::vector<float>& q, int rank, Res& r) -> bool {
+        if (!model.abl_set(q, rank, strengths, o.abl_scale, err)) return false;
+        model.abl_enable(true);
+        r = Res{0.0, 0.0, 0, 0};
+        for (size_t i = 0; i < Hc.size(); ++i) {
+            if (!run(Hc[i])) return false;
+            log_softmax(lg);
+            r.ref += refusal(lg);
+            const size_t am = (size_t) (std::max_element(lg.begin(), lg.begin() + (long) V) - lg.begin());
+            const bool first = std::find(R.begin(), R.end(), (int32_t) am) != R.end();
+            r.top += first;
+            if (o.abl_gen > 0) {
+                const int g = gen_refuses();
+                if (g < 0) return false;
+                r.gen += first || g > 0;
+            }
+        }
+        r.ref /= (double) Hc.size();
+        for (size_t i = 0; i < Bc.size(); ++i) {
+            if (!run(Bc[i])) return false;
+            log_softmax(lg);
+            double k = 0.0;
+            for (size_t v = 0; v < V; ++v) k += std::exp((double) base[i][v]) * ((double) base[i][v] - lg[v]);
+            r.kl += k;
+        }
+        r.kl /= (double) Bc.size();
+        return true;
+    };
+    if (o.abl_gen > 0) {   // (the edit is not loaded yet: the unedited answers)
+        if (W.empty()) { std::fprintf(stderr, "abl build: --abl-gen needs W lines in --abl-prompts (tools/abl_prompts.py)\n"); return 2; }
+        int g0 = 0;
+        for (size_t i = 0; i < Hc.size(); ++i) {
+            if (!run(Hc[i])) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
+            const int g = gen_refuses();
+            if (g < 0) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
+            g0 += g > 0;
+        }
+        std::printf("ABL unedited: a refusal word in the first %d tokens of %d of %zu harmful check answers (%.0f s)\n",
+                    o.abl_gen, g0, Hc.size(), secs());
+        std::fflush(stdout);
+    }
+    std::vector<std::pair<int, Res>> tried;
+    for (int l : cand) {
+        const std::vector<float> q(dirs.begin() + (long) ((size_t) l * E), dirs.begin() + (long) ((size_t) (l + 1) * E));
+        Res r;
+        if (!check(q, 1, r)) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
+        std::printf("ABL layer %d: refusal mass %.4f (log %.3f), a refusal first on %d of %zu, harmless KL %.4f%s (%.0f s)\n",
+                    l, std::exp(r.ref), r.ref, r.top, Hc.size(), r.kl,
+                    o.abl_gen > 0 ? (", refused in " + std::to_string(o.abl_gen) + " tokens " + std::to_string(r.gen)).c_str() : "",
+                    secs());
+        std::fflush(stdout);
+        tried.push_back({l, r});
+    }
+    // the choice: the least refusal within --abl-max-kl, else the lowest KL
+    // (--abl-gen: fewer answers refusing first, then the refusal mass)
+    const auto better = [&](const Res& x, const Res& y) {
+        return o.abl_gen > 0 ? (x.gen != y.gen ? x.gen < y.gen : x.ref < y.ref) : x.ref < y.ref;
+    };
+    std::vector<int> layers;
+    Res best{1e30, 1e30, 0, 1 << 30};
+    for (const auto& [l, r] : tried)
+        if (r.kl <= o.abl_max_kl && better(r, best)) { best = r; layers = {l}; }
+    if (layers.empty()) {
+        for (const auto& [l, r] : tried)
+            if (r.kl < best.kl) { best = r; layers = {l}; }
+        std::printf("ABL no candidate within --abl-max-kl %.3f: the lowest KL's (layer %d)\n", o.abl_max_kl, layers[0]);
+    }
+    // --abl-rank N: the N best within the KL cap (by refusal) together, Gram-Schmidt - when it refuses less within the cap
+    std::vector<float> Q(dirs.begin() + (long) ((size_t) layers[0] * E), dirs.begin() + (long) ((size_t) (layers[0] + 1) * E));
+    int rank = 1;
+    if (o.abl_rank > 1) {
+        std::vector<std::pair<int, Res>> ok;
+        for (const auto& t : tried)
+            if (t.second.kl <= o.abl_max_kl) ok.push_back(t);
+        std::sort(ok.begin(), ok.end(), [&](const auto& x, const auto& y) { return better(x.second, y.second); });
+        if (ok.size() > (size_t) o.abl_rank) ok.resize((size_t) o.abl_rank);
+        std::vector<std::vector<double>> u;
+        std::vector<int> used;
+        for (const auto& [l, r] : ok) {
+            std::vector<double> v(dirs.begin() + (long) ((size_t) l * E), dirs.begin() + (long) ((size_t) (l + 1) * E));
+            for (int pass = 0; pass < 2; ++pass)
+                for (const auto& w : u) {
+                    const double c = std::inner_product(v.begin(), v.end(), w.begin(), 0.0);
+                    for (size_t k = 0; k < E; ++k) v[k] -= c * w[k];
+                }
+            const double n = std::sqrt(std::inner_product(v.begin(), v.end(), v.begin(), 0.0));
+            if (n < 0.1) continue;   // (nearly the same direction as one already in)
+            for (double& x : v) x /= n;
+            u.push_back(std::move(v));
+            used.push_back(l);
+        }
+        if (u.size() > 1) {
+            std::vector<float> q(E * u.size());   // [n_embd][rank] row-major
+            for (size_t k = 0; k < E; ++k)
+                for (size_t j = 0; j < u.size(); ++j) q[k * u.size() + j] = (float) u[j][k];
+            Res r;
+            if (!check(q, (int) u.size(), r)) { std::fprintf(stderr, "abl build: %s\n", err.c_str()); return 1; }
+            std::string names;
+            for (int l : used) names += (names.empty() ? "" : "+") + std::to_string(l);
+            std::printf("ABL layers %s together: refusal mass %.4f (log %.3f), a refusal first on %d of %zu, harmless KL %.4f%s "
+                        "(%.0f s)\n", names.c_str(), std::exp(r.ref), r.ref, r.top, Hc.size(), r.kl,
+                        o.abl_gen > 0 ? (", refused in " + std::to_string(o.abl_gen) + " tokens " + std::to_string(r.gen)).c_str() : "",
+                        secs());
+            std::fflush(stdout);
+            if (r.kl <= o.abl_max_kl && better(r, best)) { best = r; layers = used; Q = q; rank = (int) u.size(); }
+        }
+    }
+    model.abl_clear();
+    std::FILE* f = std::fopen(o.abl_build.c_str(), "wb");
+    if (f == nullptr) { std::fprintf(stderr, "abl build: cannot write %s\n", o.abl_build.c_str()); return 1; }
+    const int32_t hd[3] = {(int32_t) E, rank, (int32_t) L};
+    const float emb = o.abl_scale;
+    std::fwrite("ABL2", 1, 4, f);
+    std::fwrite(hd, 4, 3, f);
+    std::fwrite(Q.data(), sizeof(float), Q.size(), f);
+    std::fwrite(strengths.data(), sizeof(float), strengths.size(), f);
+    std::fwrite(&emb, sizeof(float), 1, f);
+    std::fclose(f);
+    std::string names;
+    for (int l : layers) names += (names.empty() ? "" : "+") + std::to_string(l);
+    std::printf("ABL chose layer %s (rank %d, scale %.2f: refusal mass %.4f, harmless KL %.4f) -> %s%s\n", names.c_str(), rank,
+                o.abl_scale, std::exp(best.ref), best.kl, o.abl_build.c_str(),
+                o.abl_dirs.empty() ? (" (every slot's direction in " + o.abl_build + ".dirs)").c_str() : "");
+    return 0;
+}
+
 static int glm_pack_generate(const Options& o) {
 #if !defined(_WIN32)
     // serving: the server ends the engine with QUIT (or by closing its input), and the engine then sets the conversation
@@ -1020,6 +1374,7 @@ static int glm_pack_generate(const Options& o) {
     // the prompt chunk, set in the config's args like Strata's: --prefill auto | N (a chunk of N tokens) | 0
     // (the engine reads it as STRATA_GLM_PREFILL; without either, auto)
     if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
+    if (!o.uncensor.empty() && o.abl_build.empty()) set_env("STRATA_GLM_ABL", o.uncensor.c_str());
     // the layer split across the visible GPUs: STRATA_GLM_SPLIT, else --layer-split (auto | K1,K2,..)
     if (!model.load_pack_env(o.glm_pack, o.max_context, err, o.layer_split)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
@@ -1034,11 +1389,11 @@ static int glm_pack_generate(const Options& o) {
         // (+ the CPU lane setup's calibration reads: its threads and its PCIe share, as the engine started)
         std::printf("INFO context=%lld kv=%s expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast experts=%d "
                     "vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d vision_lend=%zu cpu_threads=%d "
-                    "pcie_share=%.2f\n",
+                    "pcie_share=%.2f uncensor=%d\n",
                     (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
-                    model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share());
+                    model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share(), model.abl_loaded() ? 1 : 0);
     }
 
     strata::kernels::SamplerParams sp;
@@ -1118,6 +1473,11 @@ static int glm_pack_generate(const Options& o) {
     };
 
     std::vector<int32_t> snap_tokens;   // the prompt prefix the model's saved state belongs to (conversation reuse)
+    // the refusal-direction edit's per-request switch (GEN key abl=0|1; --uncensor loads it, on): the default, this
+    // request's, and the one the model's sequence was computed with - a state computed the other way is never reused
+    // (the snapshot is dropped on a change; the slots hold default-state conversations only)
+    const bool abl_def = model.abl_loaded();
+    bool abl_req = abl_def, snap_abl = abl_def;
     // images (GENI): this request's <|image|> positions and rows, and a hash of the rows the saved state read - the
     // same tokens with another picture must not reuse it
     std::vector<int64_t> cur_img_pos;
@@ -1301,7 +1661,8 @@ static int glm_pack_generate(const Options& o) {
     };
     // the conversation in the model (its snapshot, snap_tokens) into a slot
     const auto slot_put = [&](const char* why) {
-        if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min || snap_img_hash != kNoImages) return;
+        if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min || snap_img_hash != kNoImages ||
+            snap_abl != abl_def) return;
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
             if (slots[i].tokens.size() <= snap_tokens.size() &&
                 std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), snap_tokens.begin()))
@@ -1404,13 +1765,17 @@ static int glm_pack_generate(const Options& o) {
         // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
         // restored when this prompt extends it - a chat's next turn reads only what is new
         strata::core::progress_at("the request: restoring a conversation");
+        if (abl_def) {
+            model.abl_enable(abl_req);
+            if (abl_req != snap_abl) snap_tokens.clear();
+        }
         size_t reuse = 0;
         if (model.fast() && !snap_tokens.empty() && snap_tokens.size() < prompt.size() &&
             std::equal(snap_tokens.begin(), snap_tokens.end(), prompt.begin()) &&
             img_hash(snap_tokens.size()) == snap_img_hash &&
             getenv("STRATA_GLM_NO_REUSE") == nullptr && model.snapshot_restore())
             reuse = snap_tokens.size();
-        if (reuse == 0 && slot_max > 0) {
+        if (reuse == 0 && slot_max > 0 && abl_req == abl_def) {
             slot_put("");              // the conversation in the model, before this prompt overwrites it
             reuse = slot_take(prompt);
         } else if (reuse > 0 && slot_max > 0 && getenv("STRATA_GLM_SLOT_ROUNDTRIP") != nullptr) {
@@ -1424,6 +1789,7 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         if (reuse == 0) model.reset();
+        snap_abl = abl_req;   // (the sequence in the model from here on)
         std::vector<float> lg;
         const auto t0 = std::chrono::steady_clock::now();
         const char* finish = "length";
@@ -2099,6 +2465,7 @@ static int glm_pack_generate(const Options& o) {
         return 0;
     };
 
+    if (!o.abl_build.empty()) return glm_abl_build(model, o);
     if (!o.serve) {
         if (o.tokens.empty()) {
             std::fprintf(stderr, "maya generate: --tokens is required (this build has no tokenizer; see the "
@@ -2360,6 +2727,7 @@ static int glm_pack_generate(const Options& o) {
             bool any_key = false, greedy_req = false;
             req_think_budget = 0;
             req_think_end = -1;
+            abl_req = abl_def;        // abl=0|1: the refusal-direction edit for this request (as the engine started)
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
             int req_threads = 0;
             std::string tok2, ids, emb_path;
@@ -2384,6 +2752,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "think_end") { req_think_end = std::atoi(v.c_str()); }
                 else if (k == "pcie_frac") { req_pcie = std::atof(v.c_str()); }
                 else if (k == "cpu_threads") { req_threads = std::atoi(v.c_str()); }
+                else if (k == "abl") { abl_req = abl_def && std::atoi(v.c_str()) != 0; }
                 // penalty_* need machinery this mode does not have (history rows): ignored rather than approximated
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
@@ -2616,6 +2985,23 @@ int main(int argc, char** argv) {
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
         else if (a == "--serve") o.serve = true;
+        else if (a == "--uncensor") o.uncensor = next("--uncensor");
+        else if (a == "--abl-build") o.abl_build = next("--abl-build");
+        else if (a == "--abl-prompts") o.abl_prompts = next("--abl-prompts");
+        else if (a == "--abl-max-kl") o.abl_max_kl = std::atof(next("--abl-max-kl"));
+        else if (a == "--abl-candidates") o.abl_candidates = std::max(1, std::atoi(next("--abl-candidates")));
+        else if (a == "--abl-layer") o.abl_layer = std::atoi(next("--abl-layer"));
+        else if (a == "--abl-dirs") o.abl_dirs = next("--abl-dirs");
+        else if (a == "--abl-gen") o.abl_gen = std::max(0, std::min(256, std::atoi(next("--abl-gen"))));
+        else if (a == "--abl-rank") o.abl_rank = std::min(4, std::max(1, std::atoi(next("--abl-rank"))));
+        else if (a == "--abl-scale") o.abl_scale = (float) std::atof(next("--abl-scale"));
+        else if (a == "--abl-range") {
+            const char* v = next("--abl-range");
+            if (std::sscanf(v, "%lf,%lf", &o.abl_lo, &o.abl_hi) != 2 || o.abl_lo < 0.0 || o.abl_hi > 1.0 || o.abl_lo > o.abl_hi) {
+                std::fprintf(stderr, "--abl-range: LO,HI with 0 <= LO <= HI <= 1\n");
+                std::exit(2);
+            }
+        }
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));

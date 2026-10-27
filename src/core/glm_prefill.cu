@@ -2354,6 +2354,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (Ly.eng >= 0) {
                 if (blk != nullptr) gb::hc_update(blk, S->R, S->post, S->comb, nullptr, T, E, s);
                 if (!dsv41_engram_prompt(il, T, S->R, err)) return false;
+                abl_res(S->R, T * 4, E, s);   // (Engram's rows are a residual write too)
                 blk = nullptr;
                 S->mark("engram", s);
             }
@@ -2605,6 +2606,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
 
         S->mark(Ly.recr ? "kda" : "dsa", s);
         if (skip_output) continue;   // every KDA/DSA cache update above still ran; these output rows feed nothing
+        abl_out(il, 0, S->mixer, T, E, s);
         dump_row("mixer-" + std::to_string(il), S->mixer, E);
         if (g.v41)
             hc_read(S->mixer, Ly.hc_ffn_fn, Ly.hc_ffn_scale, Ly.hc_ffn_base, Ly.ffn_norm, S->pre, S->pre2);
@@ -2642,6 +2644,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 hgemm_q(Ly.ffn_down, E, g.n_ff_dense, B.dh16, g.n_ff_dense, S->ffn + (size_t) t0 * E, E, tn, 0.0f);
             }
             S->mark("dense_ffn", s);
+            abl_out(il, 1, S->ffn, T, E, s);
             dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
             continue;
         }
@@ -3657,6 +3660,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         dump_row("pf_shexp-" + std::to_string(il), S->ffn, E);
         flush();
         if (cpu_nrows > 0) gb::moe_combine_add(M.OUTPc, cpu_r0, cpu_r0, rows, M.pos, M.rw, T, K, E, S->ffn, s);
+        abl_out(il, 1, S->ffn, T, E, s);   // (the whole FFN: shared + routed + the CPU lane's rows)
         S->mark("combine", s);
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].end, s);
         dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
@@ -3964,6 +3968,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         cudaMemcpyAsync(S->x, S->emb_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, fast_->cs);
         if (S->toks_d != nullptr)   // (pageable source: the copy completes before the call returns)
             cudaMemcpyAsync(S->toks_d, tokens.data() + i, (size_t) T * sizeof(int), cudaMemcpyHostToDevice, fast_->cs);
+        abl_res(S->x, T, E, fast_->cs);
         gb::embed_rows(S->x, S->R, T, E, fast_->cs);
         if (g.v41) S->toks_h.assign(tokens.begin() + i, tokens.begin() + i + T);
         return true;

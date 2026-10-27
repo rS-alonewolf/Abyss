@@ -473,7 +473,8 @@ class StrataEngine:
         if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic)
-            return " temperature=0" + think + tune_keys + StrataEngine.projection_key(sampling)
+            return " temperature=0" + think + tune_keys + StrataEngine.projection_key(sampling) + \
+                StrataEngine.uncensor_key(sampling)
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
@@ -509,7 +510,14 @@ class StrataEngine:
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
         keys += think + tune_keys
-        return keys + StrataEngine.projection_key(sampling)
+        return keys + StrataEngine.projection_key(sampling) + StrataEngine.uncensor_key(sampling)
+
+    @staticmethod
+    def uncensor_key(sampling: dict) -> str:
+        """`abl=0|1`: the refusal-direction edit for this request, when the engine was started with one (the config's
+        "uncensor": <file.abl>, --uncensor; an engine without one ignores the key).  Absent = on."""
+        on = sampling.get("uncensor")
+        return f" abl={int(on)}" if isinstance(on, bool) else ""
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -907,6 +915,9 @@ def engine_args(cfg: dict) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32")."""
     args = list(cfg["args"])
+    # "uncensor": <file.abl> (--abl-build's, docs/MANUAL): the refusal-direction edit, switched per request ("uncensor")
+    if cfg.get("uncensor") and "--uncensor" not in args:
+        args += ["--uncensor", str(cfg["uncensor"])]
     if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
         args += ["--layer-split", str(cfg.get("layer_split") or "auto")]
     return args
@@ -2705,7 +2716,8 @@ def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     return httpd
 
 
-SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection")
+SHARED_KEYS = ("reasoning_effort", "temperature", "top_p", "top_k", "seed", "max_tokens", "experimental_speed_projection",
+               "uncensor")
 
 
 def clean_shared_defaults(d) -> dict:
@@ -2740,9 +2752,9 @@ def clean_shared_defaults(d) -> dict:
             if not number or value != int(value) or value <= 0:
                 raise ValueError(f"{key}: a positive integer")
             value = int(value)
-        elif key == "experimental_speed_projection":
+        elif key in ("experimental_speed_projection", "uncensor"):
             if not isinstance(value, bool):
-                raise ValueError("experimental_speed_projection: true or false")
+                raise ValueError(f"{key}: true or false")
         else:
             raise ValueError(f"unknown setting {key!r}")
         out[key] = float(value) if key in ("temperature", "top_p", "min_p") else value
@@ -2797,10 +2809,10 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
             if not number or value != int(value) or value <= 0:
                 raise SystemExit(f"[maya] config sampling.seed={value!r}: expected a positive integer")
             out[key] = int(value)
-        elif key == "experimental_speed_projection":
+        elif key in ("experimental_speed_projection", "uncensor"):
             if not isinstance(value, bool):
-                raise SystemExit(f"[maya] config sampling.experimental_speed_projection={value!r}: expected true or "
-                                 "false (the default for requests that leave it out, when the engine has the vector)")
+                raise SystemExit(f"[maya] config sampling.{key}={value!r}: expected true or false (the default for "
+                                 "requests that leave it out, when the engine has the vector / the edit)")
             out[key] = value
         else:
             print(f"[maya] config sampling.{key}={value!r}: unknown key, ignored", flush=True)

@@ -640,11 +640,17 @@ struct Glm5Model::FastState {
     int ram_slack = 0;           // extra RAM-tier slots per MoE layer (STRATA_GLM_RAM_SLACK; default 16 resident)
     // ---- STRATA_GLM_PROF=1: a cudaEvent after every launch, the gaps summed per kernel name (debug only)
     bool prof_on = false;
-    // ---- STRATA_GLM_ABL=<file>: a refusal-direction edit applied to the attention / shared-expert outputs at run time
-    // (Glm5Model::abl_apply): Q [n_embd][abl_r] on the device, the strengths [layer][attn, shexp] on the host
+    // ---- the refusal-direction edit (src/core/glm_abl.cu; STRATA_GLM_ABL / --uncensor): Q [n_embd][abl_r] on the
+    // device, the strengths [layer][2] on the host - ABL1 (an abliteration's edit): [attention, shared expert]; ABL2
+    // (abl_full, --abl-build's): [attention, the whole FFN] and abl_emb on the embedding (every residual write)
     float* abl_q = nullptr;
     int abl_r = 0;
     std::vector<float> abl_s;
+    bool abl_full = false;
+    float abl_emb = 0.0f;
+    int* abl_on = nullptr;      // device int: the per-request switch (1 on), read by the kernel
+    float* abl_cap = nullptr;   // --abl-build: [n_layers + 1][n_embd], the residual entering each layer
+    bool abl_cap_on = false;
     // qwen35moe's NextN drafter: the pending position's normed hidden, the row kernels' scratch (<= kVerifyMax rows),
     // the chain's tokens and confidences
     float *q35_pend_h = nullptr, *q35_mt_emb = nullptr, *q35_mt_hid = nullptr, *q35_mt_x = nullptr, *q35_mt_k = nullptr,
