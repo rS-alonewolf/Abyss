@@ -218,17 +218,7 @@ GGUF_PY=~/llm/apps/llama.cpp/gguf-py LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin
 }
 ```
 
-| 項目 | |
-| --- | --- |
-| `exe` | エンジン（`build/strata`） |
-| `args` | エンジンの引数。`--glm-pack` に pack（DeepSeek V4 も GLM と同じ入口で動く）、`--max-context` にコンテキスト長、`--prefill auto` は prompt のまとめ処理の大きさ |
-| `tokenizer` | pack の `tokenizer` フォルダ（チャットテンプレートは DeepSeek のもの） |
-| `model_name` | API が返すモデル名 |
-| `sampling` | リクエストが指定しないときの既定値（DeepSeek の推奨: temperature 1.0, top_p 0.95） |
-| `reasoning_effort` | 省略可。思考の既定レベル（`none`, `low`, `high`, `max`） |
-| `thinking_budget` | 省略可。思考の上限トークン数（既定 32768、0 で上限なし） |
-| `env` | 省略可。エンジンの設定 `{"STRATA_GLM_...": "..."}`（[設定項目](#設定項目)） |
-| `log` | エンジンのログ |
+すべての項目、セットアップがこのファイル（`abyss-<名前>.json`）を置く場所、書き換え方は [SETTINGS.ja.md](SETTINGS.ja.md) にあります。
 
 サーバーを起動する:
 
@@ -531,6 +521,8 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 [UNCENSOR.ja.md](UNCENSOR.ja.md) にまとめています。
 
 ## 設定項目
+
+（設定ファイルそのもの、つまり場所とすべての項目は [SETTINGS.ja.md](SETTINGS.ja.md) にあります。）
 
 エンジンへの環境変数。設定ファイルの `"env"` に書く（Maya の全項目は [docs/maya/README.md](maya/README.md#tuning)。
 ここで特に関係するもの）:

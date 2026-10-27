@@ -220,17 +220,7 @@ A config file (any name; `strata-dsv4.json` here) in the Abyss folder:
 }
 ```
 
-| Field | |
-| --- | --- |
-| `exe` | the engine (`build/strata`) |
-| `args` | the engine's arguments: `--glm-pack` the pack (the engine runs DeepSeek V4 through the same entry as GLM), `--max-context` the context in tokens, `--prefill auto` the prompt chunk size |
-| `tokenizer` | the pack's `tokenizer` folder (its chat template is DeepSeek's own) |
-| `model_name` | the name the API reports |
-| `sampling` | defaults for requests that do not set them (DeepSeek's recommendation: temperature 1.0, top_p 0.95) |
-| `reasoning_effort` | optional default thinking level (`none`, `low`, `high`, `max`) |
-| `thinking_budget` | optional cap on a thinking block in tokens (default 32768; 0 = none) |
-| `env` | optional `{"STRATA_GLM_...": "..."}` settings for the engine (see [Settings](#settings)) |
-| `log` | the engine's log |
+Every key, where setup puts this file (`abyss-<name>.json`) and how to change it: [SETTINGS.md](SETTINGS.md).
 
 Start the server:
 
@@ -549,6 +539,8 @@ From v1.3.71 the engine can take a model's refusal direction out while it runs, 
 and the older ways are all in [UNCENSOR.md](UNCENSOR.md).
 
 ## Settings
+
+(The config file itself - where it is and every key - is described in [SETTINGS.md](SETTINGS.md).)
 
 Environment variables for the engine, in the config's `"env"` block (all of Maya's are listed in
 [docs/maya/README.md](maya/README.md#tuning); these matter most here):

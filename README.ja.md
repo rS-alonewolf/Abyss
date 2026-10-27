@@ -283,6 +283,8 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 | | |
 | --- | --- |
 | [マニュアル](docs/MANUAL.ja.md) · [Manual](docs/MANUAL.md) | セットアップ、設定、API、複数 GPU、AMD、設定項目、トラブル対応 |
+| [設定ファイル](docs/SETTINGS.ja.md) · [Config files](docs/SETTINGS.md) | 設定ファイルと起動スクリプトの場所、変えたいこと別の書き換え場所、全項目、書き換えたあとの反映 |
+| [無検閲化](docs/UNCENSOR.ja.md) · [Uncensoring](docs/UNCENSOR.md) | `--uncensor` の有効化、自分のモデル用のファイル作り、実測、以前からある方法 |
 | [AMD Radeon](docs/amd/README.ja.md) · [English](docs/amd/README.md) | AMD: ドライバ、ROCm（アーキテクチャ別のパッケージ）、単体の Radeon と APU の iGPU、トラブル対応 |
 | [更新履歴](CHANGELOG.md) | 各リリースの内容と測定結果 |
 | [移植の記録](docs/deepseek4/PORT.md) | Abyss が足したものと、その確認方法 |

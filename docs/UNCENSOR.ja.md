@@ -62,14 +62,28 @@ SSD 上のルーティングされるエキスパートには触らないので�
 
 ## 有効にする
 
-サーバーの設定に書きます。
+**どのファイルか。** モデルの実行設定、Abyss フォルダーにある `abyss-<name>.json` です（例: `abyss-dsv41-iq2xxs.json`）。
+- setup が書き出すファイルです。
+- `run-abyss-<name>.sh` がサーバーに `--config` で渡すファイルで、サーバーを自分で起動するときに
+  `serve/server.py --config <file>` で指定するファイルです（場所と、いま使っているファイルの見つけ方は [SETTINGS](SETTINGS.ja.md)）。
+- モデルごとに 1 つあります。`.abl` ファイルを作ったモデルのものに書いてください。
+
+一番外側に、`"exe"` や `"args"` と並べてキーを 1 つ足します（`"args"` や `"env"` の中ではありません）。
 
 ```json
-"uncensor": "/path/to/model.abl"
+{
+ "exe": "/home/you/llm/apps/Abyss/build/strata",
+ "args": ["--glm-pack", "...", "--max-context", "65536"],
+ "uncensor": "/home/you/llm/apps/Abyss-data/abl/dsv41-iq2xxs.abl",
+ ...
+}
 ```
 
-エンジンの `--uncensor <file>`、または設定の `env` に `STRATA_GLM_ABL=<file>` を書いても同じです。起動時のエンジンログに
-`glm fast: uncensored (<file>): ...` と出ます。
+書いたらサーバーを再起動します（`../Abyss-tools/abyss.sh restart`、または止めてから `run-abyss-<name>.sh` をもう一度実行）。ファイルはエンジンの起動時に読み込みます。
+起動時のエンジンログ（設定の `"log"` のファイル）に `glm fast: uncensored (<file>): ...` と出ます。
+
+ほかに 2 つ、同じことをする書き方があります。`"args"` に `"--uncensor", "<file>"` を足すか、設定の `"env"` に
+`"STRATA_GLM_ABL": "<file>"` を書きます。3 つのうち 1 つだけを使ってください。
 
 以後のリクエストは編集つきで動きます。入り切りの方法は次のとおりです。
 

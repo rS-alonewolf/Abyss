@@ -56,14 +56,28 @@ CUDA / HIP graphs and a request can turn it off.
 
 ## Turning it on
 
-In the server config:
+**Which file.** The model's run config: `abyss-<name>.json` in the Abyss folder (for example
+`abyss-dsv41-iq2xxs.json`). Setup writes it; it is the file `run-abyss-<name>.sh` passes to the server as
+`--config`, and the one `serve/server.py --config <file>` reads if you start the server yourself
+([SETTINGS](SETTINGS.md) shows where it is and how to find the one in use). Each model has its own, so add the line to the one of
+the model the `.abl` file was made for.
+
+Add one top-level key, beside `"exe"` and `"args"` (not inside `"args"` or `"env"`):
 
 ```json
-"uncensor": "/path/to/model.abl"
+{
+ "exe": "/home/you/llm/apps/Abyss/build/strata",
+ "args": ["--glm-pack", "...", "--max-context", "65536"],
+ "uncensor": "/home/you/llm/apps/Abyss-data/abl/dsv41-iq2xxs.abl",
+ ...
+}
 ```
 
-(the engine's `--uncensor <file>`, or `STRATA_GLM_ABL=<file>` in the config's `env`, do the same). At start the
-engine log says `glm fast: uncensored (<file>): ...`.
+Then restart the server (`../Abyss-tools/abyss.sh restart`, or stop it and run `run-abyss-<name>.sh` again); the file is read when the engine starts. At
+start the engine log (the config's `"log"`) says `glm fast: uncensored (<file>): ...`.
+
+Two other ways do the same: `"--uncensor", "<file>"` added to `"args"`, or `"STRATA_GLM_ABL": "<file>"` in the
+config's `"env"`. Use one of the three, not several.
 
 Requests then run with the edit:
 

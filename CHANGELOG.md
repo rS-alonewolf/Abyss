@@ -7,6 +7,22 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.73 - 2026-10-28
+
+**Docs only: the config files on one page, [docs/SETTINGS.md](docs/SETTINGS.md) (日本語:
+[docs/SETTINGS.ja.md](docs/SETTINGS.ja.md)), written for a first-time user.**
+
+- Setup and config told apart: setup (build, model, pack) runs once and writes the config file and start script; the
+  config is what you change afterwards.
+- What to change where (context, sampling, port - config and start script both -, access from other PCs, GPUs,
+  uncensoring, engine tuning), where the files are with their real names (`abyss-<name>.json`, `run-abyss-<name>.sh`,
+  `maya-<model>.json`, the logs, `.shared-settings.json`), finding the config in use (`abyss.sh models`), changing one
+  step by step (backup, JSON rules, restart, which log to read), every key the server reads, the keys Abyss writes
+  itself (dashboard context, setup, `--rewrite-config`, `--gpu-tune`, `--calibrate`) and the other files.
+- MANUAL's "Configure and start" field table, docs/UNCENSOR's "which file" and the README's docs table link to it.
+  docs/UNCENSOR now names the file to edit (`abyss-<name>.json`), where the key goes and how to restart.
+- No code changes.
+
 ## v1.3.72 - 2026-10-28
 
 **Docs only: everything about uncensoring on one page, [docs/UNCENSOR.md](docs/UNCENSOR.md) (日本語:
