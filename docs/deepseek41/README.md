@@ -106,9 +106,8 @@ sampled. `STRATA_DS4_DSPARK=<file> STRATA_DS4_DSPARK_CHAIN=0.6` in the config's 
 40.4 -> 46.7 tok/s (+16%, 4 runs, Lexar NM790); on the old ~3.4 GB/s SSD it measured no gain, since a verify window's
 columns wait on the disk. Its 1.67 GB of VRAM (dense 0.46 GB, 48 / 40 / 24 expert slots a stage) come out of the expert pool.
 
-**The abliteration edit at run time** (v1.3.53): `tools/abl_export.py abliteration-edit.npz <out>.abl`, then
-`STRATA_GLM_ABL=<out>.abl` - the same edit as the overlay below, applied to the attention and shared-expert outputs
-as they are written (no overlay shard, no second rounding). UD-IQ1_S: KL 0.3557 -> 0.3577, refusals 12 of 16 -> 0.
+**Uncensoring**: the run-time `--uncensor` (an `--abl-build` file or mrfakename's edit via `tools/abl_export.py`) and
+the `--abl` overlay are described and measured in [UNCENSOR.md](../UNCENSOR.md).
 
 The `deepseek41` GGUFs from kyuz0 / antirez named "v4.1" without `1017` are the September checkpoint
 (`general.source.revision` `df42c109`); check the revision before trusting a repo name. Lucebox's ROCMFP files use
@@ -193,17 +192,13 @@ subset of 8 tasks):
   3.85 -> 3.22 GB) re-quantized to Q5_K - a 3.2 GB overlay. GPU time a token -1.4 ms (~6%), dense VRAM 6.08 -> 5.50 GB,
   swe-bench 40.1 -> 43.0 tok/s (two runs each, alternated); KL 0.3557 -> 0.3652, ppl 10.79 -> 10.93. Q5_K on
   `output.weight` as well is no faster and costs more (KL 0.3686).
-- **A published abliteration edit**: mrfakename/DeepSeek-V4.1-Flash-1017-abliterated ships `abliteration-edit.npz`
-  (43 KB), a rank-2 refusal subspace and per-layer strengths; `--abl` applies `W - s Q Q^T W` to `attn_output_b` /
-  `ffn_down_shexp` (62 tensors, a 1.4 GB overlay). KL 0.3557 -> 0.3563, ppl 10.79 -> 10.76; 16 refusal-bait prompts
-  (12 English, 4 Japanese) refused 14 -> 0. With the Q5_K set too: KL 0.3738 (the edited tensors are rounded twice).
+- **A published abliteration edit** (`--abl`): see [UNCENSOR.md](../UNCENSOR.md#older-ways).
 
 ```sh
 U=<models dir>/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ1_S
 O=<models dir>/ud-iq1s-q5k
 .venv/bin/python -I tools/dense_overlay.py $U/DeepSeek-V4.1-Flash-1017-UD-IQ1_S-00001-of-00005.gguf $O \
   'blk\.\d+\.(attn_q_a|attn_q_b|attn_kv|attn_output_a|attn_output_b|ffn_(gate|up|down)_shexp|engram_kv)\.weight'
-#   (or the edit: ... $O --abl=<dir>/abliteration-edit.npz - both together: the regex and --abl in one call)
 .venv/bin/python tools/iq_pack.py --gguf $O/overlay-00001-of-00006.gguf --out $O/pack --compat-bf16 --first-wins
 cp $U/pack/expert_*.txt $O/pack/
 ```

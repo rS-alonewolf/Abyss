@@ -544,56 +544,9 @@ the windows, the drafts and the acceptance, and the tokens a step.
 
 ## Uncensoring at run time (`--uncensor`)
 
-From v1.3.71 the engine can take a model's refusal direction out of the residual stream while it runs, without a new
-GGUF: every write into the residual (the embedding, each layer's attention output, its whole FFN output with the CPU
-lane's part, V4.1's Engram adds) loses its component along a few directions, `w - s Q Q^T w` (Arditi et al.'s
-directional ablation; the same as abliterated weights, but the routed experts stay on the SSD untouched). The edit is a
-small `.abl` file (16-82 KB) and can be switched per request.
-
-**Turning it on.** In the config, `"uncensor": "<file.abl>"` (or the engine's `--uncensor <file>`, or
-`STRATA_GLM_ABL=<file>`). Requests then run with the edit; a request with `"uncensor": false` runs without it, and
-`"uncensor": true` with it. The engine log says `glm fast: uncensored (<file>): ...` at start. With the file loaded and
-switched off, the output is the same as without the file (checked bit for bit on V4.1 with the score path); the speed
-with it on is within the run-to-run noise (V4.1 on an AI PRO R9700: 20.4 tok/s on, 21.3 off, 22.2 without the file).
-While a file is loaded the hc3 fusion of the CPU lane's answer and `STRATA_GLM_DEFER` stay off (the FFN output must be
-complete when it is edited).
-
-**Making the file** (an hour or less on the machine below). The directions are measured from public prompt sets
-(JailbreakBench, AdvBench, MaliciousInstruct, ForbiddenQuestions, SimpleSafetyTests, XSTest - see the MANIFEST in
-`Abyss-data/datasets/safety`; get them from their own pages):
-
-```sh
-.venv/bin/python -I tools/abl_prompts.py --pack <pack> --out prompts.txt
-build/strata --glm-pack <pack> --max-context 4096 --abl-build model.abl --abl-prompts prompts.txt \
-  --abl-gen 32 --abl-rank 3 --abl-range 0.3,0.9 --abl-candidates 9
-```
-
-The build reads each prompt to its last token and keeps the residual per layer; a layer's direction is the harmful
-prompts' mean minus the harmless ones', made orthogonal to the harmless means (without that step the direction carries
-the model's huge fixed channels and breaks it: KL 9 on one model). Each candidate layer is then tried on 24 held-out
-harmful and 24 harmless prompts: `--abl-gen N` generates N tokens of each harmful answer and counts the answers with a
-refusal word in them (" can't", " cannot", "Sorry", 申し訳, ... - GLM opens with a heading and refuses in the second
-line, so the first token alone misses it), and the harmless prompts' first-token KL is printed. The best layers within
-`--abl-max-kl` are combined up to `--abl-rank` (1-4). `--abl-dirs <out>.dirs` reuses a build's measurement to try other
-settings in ~10 minutes; `--abl-scale` sets the strength (1.0 = the direction removed).
-
-The first-token KL on the chat prompts overstates the cost: on V4 it read 0.8-1.0 where the text KL was 0.013. Check a
-file on plain text with the score path before using it: `STRATA_GLM_SCORE=400 STRATA_GLM_SCORE_DUMP=ref.bin` once
-without the file, then `STRATA_GLM_SCORE_REF=ref.bin STRATA_GLM_ABL=<file>` (`STRATA_GLM_ABL_ON=0` loads it switched
-off).
-
-**Measured** (AI PRO R9700; 101 held-out prompts - 66 harmful, 35 harmless - none of them in the build's sets; greedy;
-"refused" read from the answer's opening):
-
-| Model | Harmful refused (off -> on) | Harmless refused (off -> on) | Text KL | The edit |
-| --- | :---: | :---: | :---: | --- |
-| DeepSeek V4.1 Flash 1017, unsloth UD-IQ2_XXS | 86% -> 3% | 17% -> 3% | 0.023 | layers 27+30+33+24, strength 1.3 |
-| DeepSeek V4 Flash 0731, UD-Q2_K_XL attn-q5k | 85% -> 6% | 11% -> 3% | 0.013 | layer 29, strength 1.3 |
-| GLM-5.3-Flash, Maya-S-v2-IQ2_XXS | 88% -> 8% | 11% -> 3% | 0.053 | layers 31+28+34, strength 1.0 |
-
-For comparison, orcarouter's abliterated V4.1 Mix-256G (new weights) has a text KL of 0.083. The answers that still
-refuse are mostly a short caveat followed by the answer, or medical and financial advice. The edit removes refusals;
-it does not add knowledge, and what the model then writes is the user's responsibility.
+From v1.3.71 the engine can take a model's refusal direction out while it runs, switchable per request, with a
+16-82 KB file made from the model itself (`--abl-build`). How to turn it on, make and check the file, what it measured
+and the older ways are all in [UNCENSOR.md](UNCENSOR.md).
 
 ## Settings
 

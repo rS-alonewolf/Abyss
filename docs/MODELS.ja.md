@@ -59,14 +59,14 @@ V4.1 はエキスパートが RAM に収まらず、一部を毎トークン SSD
 | `Q2_K`（[mrfakename/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF)） | 247 GB | 教師 KL 0.64（dense と Engram も Q2_K） | 5090: 約 9.7 tok/s（2026-10-18） | 単体では勧めない |
 | ハイブリッド: Lucebox の Q8_0 dense + 8 bit Engram と mrfakename のエキスパート | 201 GB | 0.168 / 83.4% / 9.25 | 5090: 8.5 tok/s（2026-10-18） | 最も正確だが遅い |
 
-V4.1 のオーバーレイと実行時の書き換え（UD-IQ1_S、R9700 + レーン、v1.3.52）:
+V4.1 のオーバーレイ（UD-IQ1_S、R9700 + レーン、v1.3.52）:
 
 | 方法 | 追加するもの | KL（基準 0.3557） | 速さ | 用途 |
 | --- | --- | --- | --- | --- |
 | Q5_K dense オーバーレイ（`tools/dense_overlay.py`、opt-in、lossy） | 3.2 GB | 0.3652、ppl 10.79 → 10.93 | swe 8 問 40.1 → 43.0 tok/s（n-gram 窓） | 少しでも速く |
-| 拒否の書き換え `--abl`（mrfakename の `abliteration-edit.npz`） | 1.4 GB | 0.3563、ppl 10.76。拒否 16 問中 14 → 0 | 変わらない | 制限解除 |
-| 上の 2 つを一緒に | – | 0.3738 | 未計測 | – |
-| `STRATA_GLM_ABL=<file>`（実行時に同じ書き換え、再量子化なし、v1.3.53） | 43 KB | UD-IQ1_S に掛けて KL 0.3557 → 0.3577、拒否 16 問中 12 → 0 | 未計測 | ファイルを作らずに制限解除 |
+| Q5_K と拒否のオーバーレイを一緒に | – | 0.3738 | 未計測 | – |
+
+拒否の編集（`--abl` のオーバーレイ、`STRATA_GLM_ABL`）と実行時の `--uncensor` の計測は [UNCENSOR.ja.md](UNCENSOR.ja.md) にあります。
 
 V4.1 の lossy な設定（KL は nazeshinjite Q2、8 系列）: `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1` は 0.229 → 0.240〜0.241
 （5090 で 17.7 → 約 28〜29 tok/s）。`=4` は 0.235。`STRATA_GLM_ROUTE_AFFINITY_RAM=0.08` は 0.2406 → 0.2438（-8〜12% / トークン）。

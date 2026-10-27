@@ -7,6 +7,20 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.72 - 2026-10-28
+
+**Docs only: everything about uncensoring on one page, [docs/UNCENSOR.md](docs/UNCENSOR.md) (日本語:
+[docs/UNCENSOR.ja.md](docs/UNCENSOR.ja.md)).**
+
+- Which way to use (the run-time `--uncensor`, an abliteration's own ABL1 edit, the `--abl` overlay shard,
+  abliterated GGUFs) compared in one table; how the edit works; turning it on and switching it per request
+  (config, request, `POST /settings`, `GEN abl=`); making the file for your model (`tools/abl_prompts.py` and every
+  `--abl-build` option, with a sample log); checking a file (text KL with the score path, held-out refusals); the
+  measured results with file sizes and the harmful answers' breakdown; the limits; the `.abl` file format.
+- The MANUAL section, the refusal rows in MODELS, the abliteration notes in docs/deepseek41 and the README lines now
+  link to it instead of repeating it.
+- No code changes.
+
 ## v1.3.71 - 2026-10-28
 
 **Uncensoring at run time (opt-in): `--uncensor <file>` takes a model's refusal direction out of the residual stream

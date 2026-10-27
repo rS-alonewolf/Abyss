@@ -526,50 +526,9 @@ swe-bench の問題ごとに +16〜32%。これらの問題では下書きの 68
 
 ## 実行時の無検閲化（`--uncensor`）
 
-v1.3.71 から、新しい GGUF を作らずに、動かしながらモデルの「拒否の方向」を取り除けます。残差ストリームへの書き込み
-（埋め込み、各層の attention 出力、CPU レーンの分も含めた FFN 出力全体、V4.1 の Engram の加算）すべてから、数本の方向の成分を
-引きます（`w - s Q Q^T w`。Arditi らの directional ablation。abliterated の重みと同じ効果ですが、ルーティングされるエキスパートは
-SSD 上のまま触りません）。編集は小さな `.abl` ファイル（16〜82 KB）で、リクエストごとに入り切りできます。
-
-**有効にする。** 設定に `"uncensor": "<file.abl>"`（エンジンなら `--uncensor <file>`、または `STRATA_GLM_ABL=<file>`）。
-以後のリクエストは編集つきで動き、`"uncensor": false` のリクエストは編集なし、`"uncensor": true` は編集ありです。起動時の
-エンジンログに `glm fast: uncensored (<file>): ...` が出ます。ファイルを読み込んでオフにした出力は、ファイルなしと同じです
-（V4.1 で score 経路を使いビット単位で確認）。オンの速度は回すたびの揺れの範囲内です（V4.1、AI PRO R9700: オン 20.4 tok/s、
-オフ 21.3、ファイルなし 22.2）。ファイルを読み込んでいる間は、CPU レーンの答えの hc3 融合と `STRATA_GLM_DEFER` は止まります
-（FFN 出力がそろってから編集するため）。
-
-**ファイルを作る**（下のマシンで 1 時間以内）。方向は公開されている質問のセット（JailbreakBench、AdvBench、MaliciousInstruct、
-ForbiddenQuestions、SimpleSafetyTests、XSTest。`Abyss-data/datasets/safety` の MANIFEST 参照。それぞれの配布元から取得）で
-測ります:
-
-```sh
-.venv/bin/python -I tools/abl_prompts.py --pack <pack> --out prompts.txt
-build/strata --glm-pack <pack> --max-context 4096 --abl-build model.abl --abl-prompts prompts.txt \
-  --abl-gen 32 --abl-rank 3 --abl-range 0.3,0.9 --abl-candidates 9
-```
-
-作成モードは各質問を最後のトークンまで読み、層ごとの残差を記録します。層の方向は「有害な質問の平均 − 無害な質問の平均」を、
-無害な質問の平均たちと直交させたものです（この手順がないと、モデルが常に持つ巨大な固定チャネルが方向に混ざってモデルが壊れます。
-あるモデルで KL 9）。候補の層ごとに、別に取っておいた有害 24 問・無害 24 問で試します。`--abl-gen N` は有害な質問の答えを
-N トークン生成し、拒否の言葉（" can't"、" cannot"、"Sorry"、申し訳 など）が入った答えを数えます（GLM は見出しから書き始めて
-2 行目で断るので、1 トークン目だけでは見逃す）。無害な質問の 1 トークン目の KL も表示します。`--abl-max-kl` 以内の良い層を
-`--abl-rank`（1〜4）本まで組み合わせます。`--abl-dirs <out>.dirs` は前回の測定を使い回して別の設定を 10 分ほどで試せます。
-`--abl-scale` は強さ（1.0 = 方向をちょうど取り除く）。
-
-チャット形式の質問の 1 トークン目の KL は、品質の損失を大きく見せます（V4 では 0.8〜1.0 と出たが、普通の文章の KL は 0.013）。
-使う前に score 経路で普通の文章の KL を確かめてください: ファイルなしで一度 `STRATA_GLM_SCORE=400 STRATA_GLM_SCORE_DUMP=ref.bin`、
-次に `STRATA_GLM_SCORE_REF=ref.bin STRATA_GLM_ABL=<file>`（`STRATA_GLM_ABL_ON=0` で読み込んだままオフ）。
-
-**実測**（AI PRO R9700。作成に使っていない 101 問（有害 66、無害 35）、greedy、拒否は答えの書き出しで判定）:
-
-| モデル | 有害で拒否（オフ → オン） | 無害で拒否（オフ → オン） | 文章の KL | 編集 |
-| --- | :---: | :---: | :---: | --- |
-| DeepSeek V4.1 Flash 1017、unsloth UD-IQ2_XXS | 86% → 3% | 17% → 3% | 0.023 | 27+30+33+24 層、強さ 1.3 |
-| DeepSeek V4 Flash 0731、UD-Q2_K_XL attn-q5k | 85% → 6% | 11% → 3% | 0.013 | 29 層、強さ 1.3 |
-| GLM-5.3-Flash、Maya-S-v2-IQ2_XXS | 88% → 8% | 11% → 3% | 0.053 | 31+28+34 層、強さ 1.0 |
-
-比較: orcarouter の abliterated V4.1 Mix-256G（重みを作り直したもの）は文章の KL 0.083。まだ断る答えの多くは、短い注意書きの
-あとに答えるもの、医療や投資の助言です。この編集は拒否を外すだけで知識は増えません。出力の扱いは使う人の責任です。
+v1.3.71 から、動かしながらモデルの拒否の方向を取り除けます。リクエストごとに入り切りでき、ファイル（16〜82 KB）はモデル自身から
+`--abl-build` で作ります。有効にする方法、ファイルの作り方と確かめ方、実測、以前からある方法は、すべて
+[UNCENSOR.ja.md](UNCENSOR.ja.md) にまとめています。
 
 ## 設定項目
 

@@ -60,14 +60,14 @@ V4.1's experts do not fit in RAM, so some are read from the SSD every token; a s
 | `Q2_K` ([mrfakename/DeepSeek-V4.1-Flash-1017-GGUF](https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-GGUF)) | 247 GB | teacher KL 0.64 (dense and Engram Q2_K too) | 5090: ~9.7 tok/s (2026-10-18) | not on its own |
 | hybrid: Lucebox's Q8_0 dense + 8-bit Engram with mrfakename's experts | 201 GB | 0.168 / 83.4% / 9.25 | 5090: 8.5 tok/s (2026-10-18) | the most accurate, slow |
 
-V4.1 overlays and the run-time edit (UD-IQ1_S, R9700 + lane, v1.3.52):
+V4.1 overlays (UD-IQ1_S, R9700 + lane, v1.3.52):
 
 | method | adds | KL (base 0.3557) | speed | for |
 | --- | --- | --- | --- | --- |
 | Q5_K dense overlay (`tools/dense_overlay.py`, opt-in, lossy) | 3.2 GB | 0.3652, ppl 10.79 -> 10.93 | swe 8 tasks 40.1 -> 43.0 tok/s (n-gram windows) | a little more speed |
-| refusal edit `--abl` (mrfakename's `abliteration-edit.npz`) | 1.4 GB | 0.3563, ppl 10.76; 16 refusal-bait prompts refused 14 -> 0 | unchanged | uncensored |
-| both together | – | 0.3738 | not measured | – |
-| `STRATA_GLM_ABL=<file>` (the same edit at run time, no re-quantization; v1.3.53) | 43 KB | on UD-IQ1_S: KL 0.3557 -> 0.3577, refusals 12 of 16 -> 0 | not measured | uncensored without a new file |
+| Q5_K + the refusal overlay together | – | 0.3738 | not measured | – |
+
+The refusal edits (`--abl` overlay, `STRATA_GLM_ABL`) and the run-time `--uncensor` are measured in [UNCENSOR.md](UNCENSOR.md).
 
 V4.1 lossy settings (KL on nazeshinjite Q2, 8 sequences): `STRATA_GLM_TAIL_SKIP=3 STRATA_GLM_TAIL_SKIP_DISK=1` 0.229 ->
 0.240-0.241 (5090: 17.7 -> ~28-29 tok/s); `=4` 0.235. `STRATA_GLM_ROUTE_AFFINITY_RAM=0.08` 0.2406 -> 0.2438 (-8-12% a
