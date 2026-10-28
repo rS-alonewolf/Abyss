@@ -30,11 +30,11 @@ template<int TD, int NR, int MODE = 0>
 __global__ void __launch_bounds__(256) lane_down_kernel(const unsigned long long* plan_ptr, const float* plan_w, int k,
                                                         int n_ff, size_t down_off, const block_q8_1* __restrict__ hq,
                                                         float* __restrict__ out, unsigned int* done) {
-    __shared__ unsigned long long s_ptr[8];
-    __shared__ float s_w[8];
+    __shared__ unsigned long long s_ptr[gf::kMaxK];
+    __shared__ float s_w[gf::kMaxK];
     __shared__ uint32_t s_tab[TabWords<TD>::n > 0 ? TabWords<TD>::n : 1];
     load_tab<TD>(s_tab);
-    if (threadIdx.x < 8) {
+    if (threadIdx.x < gf::kMaxK) {
         s_ptr[threadIdx.x] = (int) threadIdx.x < k ? plan_ptr[threadIdx.x] : 0ull;
         s_w[threadIdx.x] = (int) threadIdx.x < k ? plan_w[threadIdx.x] : 0.0f;
     }
@@ -83,9 +83,9 @@ __global__ void __launch_bounds__(256) lane_down_q2k_kernel(const unsigned long 
                                                             int k, int n_ff, size_t down_off,
                                                             const block_q8_1* __restrict__ hq, float* __restrict__ out,
                                                             unsigned int* done) {
-    __shared__ unsigned long long s_ptr[8];
-    __shared__ float s_w[8];
-    if (threadIdx.x < 8) {
+    __shared__ unsigned long long s_ptr[gf::kMaxK];
+    __shared__ float s_w[gf::kMaxK];
+    if (threadIdx.x < gf::kMaxK) {
         s_ptr[threadIdx.x] = (int) threadIdx.x < k ? plan_ptr[threadIdx.x] : 0ull;
         s_w[threadIdx.x] = (int) threadIdx.x < k ? plan_w[threadIdx.x] : 0.0f;
     }
@@ -235,8 +235,8 @@ struct Range {
     bool owned;   // registered here (not already pinned by the engine: a HIP engine's own RAM tier) - unregistered here
 };
 struct Plan {                         // host-mapped: the kernels read it in place
-    unsigned long long ptr[8];
-    float w[8];
+    unsigned long long ptr[gf::kMaxK];
+    float w[gf::kMaxK];
     int cpu_flag;
     unsigned int done;                // lane_down's blocks count themselves in here (the host waits on it)
 };
@@ -426,7 +426,7 @@ __attribute__((visibility("default"))) int abyss_igpu_experts_q(int gu_type, int
 static int igpu_experts(int gu_type, int d_type, int n_embd, int n_ff, size_t down_off, float limit, int ne,
                         const void* const* blobs, const float* w, const float* x, const void* xq_in, float* out,
                         bool start_only) {
-    if (!L.open || ne < 1 || ne > 8 || n_embd > L.n_embd || n_ff > L.n_ff) return 1;
+    if (!L.open || ne < 1 || ne > gf::kMaxK || n_embd > L.n_embd || n_ff > L.n_ff) return 1;
     // one caller at a time (a layer split's parts share the lane): busy -> the CPU takes this one, a decode does not wait
     std::unique_lock<std::mutex> lk(L.mu, std::try_to_lock);
     if (!lk.owns_lock()) return 1;
@@ -460,7 +460,7 @@ static int igpu_experts(int gu_type, int d_type, int n_embd, int n_ff, size_t do
         L.plan_h->ptr[i] = d;
         L.plan_h->w[i] = w[i];
     }
-    for (int i = ne; i < 8; ++i) { L.plan_h->ptr[i] = 0ull; L.plan_h->w[i] = 0.0f; }
+    for (int i = ne; i < gf::kMaxK; ++i) { L.plan_h->ptr[i] = 0ull; L.plan_h->w[i] = 0.0f; }
     L.plan_h->cpu_flag = 0;
     // DIRECT (ABYSS_IGPU_DIRECT=1; default 0): x read from, and the sum written to, the caller's buffers in place when
     // they lie in registered host memory (the engine registers its request ring and answer slots) - no 16 KB memcpy
@@ -564,7 +564,7 @@ __attribute__((visibility("default"))) int abyss_igpu_x3_start(const int* K3, in
                                                                const float* w, const float* x) {
     DevScope ds;
     namespace x3 = strata::kernels::exl3;
-    if (!L.open || ne < 1 || ne > 8 || n_embd > L.n_embd || n_ff > L.n_ff) return 1;
+    if (!L.open || ne < 1 || ne > gf::kMaxK || n_embd > L.n_embd || n_ff > L.n_ff) return 1;
     if (!L.mu.try_lock()) return 1;
     std::unique_lock<std::mutex> lk(L.mu, std::adopt_lock);
     if (L.pending) {
@@ -584,7 +584,7 @@ __attribute__((visibility("default"))) int abyss_igpu_x3_start(const int* K3, in
         L.plan_h->ptr[i] = d;
         L.plan_h->w[i] = w[i];
     }
-    for (int i = ne; i < 8; ++i) { L.plan_h->ptr[i] = 0ull; L.plan_h->w[i] = 0.0f; }
+    for (int i = ne; i < gf::kMaxK; ++i) { L.plan_h->ptr[i] = 0ull; L.plan_h->w[i] = 0.0f; }
     std::memcpy(L.x_h, x, (size_t) n_embd * sizeof(float));
     x3::MoeArgs xa;
     xa.plan_ptr = L.plan_d->ptr;

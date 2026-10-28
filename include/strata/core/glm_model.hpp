@@ -109,6 +109,12 @@ struct Glm5Geometry {
     int attn_head_kv = 2, n_ff_shexp = 1024;
     int ssm_conv_dim() const { return 2 * ssm_k_heads * ssm_state + ssm_inner; }
     static bool from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+    // ---- qwen4exp (Qwen3.8-Flash-Next, llama.cpp src/models/qwen4exp.cpp): arch stays 2 (the qwen35moe path) with
+    // hc streams mixed by low-rank hyper-connections in place of the norms (hc_lr wide), the delta-net's output gate a
+    // sigmoid, top-k up to glmf::kMaxK, the attention layers' QSA indexer and layer 1's per-layer embedding (PLE)
+    bool q4x = false;
+    int hc_lr = 320;
+    static bool from_gguf_qwen4exp(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 
     int d_inner() const { return kda_head_dim * n_head; }
     int top_pools_max() const { return idx_top_k / idx_kpool; }
@@ -479,6 +485,9 @@ public:
     bool verify_part_v41(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // deepseek41's (one part)
     bool verify_part_q35(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // qwen35moe's (one part)
     void verify_rewind_q35(int64_t pos);   // qwen35moe: the recurrent states back to after the kept columns
+    bool verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, std::string& err);   // qwen4exp's (one part)
+    bool q4x_mix_cols(float* R, int T, const float* norm, const WSlot& down, const WSlot& up, const WSlot* inject,
+                      const float* out, const float* inj_prev, float* inj_out, float* x, void* xq, std::string& err);
     // qwen35moe's NextN block as the drafter (behind the dspark_* hooks; qwen35_fast_path.cu): a position's cache row
     // needs its normed hidden and the NEXT token, so a position waits in q35_pend_pos_ until that token is known
     bool q35_mtp_on() const;
@@ -488,12 +497,29 @@ public:
     bool q35_mtp_step(int64_t p, const int* tok_dev, const float* h, float* conf_out, int* tok_out, std::string& err);
     bool q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::string& err);
     int64_t q35_pend_pos_ = -1, q35_row_done_ = -1;
+    // qwen4exp's draft layer (q4x_drafter.cu, STRATA_Q4X_MTP=<tools/mtp_rt.py's dir>): the same pending-row scheme, the
+    // rows' input the trunk's final residual (4 streams) instead of a normed hidden
+    void* q4d_ = nullptr;
+    bool q4x_mtp_load(const std::string& dir, std::string& err);
+    bool q4x_mtp_forward(int64_t p0, int n, const float* Rin, size_t r_stride, const int* tok, bool full, float* conf_out,
+                         int* tok_out, std::string& err);
+    bool q4x_mtp_rows(int64_t p0, int n, const float* Rin, size_t r_stride, const int32_t* next, std::string& err);
+    const float* q4x_mtp_residual() const;
+    bool q4x_mtp_on() const { return q4d_ != nullptr && q35_mtp_on(); }
     // the conversation snapshot's qwen35moe state (pinned host memory, not VRAM): each delta-net layer's state and conv
     // rows, the drafter's pending hidden and its two positions - the KV caches are written a row a position, so the
     // position alone restores them
     void* q35_snap_h_ = nullptr;
+    std::string ple_gguf_;                                 // qwen4exp: the shard holding per_layer_token_embd
+    bool q4x_ple_setup(std::string& err);
+    bool q4x_ple_issue(int32_t token, int64_t p, std::string& err);
+    bool q4x_ple_apply(std::string& err);
+    bool q4x_qsa_setup(std::string& err);
     int64_t q35_snap_pend_ = -1, q35_snap_done_ = -1;
     bool q35_snap_copy(bool restore);
+    bool q4x_mix(const float* norm, const WSlot& down, const WSlot& up, const WSlot* inject, const float* out,
+                 const float* inj_prev, float* inj_out, float* x, void* xq, std::string& err);
+    bool fast_q4x_layers(int64_t p, std::string& err);
     const Glm5Model* verify_tail() const;
     // the conversation snapshot's deepseek4 state: every layer's window ring and compressor rings (the compressed
     // caches are append-only by position - a row is written exactly when it becomes visible - so the position alone
@@ -524,7 +550,7 @@ public:
     // gate / up / down of one expert from the shards (or its chunk-th of n_chunks pieces)
     void fast_read_part(int il, int e, int role, uint8_t* blob, int chunk = 0, int n_chunks = 1);
     void fast_read_expert_x3(int il, int e, uint8_t* blob);   // a whole EXL3 expert in as few reads as it allows
-    void fast_ahead_route(int il, const int* ids, unsigned int miss, const short (*ahead)[8]);   // LOOKAHEAD
+    void fast_ahead_route(int il, const int* ids, unsigned int miss, const short (*ahead)[16]);   // [glmf::kMaxK]   // LOOKAHEAD
     void fast_ahead_reader();
     bool fast_boundary(std::string& err);                  // between tokens: apply finished promotions
     int fast_sample(strata::kernels::SamplerParams& sp, std::string& err);   // this half's logits, sampled on its stream

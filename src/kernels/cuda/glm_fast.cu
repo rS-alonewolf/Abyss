@@ -907,6 +907,22 @@ template<> __device__ __forceinline__ float dw<39>(const uint8_t* row, int kbx, 
 template<> struct F<39> { static constexpr int qk = 32, ipb = 1, step = 1, bytes = sizeof(block_mxfp4);
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int) {
         return dw<39>((const uint8_t*) v, kbx, 0, load_xv(y), nullptr); } };
+// IQ4_NL (qwen4exp's down experts, orcarouter's Qwen3.8): 32 values a block, an FP16 scale and the iq4nl table -
+// vecdotq's vec_dot_iq4_nl_q8_1 over the whole block (as MXFP4 above, without its x0.5)
+template<> __device__ __forceinline__ float dw<20>(const uint8_t* row, int kbx, int, const XV& x, const uint32_t*) {
+    const block_iq4_nl* b = (const block_iq4_nl*) row + kbx;
+    int sumi = 0;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int2 v = get_int_from_table_16(get_int_b1(b->qs, l), kvalues_iq4nl);
+        sumi = __dp4a(v.x, x.u[l], sumi);
+        sumi = __dp4a(v.y, x.u[l + 4], sumi);
+    }
+    return __half2float(b->d) * x.d * (float) sumi;
+}
+template<> struct F<20> { static constexpr int qk = 32, ipb = 1, step = 1, bytes = sizeof(block_iq4_nl);
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int) {
+        return dw<20>((const uint8_t*) v, kbx, 0, load_xv(y), nullptr); } };
 // NR rows against ONE activation, the whole warp; s[r] gets each row's full sum
 // the K-quant calls read 4 q8_1 blocks' int (iqs % 8) each: loaded ONCE per call position for all rows
 struct XK {
@@ -1015,7 +1031,7 @@ __device__ __forceinline__ float any_row_dot(int type, const void* w, int row, c
         case kTypeBF16: return row_dot_bf16((const uint16_t*) w + (size_t) row * n_in, xf, n_in, lane);
 #define GF_CASE(T) case T: return row_dot<T>((const uint8_t*) w + (size_t) row * rbytes<T>(n_in), (const block_q8_1*) xq, n_in, lane);
         GF_CASE(12) GF_CASE(13) GF_CASE(14) GF_CASE(8) GF_CASE(16) GF_CASE(18) GF_CASE(19) GF_CASE(23) GF_CASE(10) GF_CASE(11)
-        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29)
+        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20)
 #undef GF_CASE
         default: return 0.0f;
     }
@@ -1066,7 +1082,7 @@ __device__ __forceinline__ float any_row_dot_part(int type, const void* w, int r
         }
 #define GF_CASE(T) case T: return row_dot_part<T>((const uint8_t*) w + (size_t) row * rbytes<T>(n_in), (const block_q8_1*) xq, n_in, lane, p, split);
         GF_CASE(12) GF_CASE(13) GF_CASE(14) GF_CASE(8) GF_CASE(16) GF_CASE(18) GF_CASE(19) GF_CASE(23) GF_CASE(10) GF_CASE(11)
-        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29)
+        GF_CASE(17) GF_CASE(22) GF_CASE(21) GF_CASE(29) GF_CASE(20)
 #undef GF_CASE
         default: return 0.0f;
     }
@@ -2559,8 +2575,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     unsigned long long prof_t = 0;
     ROUTE_PROF(0)
     __shared__ float s_p[512], s_sel[512];
-    __shared__ int s_ids[8];
-    __shared__ float s_w[8];
+    __shared__ int s_ids[kMaxK];
+    __shared__ float s_w[kMaxK];
     __shared__ unsigned int s_mask, s_seq;
     __shared__ int bad;
     // an earlier route's error: its device copy (the host-mapped flag is a PCIe round trip, which waited ~100 us
@@ -2614,8 +2630,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             if (s_ids[i] < 0 || s_ids[i] >= E) atomicMax(&bad, 1);
     ROUTE_PROF(3)
     // the next layer's predicted top-k (same selection rule, its own bias)
-    __shared__ int s_pred[8];
-    if (tid < 8) s_pred[tid] = -1;
+    __shared__ int s_pred[kMaxK];
+    if (tid < kMaxK) s_pred[tid] = -1;
     if (a.pred_logits != nullptr) {
         __syncthreads();
         for (int e = tid; e < E; e += ROUTE_THREADS) {
@@ -2631,7 +2647,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     }
     ROUTE_PROF(4)
     // LOOKAHEAD: one warp per later layer, its top-k in registers (E <= 512; the same selection rule and ties)
-    __shared__ short s_ah[kAhead][8];
+    __shared__ short s_ah[kAhead][kMaxK];
     if ((tid >> 5) < a.n_ahead) {
         const int w = tid >> 5;
         const float* lg = a.ahead_logits + (size_t) w * E;
@@ -2678,8 +2694,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     }
     // (4) the route's table entries, one thread an expert: tid 0's plan below then reads shared memory, not k
     // dependent global loads (the RAM-tier table, the VRAM table, the route counts)
-    __shared__ unsigned long long s_tab[8], s_rtab[8];
-    __shared__ unsigned int s_cnt[8], s_seq0;
+    __shared__ unsigned long long s_tab[kMaxK], s_rtab[kMaxK];
+    __shared__ unsigned int s_cnt[kMaxK], s_seq0;
     if (tid < a.k && s_ids[tid] >= 0 && s_ids[tid] < E) {
         const size_t key = (size_t) a.layer * E + s_ids[tid];
         s_tab[tid] = a.d.tab[key];
@@ -2719,9 +2735,9 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         return;
     }
     __shared__ unsigned int s_fetch, s_promo, s_cpu, s_skip;
-    __shared__ unsigned long long s_pp[8], s_cs[8];
-    __shared__ int s_npf, s_pfid[8];
-    __shared__ unsigned long long s_pfptr[8];
+    __shared__ unsigned long long s_pp[kMaxK], s_cs[kMaxK];
+    __shared__ int s_npf, s_pfid[kMaxK];
+    __shared__ unsigned long long s_pfptr[kMaxK];
     // The PLAN, one lane an entry (warp 0): it was one thread walking the k entries, ~6 us of dependent shared and
     // global loads and FP64 a route on the GPU's critical path (route -> lane request, route -> the expert kernels).
     // The same decisions, made in parallel: the sum in route order, the host set as the to_cpu smallest by (route
@@ -2738,7 +2754,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         }
         double sum = 0.0;
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 0; j < kMaxK; ++j) {
             const float pj = __shfl_sync(0xffffffffu, p, j);
             if (j < a.k) sum += (double) pj;
         }
@@ -2757,11 +2773,12 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             const bool cand = on && !cut_i && tab_i == 0ull && rtab_i != 0ull;
             const unsigned int cm = (unsigned int) __ballot_sync(0xffffffffu, cand);
             const int f_ram = __popc(cm);
-            const int to_cpu = min((int) ((a.cpu_plan >> (4 * f_ram)) & 15ull), f_ram);
+            const int f_tab = f_ram < 15 ? f_ram : 15;   // (cpu_take's: the split table holds f = 0..15)
+            const int to_cpu = min((int) ((a.cpu_plan >> (4 * f_tab)) & 15ull), f_ram);
             const unsigned int c_i = on ? s_cnt[i] : 0u;
             int rank = 0;
 #pragma unroll
-            for (int j = 0; j < 8; ++j) {
+            for (int j = 0; j < kMaxK; ++j) {
                 const unsigned int cj = __shfl_sync(0xffffffffu, c_i, j);
                 if (((cm >> j) & 1u) && (cj < c_i || (cj == c_i && j > i))) ++rank;
             }
@@ -2825,7 +2842,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             a.d.fetch_src[i] = src;
             a.d.plan_w[i] = w;
             a.d.plan_id[i] = s_ids[i];
-        } else if (i < 8) {
+        } else if (i < kMaxK) {
             a.d.fetch_src[i] = 0ull;
         }
         const unsigned int skip = (unsigned int) __ballot_sync(0xffffffffu, b_skip);
@@ -2923,7 +2940,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             rq->pf_ptr[i] = s_pfptr[i];
         }
         for (int d2 = 0; d2 < kAhead; ++d2)
-            for (int i = 0; i < 8; ++i) rq->ahead[d2][i] = d2 < a.n_ahead && i < a.k ? s_ah[d2][i] : (short) -1;
+            for (int i = 0; i < kMaxK; ++i) rq->ahead[d2][i] = d2 < a.n_ahead && i < a.k ? s_ah[d2][i] : (short) -1;
     }
     __threadfence_system();
     __syncthreads();
@@ -2956,10 +2973,10 @@ __device__ void moe_wait_apply(const MoeDev& d, int n_embd, unsigned int s_need)
     // the disk-only experts: the host read each into host-mapped memory and answers with that SOURCE; the
     // fetch kernel copies it into the slot the route already planned
     const unsigned int pm = ((volatile const MoeResponse*) r)->ptr_mask;
-    if (tid < 8 && (pm >> tid) & 1u) d.fetch_src[tid] = ((volatile const MoeResponse*) r)->ptr[tid];
+    if (tid < kMaxK && (pm >> tid) & 1u) d.fetch_src[tid] = ((volatile const MoeResponse*) r)->ptr[tid];
     // the disk lane: the host computed these from their RAM landing - no fetch, no expert kernels (null plan entries)
     const unsigned int hm = ((volatile const MoeResponse*) r)->host_mask;
-    if (tid < 8 && (hm >> tid) & 1u) {
+    if (tid < kMaxK && (hm >> tid) & 1u) {
         d.fetch_src[tid] = 0ull;
         d.plan_ptr[tid] = 0ull;
     }
@@ -3314,9 +3331,9 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
 #endif
     // NR output rows per block; warp w computes those rows for expert w (one activation load per call
     // for all of them), the combine runs in plan order like the reference's axpy chain
-    __shared__ unsigned long long s_ptr[8];
-    __shared__ float s_w[8];
-    __shared__ float s_part[8][NR];
+    __shared__ unsigned long long s_ptr[kMaxK];
+    __shared__ float s_w[kMaxK];
+    __shared__ float s_part[kMaxK][NR];
     __shared__ uint32_t s_tab[TabWords<TD>::n > 0 ? TabWords<TD>::n : 1];
 #if defined(STRATA_USE_HIP)
     __shared__ uint4 s_sign[LUT && !DIRECT ? sign_count<TD> : 1];
@@ -3339,15 +3356,16 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
         out += (size_t) blockIdx.z * out_cs;
         if (sh_out != nullptr) sh_out += (size_t) blockIdx.z * out_cs;
     }
-    if (threadIdx.x < 8) {
+    if (threadIdx.x < kMaxK) {
         s_ptr[threadIdx.x] = (int) threadIdx.x < k ? plan_ptr[threadIdx.x] : 0ull;
         s_w[threadIdx.x] = (int) threadIdx.x < k ? plan_w[threadIdx.x] : 0.0f;
     }
     __syncthreads();
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
     const int r0 = blockIdx.x * NR;
     const size_t drb = rbytes<TD>(n_ff);
-    {
+    // warp w computes expert w, then w + 8 (top-k above 8: qwen4exp's 10)
+    for (int warp = threadIdx.x >> 5; warp < 8 || warp < k; warp += 8) {
         float s[NR];
         if (warp < k && s_ptr[warp] != 0ull) {
             const uint8_t* rows[NR];
@@ -3828,7 +3846,7 @@ __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ 
 int mv_type_ok(int t) {
     switch (t) {
         case kTypeF32: case kTypeBF16: case 12: case 13: case 14: case 8: case 16: case 18: case 19: case 23: case 10: case 11:
-        case 17: case 22: case 21: case 29: return 1;
+        case 17: case 22: case 21: case 29: case 20: return 1;
         case exl3::kTypeEXL3: return 1;   // forwarded to the EXL3 kernels (mv below)
         default: return 0;
     }
@@ -3850,7 +3868,7 @@ bool mv_supported(int type) { return mv_type_ok(type) != 0; }
 
 bool moe_supported(int type) {   // moe_gate_up's and moe_down's instantiations
     return type == 10 || type == 11 || type == 12 || type == 13 || type == 14 || type == 16 || type == 17 ||
-           type == 18 || type == 19 || type == 21 || type == 22 || type == 23 || type == 29 || type == 39;
+           type == 18 || type == 19 || type == 20 || type == 21 || type == 22 || type == 23 || type == 29 || type == 39;
 }
 
 int launch_errors() { return g_launch_errors.load(std::memory_order_relaxed) + exl3::launch_errors(); }
@@ -3874,12 +3892,14 @@ size_t row_bytes(int type, int64_t n_in) {
         case 21: return (size_t) (n_in / 256) * sizeof(block_iq3_s);
         case 29: return (size_t) (n_in / 256) * sizeof(block_iq1_m);
         case 39: return (size_t) (n_in / 32) * sizeof(block_mxfp4);
+        case 20: return (size_t) (n_in / 32) * sizeof(block_iq4_nl);
         default: return 0;
     }
 }
 
-bool mvn_supported(int type) {
-    return type == 8 || type == 12 || type == 13 || type == 14 || type == kTypeBF16 || type == kTypeF32;
+bool mvn_supported(int type) {   // (qwen4exp's i-quant projections too: IQ3_XXS, IQ4_NL, IQ3_S, IQ2_S)
+    return type == 8 || type == 12 || type == 13 || type == 14 || type == 18 || type == 20 || type == 21 || type == 22 ||
+           type == kTypeBF16 || type == kTypeF32;
 }
 
 bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
@@ -3915,7 +3935,7 @@ bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
             return false;
         }
     // one launch per type present (as mv's typed kernels), each compiled for the column count
-    constexpr int kTypes[] = {14, 8, 12, 13, kTypeBF16};
+    constexpr int kTypes[] = {14, 8, 12, 13, 18, 20, 21, 22, kTypeBF16};
     bool done[kMaxMvJobs] = {};
     for (const int T : kTypes) {
         MvBatch b{};
@@ -3944,6 +3964,10 @@ bool mvn(const MvJob* jobs, int n, int nc, cudaStream_t s) {
             case 8: GF_MVN(8) break;
             case 12: GF_MVN(12) break;
             case 13: GF_MVN(13) break;
+            case 18: GF_MVN(18) break;
+            case 20: GF_MVN(20) break;
+            case 21: GF_MVN(21) break;
+            case 22: GF_MVN(22) break;
             default:
                 switch (nc) {
                     case 2: mvn_kernel_f<2><<<acc, 256, 0, s>>>(b); break;
@@ -4608,7 +4632,7 @@ void gate_up_impl(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, flo
                                                                      n_ff_sh, sh_out, mc.ca, mc.xq_cs, mc.hq_cs,      \
                                                                      mc.shq_cs, mc.out_cs); break;
         GLMF_GU(16) GLMF_GU(18) GLMF_GU(19) GLMF_GU(23) GLMF_GU(10) GLMF_GU(11) GLMF_GU(17) GLMF_GU(22) GLMF_GU(21) GLMF_GU(29)
-        GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(39)
+        GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(39) GLMF_GU(20)
 #undef GLMF_GU
         default: std::fprintf(stderr, "glm_fast moe_gate_up: type %d unsupported\n", gu_type); return;
     }
@@ -4753,7 +4777,7 @@ void down_impl(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t 
         case T: moe_down_kernel<T><<<grid, 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out, mc.ca, mc.hq_cs, \
                                                          mc.out_cs); break;
         GLMF_DN(16) GLMF_DN(18) GLMF_DN(19) GLMF_DN(23) GLMF_DN(10) GLMF_DN(11) GLMF_DN(17) GLMF_DN(22) GLMF_DN(21) GLMF_DN(29)
-        GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(39)
+        GLMF_DN(12) GLMF_DN(13) GLMF_DN(14) GLMF_DN(39) GLMF_DN(20)
 #undef GLMF_DN
         default: std::fprintf(stderr, "glm_fast moe_down: type %d unsupported\n", d_type); return;
     }

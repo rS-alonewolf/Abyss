@@ -6,6 +6,8 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/igpu/igpu_lane.h"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/ngram.hpp"
+#include "strata/kernels/ple.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "glm_memory.hpp"
 #include "glm_layer_graphs.hpp"
@@ -217,7 +219,7 @@ struct Glm5Model::FastState {
     // ROUTE TAIL SKIP (STRATA_GLM_TAIL_SKIP=<r>): a trunk route's experts at rank >= r that are not in VRAM are left out
     // (no PCIe pull, no CPU lane, no disk wait); the others keep the router's weights.  8: off.  tail_skips counts them.
     // STRATA_GLM_TAIL_SKIP_W=<share>: also (or instead) those whose share of the route's probability is below it.
-    int tail_skip = 8;
+    int tail_skip = gf::kMaxK;   // (glmf::kMaxK: off)
     float tail_skip_w = 0.0f;
     bool tail_skip_disk = false;   // STRATA_GLM_TAIL_SKIP_DISK=1: ... only the disk-only ones
     std::atomic<uint64_t> tail_skips{0};
@@ -268,7 +270,7 @@ struct Glm5Model::FastState {
     bool stream_fetch = true;                  // STRATA_GLM_STREAM_FETCH=0: the fetch after the whole read, as before
     int read_chunks = 8;                       // STRATA_GLM_READ_CHUNKS: a part's O_DIRECT reads (also the stream's bits)
     float* alog = nullptr;                     // kAhead x n_expert logits (device)
-    std::vector<std::array<std::array<short, 8>, gf::kAhead>> ah_pred;   // per layer: the predictions d+1 layers early
+    std::vector<std::array<std::array<short, gf::kMaxK>, gf::kAhead>> ah_pred;   // per layer: the predictions d+1 layers early
     struct AheadJob {
         int rclass, rslot, il, e;
         uint64_t tag;
@@ -373,6 +375,17 @@ struct Glm5Model::FastState {
         const float *q_norm = nullptr, *k_norm = nullptr, *post_norm = nullptr, *sh_gate_w = nullptr;
         float *gdn_state = nullptr, *gdn_conv = nullptr;            // (S x h_v x S), (C x (d_conv - 1))
         uint16_t *kc = nullptr, *vc = nullptr;                      // the KV cache, FP16 [ctx][attn_head_kv][head_dim]
+        // ---- qwen4exp (q4x, qwen35_fast_path.cu): the hyper-connections' mixers, [0] the attention's, [1] the FFN's
+        struct Hc4 {
+            const float* norm = nullptr;                            // the grouped norm's gamma [hc][n_embd]
+            WSlot down, up, inject;                                 // hc*n_embd -> hc_lr, hc_lr -> hc*n_embd, -> hc
+        } hc4[2];
+        // qwen4exp's QSA indexer (an attention layer): k_proj / q_proj (BF16), their norms, and the block keys -
+        // the raw tail, the spare slot's key, the pooled keys (normed, rotated; the old path's indexer_key_append)
+        WSlot q4_ik, q4_iq;
+        const float *q4_ikn = nullptr, *q4_iqn = nullptr;
+        float *q4_tail = nullptr, *q4_dead = nullptr, *q4_pooled = nullptr;
+        int32_t* q4_bpos = nullptr;
         // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix
         bool exl3 = false;
         strata::kernels::exl3::ExpertLayout xl;
@@ -408,6 +421,39 @@ struct Glm5Model::FastState {
           *q35_o = nullptr, *q35_y = nullptr, *q35_qf = nullptr, *q35_k = nullptr, *q35_v = nullptr, *q35_q = nullptr,
           *q35_ao = nullptr, *q35_part = nullptr, *q35_shg = nullptr;
     void *q35_yq = nullptr, *q35_aoq = nullptr;
+    // ---- qwen4exp activations: the normed streams, the low rank, the gate, the injections ([0] attention, [1] FFN:
+    // each lives until its combine, the FFN's into the next layer)
+    float *q4_xn = nullptr, *q4_lo = nullptr, *q4_gate = nullptr, *q4_inj[2] = {nullptr, nullptr};
+    void *q4_xnq = nullptr, *q4_loq = nullptr;
+    const float* q4_head[1] = {nullptr};                         // output_hc_norm
+    // qwen4exp's per-layer embedding (layer 1, qwen35_fast_path.cu q4x_ple_*): the table on the SSD, the tokens by
+    // position (the n-gram hash reads the two before), the gathered rows (pinned / device / q8_1), the projections,
+    // the normalized rows' history (9 rows a channel, row-fastest) and the postops' scratch
+    std::unique_ptr<strata::kernels::PleTable> ple;
+    std::vector<int32_t> ple_toks;
+    bool ple_issued = false;
+    int ple_il = -1;                                             // the PLE layer (-1: none on this part)
+    float *ple_emb_h = nullptr, *ple_emb = nullptr, *ple_kp = nullptr, *ple_val = nullptr, *ple_hist = nullptr;
+    float *ple_key = nullptr, *ple_norm = nullptr, *ple_gated = nullptr, *ple_conv = nullptr, *ple_gate = nullptr;
+    void* ple_embq = nullptr;
+    uint16_t* ple_conv16 = nullptr;
+    WSlot ple_key_w, ple_val_w;
+    strata::kernels::PleWeights ple_w;
+    // qwen4exp's QSA (sparse attention past 2,051 cells): the RoPE table, the step record (pos, n_kv, n_bid, width)
+    // and the rows' positions (device; host-mapped sources), the indexer's raw key / queries, the block scores, the
+    // selected cells and their gathered K / V
+    float *q4_cos = nullptr, *q4_sin = nullptr, *q4_iraw = nullptr, *q4_iq = nullptr, *q4_scores = nullptr;
+    int32_t *q4_step = nullptr, *q4_pos = nullptr, *q4_step_h = nullptr, *q4_pos_h = nullptr, *q4_ids = nullptr;
+    uint16_t *q4_ks = nullptr, *q4_vs = nullptr;
+    int64_t q4_step_at = -1;                                     // the position the step record holds
+    int q4_max_blocks = 0, q4_cap = 0;
+    // ... and the prompt path's: kQ4Grp rows' block scores and selections, and the chunk's PLE rows (pinned)
+    static constexpr int kQ4Grp = 64;
+    float* q4_pf_scores = nullptr;
+    int32_t* q4_pf_ids = nullptr;
+    float* ple_pf_h = nullptr;
+    size_t ple_pf_n = 0;
+    WSlot q4_head_w[2];                                          // output_hc_down, output_hc_up
     // ---- the VRAM tier: per-layer partitions.  A slot is FREE, RESIDENT (in tab), a SPARE (handed to the
     //      device, which may fill it during a token and mark it resident itself) or DRAINING (its old expert
     //      is being demoted to the RAM tier by a D2H; it becomes free when that copy lands).

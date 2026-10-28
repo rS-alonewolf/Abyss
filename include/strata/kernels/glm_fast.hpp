@@ -186,17 +186,20 @@ void swiglu_q8(const float* gate, const float* up, float limit, int n, void* hq,
 // array (tab at [0, N), rtab at [N, 2N), spares at [2N, 2N + n_layers * kSpares)) so a single update
 // kernel applies the host's between-token edits.
 constexpr int kSpares = 3;
+/// The most routed experts a token uses (n_exp_used): the request / plan / answer records hold this many slots.
+/// 16 since qwen4exp (Qwen3.8-Flash-Next: top-10); the masks below are 32-bit, one bit a slot.
+constexpr int kMaxK = 16;
 /// The per-device routing state (device memory unless noted).
 struct MoeDev {
     unsigned long long* tab = nullptr;         // [3 tables, see above]
     int n_keys = 0;                            // N = n_layers * n_expert
-    unsigned long long* scratch = nullptr;     // [8] VRAM slots for fetched experts that could not be promoted
-    unsigned long long* plan_ptr = nullptr;    // [8]
-    float* plan_w = nullptr;                   // [8]
-    int* plan_id = nullptr;                    // [8]
-    unsigned long long* fetch_src = nullptr;   // [8] host-mapped source (0 = nothing to fetch for entry i)
-    unsigned long long* pf_src = nullptr;      // [8] the NEXT layer's predicted experts being prefetched: source,
-    unsigned long long* pf_dst = nullptr;      // [8] ... their (claimed spare) slot,
+    unsigned long long* scratch = nullptr;     // [kMaxK] VRAM slots for fetched experts that could not be promoted
+    unsigned long long* plan_ptr = nullptr;    // [kMaxK]
+    float* plan_w = nullptr;                   // [kMaxK]
+    int* plan_id = nullptr;                    // [kMaxK]
+    unsigned long long* fetch_src = nullptr;   // [kMaxK] host-mapped source (0 = nothing to fetch for entry i)
+    unsigned long long* pf_src = nullptr;      // [kMaxK] the NEXT layer's predicted experts being prefetched: source,
+    unsigned long long* pf_dst = nullptr;      // [kMaxK] ... their (claimed spare) slot,
     int* pf_n = nullptr;                       // ... and how many (the side-stream fetch kernel reads these)
     unsigned int* seq = nullptr;               // the device's request counter
     unsigned int* wait_seq = nullptr;          // the seq the wait kernel must see answered (0 = none); [1] the last
@@ -239,16 +242,16 @@ struct MoeRequest {
     unsigned int miss_mask;      // experts the host must provide (only on disk) - the device waits for these
     unsigned int fetch_mask;     // experts fetched from the RAM tier
     unsigned int promo_mask;     // ... of which promoted into a spare slot: promo_ptr[i] is the slot
-    int ids[8];
-    float w[8];
-    unsigned long long promo_ptr[8];
-    int pred[8];                 // the NEXT layer's router applied to this layer's FFN input (-1: none)
+    int ids[kMaxK];
+    float w[kMaxK];
+    unsigned long long promo_ptr[kMaxK];
+    int pred[kMaxK];                 // the NEXT layer's router applied to this layer's FFN input (-1: none)
     int pf_n;                    // of which prefetched into the next layer's spares: pf_ids / pf_ptr (slot)
-    int pf_ids[8];
-    unsigned long long pf_ptr[8];
-    short ahead[kAhead][8];      // layer + 1 + d's router on this layer's FFN input: its top-k (-1: none)
+    int pf_ids[kMaxK];
+    unsigned long long pf_ptr[kMaxK];
+    short ahead[kAhead][kMaxK];      // layer + 1 + d's router on this layer's FFN input: its top-k (-1: none)
     unsigned int cpu_mask;       // the CPU LANE: RAM-tier experts the host computes (the device skips them) ...
-    unsigned long long cpu_src[8];   // ... their RAM-tier blobs
+    unsigned long long cpu_src[kMaxK];   // ... their RAM-tier blobs
     alignas(16) float x[kMaxEmbd];   // the FFN input (16-byte stores; written at the kernel's start, or only when
                                  // cpu_mask != 0 with STRATA_GLM_ROUTE_EARLY=0)
     unsigned int skip_mask;      // experts left out (not in VRAM at rank >= skip_from): neither computed nor waited for
@@ -263,8 +266,8 @@ struct MoeResponse {
     unsigned int ptr_mask;            // plan entries the host made resident: ptr[i] valid
     unsigned int host_mask;           // plan entries the host COMPUTED (their sum is in cpu_part): skipped on the device
     unsigned int stream_mask;         // STREAMED entries: posted before their disk reads finished; ready[i] collects the
-    unsigned int ready[8];            // chunks that landed (bit part * n_chunks + chunk), the fetch copies them as they do
-    unsigned long long ptr[8];
+    unsigned int ready[kMaxK];            // chunks that landed (bit part * n_chunks + chunk), the fetch copies them as they do
+    unsigned long long ptr[kMaxK];
     int n_upd;                        // table updates: tab[key] = val
     int upd_key[64];
     unsigned long long upd_val[64];
@@ -286,8 +289,9 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
 /// The shared expert's swiglu + q8_1 alone (what moe_route's extra blocks do when it is given sh_gate / sh_up): for
 /// the token path's late shared expert, whose gate/up GEMV runs after the route (STRATA_GLM_SH_LATE).
 void sh_swiglu(const float* sh_gate, const float* sh_up, float sh_limit, int n_ff_sh, void* sh_hq, cudaStream_t s);
-/// The CPU LANE's split: of f RAM-tier experts in a route, cpu_take(plan, f) go to the host (4 bits per f, f = 0..8).
-inline int cpu_take(unsigned long long plan, int f) { return (int) ((plan >> (4 * f)) & 15ull); }
+/// The CPU LANE's split: of f RAM-tier experts in a route, cpu_take(plan, f) go to the host (4 bits per f, f = 0..15:
+/// a top-k above 15 uses f = 15's entry for more).
+inline int cpu_take(unsigned long long plan, int f) { return (int) ((plan >> (4 * (f < 15 ? f : 15))) & 15ull); }
 /// Waits (on the device) for the host's CPU-lane answer of the last route when it had CPU experts, then adds it to
 /// `out` (the layer's FFN output, which moe_down wrote first - its work runs while the CPU computes).
 void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s, int mode = 1);

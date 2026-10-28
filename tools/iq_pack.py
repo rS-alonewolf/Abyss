@@ -138,6 +138,13 @@ QWEN35MOE_NATIVE_OK = (
     "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
     "token_embd.weight", "output.weight",
 )
+# qwen4exp for the fast path (--fast): the same, plus the hyper-connections' low-rank projections (Q6_K / Q8_0 as
+# stored) and the PLE key / value
+QWEN4EXP_FAST_NATIVE_OK = QWEN35MOE_NATIVE_OK + (
+    "hc_attn_down.weight", "hc_attn_up.weight", "hc_attn_inject.weight",
+    "hc_ffn_down.weight", "hc_ffn_up.weight", "hc_ffn_inject.weight",
+    "output_hc_down.weight", "output_hc_up.weight", "ple_key.weight", "ple_value.weight",
+)
 ARCHITECTURES = ("qwen4exp", "glm5-next", "glm5next", "deepseek4", "deepseek41", "qwen35moe")   # unsloth spells glm5-next without the hyphen
 
 
@@ -152,7 +159,7 @@ def needs_bf16(name: str, type_name: str, arch: str = "qwen4exp") -> bool:
         # glm5-next has no PLE and no output_hc; its F32 router stays F32 (the runner reads it
         # as F32 by config), so ONLY the listed projections take the BF16 path.
         return name.startswith("blk.") and name.endswith(GLM5NEXT_BF16)
-    if arch == "qwen35moe":
+    if arch in ("qwen35moe", "qwen4exp-fast"):
         return False
     if name in BF16_OUTPUT:
         return True
@@ -348,6 +355,10 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
             elif arch == "qwen35moe" and not name.endswith(QWEN35MOE_NATIVE_OK):
                 print("%s is %s: not on the qwen35moe native set (QWEN35MOE_NATIVE_OK); refusing to pack it "
                       "silently" % (t.name, t.type_name))
+                return 1
+            elif arch == "qwen4exp-fast" and not name.endswith(QWEN4EXP_FAST_NATIVE_OK):
+                print("%s is %s: not on the qwen4exp fast-path native set (QWEN4EXP_FAST_NATIVE_OK); refusing to "
+                      "pack it silently" % (t.name, t.type_name))
                 return 1
             else:
                 served += 1
@@ -558,6 +569,8 @@ def main() -> int:
     ap.add_argument("--compat-bf16", action="store_true",
                     help="dequantize small non-native projections to BF16 for ordinary Qwen4Exp GGUFs "
                          "(rounds weights; leaves experts and the PLE table unchanged)")
+    ap.add_argument("--fast", action="store_true",
+                    help="qwen4exp: a pack for the fast path (--glm-pack) - nothing converted to BF16")
     ap.add_argument("--experts-bin", action="store_true",
                     help="also write experts.bin (the engine otherwise reads the experts from the GGUF itself)")
     a = ap.parse_args()
@@ -640,7 +653,9 @@ def main() -> int:
             return 1
         rc = index_from_base(a, src, base, out, g, {t.name: t for t in g.tensors}, mm)
     else:
-        rc = index_standalone(src, out, model, a.compat_bf16, arch, trunk)
+        # --fast (qwen4exp): the fast path's pack - every tensor as the GGUF stores it, the F32 routers too
+        rc = index_standalone(src, out, model, a.compat_bf16, "qwen4exp-fast" if a.fast and arch == "qwen4exp" else arch,
+                              trunk)
     if rc:
         return rc
     if arch == "deepseek41":

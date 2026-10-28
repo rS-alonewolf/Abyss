@@ -498,6 +498,7 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
     if (g.get("deepseek4.block_count")) return from_gguf_dsv4(g, out, err);
     if (g.get("deepseek41.num_hidden_layers") || g.get("deepseek41.block_count")) return from_gguf_dsv41(g, out, err);
     if (g.get("qwen35moe.block_count")) return from_gguf_qwen35(g, out, err);
+    if (g.get("qwen4exp.block_count")) return from_gguf_qwen4exp(g, out, err);
     // two spellings in the wild: llama.cpp's canonical "glm5-next" and unsloth's "glm5next" -
     // the KV PREFIX follows the file's own arch string, so it is detected once here
     const std::string p = g.get("glm5next.block_count") ? "glm5next." : "glm5-next.";
@@ -684,6 +685,81 @@ bool Glm5Geometry::from_gguf_qwen35(const strata::GgufFile& g, Glm5Geometry& out
         const int every = (int) num("full_attention_interval", 4);
         for (int il = 0; il < out.n_layers; ++il) out.n_head_kv[(size_t) il] = (il + 1) % every == 0 ? out.attn_head_kv : 0;
     }
+    out.indexer_full.assign((size_t) out.n_layers, 1);
+    out.comp_ratio.assign((size_t) out.n_layers, 0);
+    return true;
+}
+
+// qwen4exp: the hparams llama.cpp's loader reads (src/models/qwen4exp.cpp load_arch_hparams), Qwen3.8-Flash-Next's
+// values as defaults; on the qwen35moe path (arch 2) with q4x set: hc streams, no NextN block, top-k <= glmf::kMaxK
+bool Glm5Geometry::from_gguf_qwen4exp(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
+    const std::string p = "qwen4exp.";
+    const auto num = [&](const std::string& key, double def) -> double {
+        const auto* v = g.get(p + key);
+        if (!v) return def;
+        if (v->type == strata::MetaType::ARRAY) return v->items.empty() || !v->items[0].is_num() ? def : v->items[0].num();
+        return v->is_num() ? v->num() : def;
+    };
+    out.arch = 2;
+    out.q4x = true;
+    out.hc = (int) num("hyper_connection.count", 4);
+    out.hc_lr = (int) num("hyper_connection.low_rank", 320);
+    out.n_embd = (int) num("embedding_length", 2560);
+    out.nextn = 0;
+    out.n_layers = (int) num("block_count", 48);
+    out.n_head = (int) num("attention.head_count", 24);
+    out.attn_head_kv = (int) num("attention.head_count_kv", 2);
+    out.head_dim = (int) num("attention.key_length", 256);
+    out.norm_eps = (float) num("attention.layer_norm_rms_epsilon", 1e-6);
+    out.n_rot = (int) num("rope.dimension_count", 64);
+    out.rope_base = (float) num("rope.freq_base", 10000000.0);
+    out.n_expert = (int) num("expert_count", 512);
+    out.n_exp_used = (int) num("expert_used_count", 10);
+    out.n_ff_exp = (int) num("expert_feed_forward_length", 640);
+    out.n_ff_shexp = (int) num("expert_shared_feed_forward_length", out.n_ff_exp);
+    out.n_shared = out.n_ff_shexp > 0 ? 1 : 0;
+    out.n_ff_dense = 0;
+    out.dense_lead = 0;
+    out.d_conv = (int) num("ssm.conv_kernel", 4);
+    out.ssm_k_heads = (int) num("ssm.group_count", 16);
+    out.ssm_inner = (int) num("ssm.inner_size", 6144);
+    out.ssm_state = (int) num("ssm.state_size", 128);
+    out.ssm_v_heads = (int) num("ssm.time_step_rank", 48);
+    out.idx_heads = (int) num("attention.indexer.head_count", 4);
+    out.idx_key = (int) num("attention.indexer.key_length", 128);
+    out.idx_top_k = (int) num("attention.indexer.top_k", 2048);
+    out.idx_kpool = 4;
+    out.gating = 2;
+    out.w_scale = 1.0f;
+    out.norm_w = 1;
+    out.swiglu_exp = out.swiglu_shexp = INFINITY;
+    out.kda_head_dim = out.ssm_state;
+    if (const auto* v = g.get("tokenizer.ggml.tokens"); v && v->type == strata::MetaType::ARRAY)
+        out.n_vocab = (int) v->count;
+    else
+        out.n_vocab = 248320;
+    if (out.n_layers < 1 || out.n_embd <= 0 || out.n_embd % 256 != 0 || out.n_expert <= 0 || out.n_expert > 512 ||
+        out.n_exp_used < 1 || out.n_exp_used > 16 || out.hc != 4 || out.hc_lr % 32 != 0) {
+        err = "qwen4exp: block_count / embedding_length / expert_count / expert_used_count / hyper_connection are off";
+        return false;
+    }
+    if (out.n_shared != 0 && out.n_ff_shexp != out.n_ff_exp) {
+        err = "qwen4exp: the shared expert's width differs from the experts' (not supported)";
+        return false;
+    }
+    if (out.ssm_v_heads % out.ssm_k_heads != 0 || out.ssm_inner != out.ssm_v_heads * out.ssm_state || out.ssm_state > 128) {
+        err = "qwen4exp: ssm.time_step_rank / group_count / inner_size / state_size do not fit the GDN kernels";
+        return false;
+    }
+    if (out.head_dim != 256 || out.n_head % out.attn_head_kv != 0 || out.n_rot <= 0 || out.n_rot > out.head_dim ||
+        out.n_rot % 2 != 0) {
+        err = "qwen4exp: the attention kernels take head_dim 256, n_head a multiple of head_count_kv, an even n_rot";
+        return false;
+    }
+    // full_attention_interval: every interval-th layer is attention (llama.cpp's rule; compress_ratios 4 the same)
+    const int every = (int) num("full_attention_interval", 4);
+    out.n_head_kv.assign((size_t) out.n_layers, 0);
+    for (int il = 0; il < out.n_layers; ++il) out.n_head_kv[(size_t) il] = (il + 1) % every == 0 ? out.attn_head_kv : 0;
     out.indexer_full.assign((size_t) out.n_layers, 1);
     out.comp_ratio.assign((size_t) out.n_layers, 0);
     return true;
@@ -2725,6 +2801,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             if (shard_names[i] == n) return (int) i;
         return -1;
     };
+    if (g_.q4x) {   // the PLE table stays in its shard (28.8 GB, read row by row: q4x_ple_*); STRATA_Q4X_PLE_GGUF moves it
+        const char* pg = getenv("STRATA_Q4X_PLE_GGUF");
+        const int si = find_shard_of("per_layer_token_embd.weight");
+        ple_gguf_ = pg != nullptr && pg[0] ? std::string(pg) : si >= 0 ? dir2 + "/" + shard_names[(size_t) si] : std::string();
+    }
 
     // 3. native_experts.txt: per MoE layer, the expert types and blob offsets
     pack_layers_.assign((size_t) g_.n_layers, NativeLayer{});

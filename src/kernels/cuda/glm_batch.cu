@@ -22,6 +22,7 @@
 #pragma pop_macro("__shfl_sync")
 #endif
 #include "strata/kernels/glm_batch.hpp"
+#include "strata/kernels/glm_fast.hpp"   // kMaxK
 #include "dsa_topk.cuh"
 #include "glm_lat8.cuh"
 
@@ -1633,7 +1634,7 @@ __global__ void __launch_bounds__(256) route_kernel(const float* __restrict__ lo
                                                     const int* __restrict__ toks) {
     const int t = blockIdx.x, tid = threadIdx.x;
     __shared__ float s_p[512], s_sel[512];
-    __shared__ int s_ids[8];
+    __shared__ int s_ids[strata::kernels::glmf::kMaxK];
     __shared__ float s_bv[32];
     __shared__ int s_bi[32];
     __shared__ int bad;
@@ -1744,8 +1745,8 @@ __global__ void moe_combine_add_kernel(const float* __restrict__ out, int base, 
                                        const int* __restrict__ pos, const float* __restrict__ w, int k, int E,
                                        float* __restrict__ ffn) {
     const int t = blockIdx.x;
-    __shared__ int s_pos[8];
-    __shared__ float s_w[8];
+    __shared__ int s_pos[strata::kernels::glmf::kMaxK];
+    __shared__ float s_w[strata::kernels::glmf::kMaxK];
     __shared__ int s_n;
     if (threadIdx.x == 0) {
         int n = 0;
@@ -1772,8 +1773,8 @@ __global__ void moe_combine_add_kernel(const float* __restrict__ out, int base, 
 __global__ void moe_combine_kernel(const float* __restrict__ out, const int* __restrict__ pos, const float* __restrict__ w,
                                    const float* __restrict__ sh, int k, int E, float* __restrict__ ffn) {
     const int t = blockIdx.x;
-    __shared__ int s_pos[8];
-    __shared__ float s_w[8];
+    __shared__ int s_pos[strata::kernels::glmf::kMaxK];
+    __shared__ float s_w[strata::kernels::glmf::kMaxK];
     if (threadIdx.x < k) {
         s_pos[threadIdx.x] = pos[t * k + threadIdx.x];
         s_w[threadIdx.x] = w[t * k + threadIdx.x];

@@ -43,6 +43,25 @@ __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
 }
+__device__ __forceinline__ float warp_max(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+// ggml's block_q8_1 (36 bytes: d and the sum as half2, 32 codes) and glm_fast's q8_1_store_warp - the same arithmetic
+// as gf::quantize_q8_1, so a kernel that also writes the q8_1 of its output gives the same bytes as a quantize after it
+struct Q81 {
+    __half2 ds;
+    int8_t qs[32];
+};
+__device__ __forceinline__ void q81_store_warp(float v, Q81* dst, int lane) {
+    const float amax = warp_max(fabsf(v));
+    const float sum = warp_sum(v);
+    const float d = fminf(amax / 127.0f, 65504.0f);
+    const int8_t q = amax == 0.0f ? 0 : (int8_t) fmaxf(-127.0f, fminf(127.0f, roundf(v / d)));
+    dst->qs[lane] = q;
+    if (lane == 0) dst->ds = make_half2(d, fmaxf(-65504.0f, fminf(65504.0f, sum)));
+}
 // a 256-thread block's sum (sh: 8 floats)
 __device__ __forceinline__ float block_sum256(float v, float* sh) {
     v = warp_sum(v);
@@ -420,6 +439,7 @@ __global__ void __launch_bounds__(256) attn_prompt_kernel(const float* __restric
     constexpr int QB = 4;
     const int g = blockIdx.y, t0 = blockIdx.x * QB, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int G = n_head / n_head_kv, h0 = g * G + warp * HW;
+    if (warp * HW >= G) return;   // (a group of fewer than 8 HW heads: qwen4exp's 12 on HW 2 - 6 warps; no block sync)
     const int nq = min(QB, T - t0);
     float qr[QB][HW][8], acc[QB][HW][8], m[QB][HW], l[QB][HW];
 #pragma unroll
@@ -867,6 +887,72 @@ void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) std::fprintf(stderr, "qwen35 %s: %s\n", what, cudaGetErrorString(e));
 }
+// qwen4exp (Qwen3.8-Flash-Next) hyper-connections - llama.cpp's src/models/qwen4exp.cpp build_hc_mix /
+// build_hc_combine: the residual is hc streams [hc][n_embd] a row, no norm tensors (the mixer is the norm)
+// block (c, t): row t's stream c - first R[c] += out * 2 sigmoid(inject[c] / hc) (the last block's combine, comb the
+// identity; out == nullptr: none), then xn[c] = rms(R[c]) * gamma[c]
+__global__ void __launch_bounds__(256) hc4_combine_norm_kernel(float* __restrict__ R, const float* __restrict__ out,
+                                                               const float* __restrict__ inject,
+                                                               const float* __restrict__ gamma, float eps, int n_embd,
+                                                               int hc, int inj_stride, float* __restrict__ xn,
+                                                               Q81* __restrict__ xq) {
+    __shared__ float sh[8];
+    const int c = blockIdx.x, t = blockIdx.y;
+    float* r = R + ((size_t) t * hc + c) * n_embd;
+    float ss = 0.0f;
+    if (out != nullptr) {
+        const float* o = out + (size_t) t * n_embd;
+        const float w = 2.0f * sigmoid_f(inject[(size_t) t * inj_stride + c] / (float) hc);
+        for (int e = threadIdx.x; e < n_embd; e += 256) {
+            const float v = r[e] + o[e] * w;
+            r[e] = v;
+            ss += v * v;
+        }
+    } else {
+        for (int e = threadIdx.x; e < n_embd; e += 256) ss += r[e] * r[e];
+    }
+    const float sc = rsqrtf(block_sum256(ss, sh) / (float) n_embd + eps);
+    float* x = xn + ((size_t) t * hc + c) * n_embd;
+    const float* gm = gamma + (size_t) c * n_embd;
+    const size_t q0 = ((size_t) t * hc + c) * n_embd;
+    for (int e = threadIdx.x; e < n_embd; e += 256) {
+        const float v = r[e] * sc * gm[e];
+        x[e] = v;
+        if (xq != nullptr) q81_store_warp(v, xq + (q0 + e) / 32, threadIdx.x & 31);   // (n_embd % 256 == 0)
+    }
+}
+// ks[j] = kc[ids[j]], vs[j] = vc[ids[j]]: a block a row, 8 bytes a thread
+__global__ void gather_rows_kernel(const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
+                                   const int32_t* __restrict__ ids, int row, uint16_t* __restrict__ ks,
+                                   uint16_t* __restrict__ vs) {
+    const size_t src = (size_t) ids[blockIdx.x] * row, dst = (size_t) blockIdx.x * row;
+    for (int i = threadIdx.x * 4; i < row; i += blockDim.x * 4) {
+        *(uint2*) (ks + dst + i) = *(const uint2*) (kc + src + i);
+        *(uint2*) (vs + dst + i) = *(const uint2*) (vc + src + i);
+    }
+}
+// lo[i] = silu(lo[i] * a)
+__global__ void silu_scale_kernel(float* __restrict__ x, int n, float a, Q81* __restrict__ xq) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {   // (with xq: n % 32 == 0, whole warps)
+        const float v = x[i] * a;
+        const float y = v / (1.0f + expf(-v));
+        x[i] = y;
+        if (xq != nullptr) q81_store_warp(y, xq + i / 32, threadIdx.x & 31);
+    }
+}
+// mixed[t][e] = (1 / hc) sum_c xn[t][c][e] sigmoid(gate[t][c][e])
+__global__ void hc4_mix_kernel(const float* __restrict__ xn, const float* __restrict__ gate, int n_embd, int hc,
+                               float* __restrict__ mixed, Q81* __restrict__ xq) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (e >= n_embd) return;   // (with xq: n_embd % 32 == 0, whole warps)
+    const size_t b = (size_t) t * hc * n_embd + e;
+    float m = 0.0f;
+    for (int c = 0; c < hc; ++c) m += xn[b + (size_t) c * n_embd] * sigmoid_f(gate[b + (size_t) c * n_embd]);
+    m = m / (float) hc;
+    mixed[(size_t) t * n_embd + e] = m;
+    if (xq != nullptr) q81_store_warp(m, xq + ((size_t) t * n_embd + e) / 32, threadIdx.x & 31);
+}
 }  // namespace
 
 void silu(float* x, int n, cudaStream_t s) {
@@ -1042,8 +1128,8 @@ void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
                  int64_t p0, int T, float scale, float* out, cudaStream_t s) {
     if (T <= 0) return;
     const int G = n_head_kv > 0 ? n_head / n_head_kv : 0;
-    if (head_dim != kD || G * n_head_kv != n_head || (G != 8 && G != 16 && G != 32)) {
-        std::fprintf(stderr, "qwen35 attn_prompt: head_dim %d, heads %d / %d (a group of 8, 16 or 32)\n", head_dim,
+    if (head_dim != kD || G * n_head_kv != n_head || (G != 8 && G != 12 && G != 16 && G != 32)) {
+        std::fprintf(stderr, "qwen35 attn_prompt: head_dim %d, heads %d / %d (a group of 8, 12, 16 or 32)\n", head_dim,
                      n_head, n_head_kv);
         return;
     }
@@ -1075,7 +1161,7 @@ void attn_prompt(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
     }
     const dim3 grid((unsigned) ((T + 3) / 4), (unsigned) n_head_kv);
     if (G == 8) attn_prompt_kernel<1><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
-    else if (G == 16) attn_prompt_kernel<2><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
+    else if (G == 16 || G == 12) attn_prompt_kernel<2><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
     else attn_prompt_kernel<4><<<grid, 256, 0, s>>>(q, kc, vc, n_head, n_head_kv, p0, T, scale, out);
     check("attn_prompt");
 }
@@ -1127,6 +1213,43 @@ void shexp_gate_rows(const float* x, const float* w, float* ffn, int T, int n, c
     if (T <= 0) return;
     shexp_gate_rows_kernel<<<T, 256, 0, s>>>(x, w, ffn, n);
     check("shexp_gate_rows");
+}
+
+void hc4_combine_norm(float* R, const float* out, const float* inject, int inj_stride, const float* gamma, float eps,
+                      int n_embd, int hc, int T, float* xn, cudaStream_t s, void* xq) {
+    if (T <= 0) return;
+    if (xq != nullptr && n_embd % 256 != 0) {
+        std::fprintf(stderr, "q35 hc4_combine_norm: the q8_1 output needs n_embd %% 256 == 0 (%d)\n", n_embd);
+        return;
+    }
+    hc4_combine_norm_kernel<<<dim3((unsigned) hc, (unsigned) T), 256, 0, s>>>(R, out, inject, gamma, eps, n_embd, hc,
+                                                                            inj_stride, xn, (Q81*) xq);
+    check("hc4_combine_norm");
+}
+void gather_rows(const uint16_t* kc, const uint16_t* vc, const int32_t* ids, int n, int row, uint16_t* ks, uint16_t* vs,
+                 cudaStream_t s) {
+    if (n <= 0) return;
+    gather_rows_kernel<<<n, 128, 0, s>>>(kc, vc, ids, row, ks, vs);
+    check("gather_rows");
+}
+void silu_scale(float* x, int n, float a, cudaStream_t s, void* xq) {
+    if (n <= 0) return;
+    if (xq != nullptr && n % 32 != 0) {
+        std::fprintf(stderr, "q35 silu_scale: the q8_1 output needs n %% 32 == 0 (%d)\n", n);
+        return;
+    }
+    silu_scale_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, n, a, (Q81*) xq);
+    check("silu_scale");
+}
+void hc4_mix(const float* xn, const float* gate, int n_embd, int hc, int T, float* mixed, cudaStream_t s, void* xq) {
+    if (T <= 0) return;
+    if (xq != nullptr && n_embd % 32 != 0) {
+        std::fprintf(stderr, "q35 hc4_mix: the q8_1 output needs n_embd %% 32 == 0 (%d)\n", n_embd);
+        return;
+    }
+    hc4_mix_kernel<<<dim3((unsigned) ((n_embd + 255) / 256), (unsigned) T), 256, 0, s>>>(xn, gate, n_embd, hc, mixed,
+                                                                                       (Q81*) xq);
+    check("hc4_mix");
 }
 
 }  // namespace strata::kernels::q35

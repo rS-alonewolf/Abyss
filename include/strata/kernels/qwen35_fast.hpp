@@ -93,4 +93,18 @@ void top_prob(const float* logits, int n, const int* tok, float* out, cudaStream
 /// ffn[t] *= sigmoid(x[t] . w) over T rows of n (the shared expert's gate from its input rows).
 void shexp_gate_rows(const float* x, const float* w, float* ffn, int T, int n, cudaStream_t s);
 
+/// qwen4exp's hyper-connections (llama.cpp src/models/qwen4exp.cpp), T rows, the residual R [T][hc][n_embd]:
+/// R[t][c] += out[t] * 2 sigmoid(inject[t * inj_stride + c] / hc) when out != nullptr (build_hc_combine, comb the
+/// identity), then xn[t][c] = rms(R[t][c]) * gamma[c] (build_hc_mix's grouped norm; gamma [hc][n_embd]).
+void hc4_combine_norm(float* R, const float* out, const float* inject, int inj_stride, const float* gamma, float eps,
+                      int n_embd, int hc, int T, float* xn, cudaStream_t s, void* xq = nullptr);   // xq: xn's q8_1 too
+/// qwen4exp's QSA: the KV cache rows ids[0..n) (FP16 [ctx][row] of `row` halves) into the contiguous ks / vs.
+void gather_rows(const uint16_t* kc, const uint16_t* vc, const int32_t* ids, int n, int row, uint16_t* ks, uint16_t* vs,
+                 cudaStream_t s);
+/// x[i] = silu(a * x[i]), i < n (build_hc_mix's low-rank activation, a = 1 / hc).
+void silu_scale(float* x, int n, float a, cudaStream_t s, void* xq = nullptr);   // xq: x's q8_1 too
+/// mixed[t][e] = mean_c xn[t][c][e] * sigmoid(gate[t][c][e]) (build_hc_mix's collapse of the streams).
+void hc4_mix(const float* xn, const float* gate, int n_embd, int hc, int T, float* mixed, cudaStream_t s,
+             void* xq = nullptr);   // xq: mixed's q8_1 too
+
 }  // namespace strata::kernels::q35

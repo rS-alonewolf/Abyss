@@ -9,7 +9,16 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/native_ple_postops.hpp"
+#include "strata/kernels/ngram.hpp"
+#include "strata/kernels/ple.hpp"
+#include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/qsa.hpp"
+#include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
+#include "strata/kernels/rope.hpp"
+
+#include "ggml.h"
 
 #include <cuda_runtime.h>
 
@@ -49,8 +58,20 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
         return it->second;
     };
     const int E = g.n_embd, C = g.ssm_conv_dim(), V = g.ssm_inner, D = g.head_dim;
-    Ly.attn_norm = f32("attn_norm.weight");
-    Ly.post_norm = f32("post_attention_norm.weight");
+    if (g.q4x) {   // no norms: the hyper-connections' mixers
+        const int64_t HE = (int64_t) g.hc * E;
+        const char* pre[2] = {"hc_attn_", "hc_ffn_"};
+        for (int h = 0; h < 2; ++h) {
+            const std::string b = pre[h];
+            Ly.hc4[h].norm = f32((b + "norm.weight").c_str());
+            Ly.hc4[h].down = q((b + "down.weight").c_str(), HE, g.hc_lr);
+            Ly.hc4[h].up = q((b + "up.weight").c_str(), g.hc_lr, HE);
+            Ly.hc4[h].inject = q((b + "inject.weight").c_str(), HE, g.hc);
+        }
+    } else {
+        Ly.attn_norm = f32("attn_norm.weight");
+        Ly.post_norm = f32("post_attention_norm.weight");
+    }
     if (Ly.recr) {
         Ly.qkv = q("attn_qkv.weight", E, C);
         Ly.zg = q("attn_gate.weight", E, V);
@@ -68,6 +89,17 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
         Ly.out = q("attn_output.weight", (int64_t) g.n_head * D, E);
         Ly.q_norm = f32("attn_q_norm.weight");
         Ly.k_norm = f32("attn_k_norm.weight");
+        if (g.q4x) {   // the QSA indexer: BF16 projections
+            const auto b16 = [&](const char* n, int64_t n_out) -> WSlot {
+                const auto it = w16_.find(P + n);
+                if (it == w16_.end()) { missing += P + n + " (bf16) "; return WSlot{}; }
+                return WSlot{nullptr, gf::kTypeBF16, it->second, E, n_out};
+            };
+            Ly.q4_ik = b16("indexer.k_proj.weight", g.idx_key);
+            Ly.q4_iq = b16("indexer.q_proj.weight", (int64_t) g.idx_heads * g.idx_key);
+            Ly.q4_ikn = f32("indexer.k_norm.weight");
+            Ly.q4_iqn = f32("indexer.q_norm.weight");
+        }
     }
     if (Ly.moe && g.n_shared > 0) Ly.sh_gate_w = f32("ffn_gate_inp_shexp.weight");
     if (Ly.mtp) {   // the NextN block: eh_proj in (2 n_embd -> n_embd) and its two norms; the head's norm the trunk's
@@ -80,6 +112,18 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
 bool Glm5Model::qwen35_alloc(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
+    if (g.q4x && l1_ == g.n_layers) {   // the output mixer's weights (the head's part)
+        const auto nw = w_.find("output_hc_norm.weight");
+        const auto dw = ws_map_.find("output_hc_down.weight"), uw = ws_map_.find("output_hc_up.weight");
+        if (nw == w_.end() || dw == ws_map_.end() || uw == ws_map_.end() || !gf::mv_supported(dw->second.type) ||
+            !gf::mv_supported(uw->second.type)) {
+            err = "qwen4exp: output_hc_norm / output_hc_down / output_hc_up (served natively) are missing";
+            return false;
+        }
+        F->q4_head[0] = nw->second;
+        F->q4_head_w[0] = dw->second;
+        F->q4_head_w[1] = uw->second;
+    }
     const size_t S = (size_t) g.ssm_state, HV = (size_t) g.ssm_v_heads, C = (size_t) g.ssm_conv_dim(), V = (size_t) g.ssm_inner;
     const size_t D = (size_t) g.head_dim, HD = (size_t) g.n_head * D, KV = (size_t) g.attn_head_kv * D;
     const size_t ctx = (size_t) std::max<int64_t>(max_ctx_, 1);
@@ -91,6 +135,9 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     bytes += al(C * 4) + al(V * 4) + al(C * 4) + al(2 * HV * 4) + al(HV * 4) + al(V * 4) + al(V * 4) + al(V / 32 * 36) +
              al(HD * 2 * 4) + al(KV * 4) + al(KV * 4) + al(HD * 4) + al(HD * 4) + al(HD / 32 * 36) + al(part * 4) + 256;
     const size_t E = (size_t) g.n_embd, TM = (size_t) kVerifyMax;
+    const size_t HE = (size_t) g.hc * E, LR = (size_t) g.hc_lr;
+    if (g.q4x)   // the hyper-connections' activations
+        bytes += al(HE * 4) + al(HE / 32 * 36) + al(LR * 4) + al(LR / 32 * 36) + al(HE * 4) + 2 * al(64);
     const bool mtp = mtp_il_ >= 0;
     if (mtp)   // the drafter: the pending hidden, <= kVerifyMax rows of scratch, the chain's tokens and confidences
         bytes += al(E * 4) + al(TM * E * 4) * 3 + al(TM * (E / 32) * 36) + al(TM * (2 * E / 32) * 36) + al(TM * KV * 4) * 2 +
@@ -134,6 +181,15 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     F->q35_aoq = take(HD / 32 * 36);
     F->q35_part = (float*) take(part * 4);
     F->q35_shg = (float*) take(256);
+    if (g.q4x) {
+        F->q4_xn = (float*) take(HE * 4);
+        F->q4_xnq = take(HE / 32 * 36);
+        F->q4_lo = (float*) take(LR * 4);
+        F->q4_loq = take(LR / 32 * 36);
+        F->q4_gate = (float*) take(HE * 4);
+        F->q4_inj[0] = (float*) take(64);
+        F->q4_inj[1] = (float*) take(64);
+    }
     if (mtp) {
         F->q35_pend_h = (float*) take(E * 4);
         F->q35_mt_emb = (float*) take(TM * E * 4);
@@ -154,6 +210,205 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     std::fprintf(stderr, "qwen35moe: CUDA%d %d delta-net layers (states %.0f MB), %d attention layers (KV caches %.2f GB "
                          "for %lld tokens)\n", dev_, n_rec, (double) n_rec * (state_b + conv_b) / 1048576.0, n_attn,
                  (double) n_attn * 2 * cache_b / 1073741824.0, (long long) ctx);
+    if (g.q4x && l0_ <= 1 && 1 < l1_ && !q4x_ple_setup(err)) return false;
+    if (g.q4x && !q4x_qsa_setup(err)) return false;
+    if (g.q4x && q4d_ == nullptr && getenv("STRATA_Q4X_MTP") != nullptr && getenv("STRATA_Q4X_MTP")[0] != '\0' &&
+        getenv("STRATA_GLM_NO_MTP") == nullptr && !q4x_mtp_load(getenv("STRATA_Q4X_MTP"), err))
+        return false;
+    return true;
+}
+
+// qwen4exp's QSA (llama.cpp build_qsa_top_k / build_attn_qsa): every attention layer keeps the indexer's block keys
+// (4 cells pooled, normed, rotated at the block's first cell: the old path's indexer_key_append); past 2,051 cells a
+// token attends to the 512 best-scored blocks plus the incomplete tail (qsa_block_scores / qsa_block_topk: the cells
+// ascending, ties to the lowest), gathered out of the KV cache; up to 2,051 the selection is every cell (dense)
+bool Glm5Model::q4x_qsa_setup(std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    namespace k = strata::kernels;
+    const k::QsaShapes sh = k::qsa_real_shapes();
+    if (g.n_head != sh.n_head || g.attn_head_kv != sh.n_head_kv || g.head_dim != sh.head_dim || g.n_rot != sh.n_rot ||
+        g.idx_heads != sh.idx_n_head || g.idx_key != sh.idx_dim || g.idx_top_k != sh.idx_top_k) {
+        err = "qwen4exp: the QSA kernels take Qwen3.8-Flash-Next's attention geometry";
+        return false;
+    }
+    const int64_t ctx = std::max<int64_t>(max_ctx_, 1);
+    F->q4_max_blocks = (int) (ctx / sh.idx_block + 2);
+    F->q4_cap = (int) k::qsa_selection_width(k::kTopkMaxCells, sh);
+    const size_t ID = (size_t) sh.idx_dim, half = (size_t) sh.n_rot / 2, row = (size_t) g.attn_head_kv * g.head_dim;
+    bool ok = true;
+    const auto dm = [&](auto** p, size_t b) { ok = ok && cudaMalloc((void**) p, b) == cudaSuccess; };
+    for (int il = l0_; il < l1_; ++il) {
+        auto& Ly = F->L[(size_t) il];
+        if (Ly.recr) continue;
+        dm(&Ly.q4_tail, (size_t) (sh.idx_block - 1) * ID * 4);
+        dm(&Ly.q4_dead, ID * 4);
+        dm(&Ly.q4_pooled, (size_t) F->q4_max_blocks * ID * 4);
+        dm(&Ly.q4_bpos, 64);
+    }
+    dm(&F->q4_cos, (size_t) ctx * half * 4);
+    dm(&F->q4_sin, (size_t) ctx * half * 4);
+    dm(&F->q4_iraw, ID * 4);
+    dm(&F->q4_iq, (size_t) sh.idx_n_head * ID * 4);
+    dm(&F->q4_scores, (size_t) F->q4_max_blocks * 4);
+    dm(&F->q4_ids, (size_t) F->q4_cap * 4);
+    dm(&F->q4_ks, (size_t) F->q4_cap * row * 2);
+    dm(&F->q4_vs, (size_t) F->q4_cap * row * 2);
+    dm(&F->q4_step, 64);
+    dm(&F->q4_pos, 256);
+    dm(&F->q4_pf_scores, (size_t) FastState::kQ4Grp * F->q4_max_blocks * 4);
+    dm(&F->q4_pf_ids, (size_t) FastState::kQ4Grp * F->q4_cap * 4);
+    ok = ok && cudaHostAlloc((void**) &F->q4_step_h, 64, cudaHostAllocDefault) == cudaSuccess &&
+         cudaHostAlloc((void**) &F->q4_pos_h, 256, cudaHostAllocDefault) == cudaSuccess;
+    if (!ok) {
+        cudaGetLastError();
+        err = "qwen4exp: the QSA indexer's buffers did not allocate";
+        return false;
+    }
+    {   // the RoPE table in float64 on the host (the old path's, rope.hpp)
+        std::vector<float> c((size_t) ctx * half), sn((size_t) ctx * half);
+        k::build_rope_table((int) sh.n_rot, (double) g.rope_base, (int) ctx, c.data(), sn.data());
+        cudaMemcpy(F->q4_cos, c.data(), c.size() * 4, cudaMemcpyHostToDevice);
+        cudaMemcpy(F->q4_sin, sn.data(), sn.size() * 4, cudaMemcpyHostToDevice);
+    }
+    F->q4_step_at = -1;
+    return true;
+}
+
+// ---------------------------------------------------------------- qwen4exp's per-layer embedding (layer 1)
+// llama.cpp src/models/qwen4exp.cpp build_inp_ple / build_ple: the token and the two before it hash (ngram_rows, the
+// EOS cut) into 16 rows of the 28.8 GB IQ4_NL table (PleTable: direct SSD reads, issued as soon as the token is known,
+// collected before layer 1), key = ple_key . emb and value = ple_value . emb on the device, then the gate, the dilated
+// conv over the normalized rows' history and R += gated + silu(conv) - native_ple_postops (the old path's, matched to
+// llama.cpp) - and the history advances a row
+bool Glm5Model::q4x_ple_setup(std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    namespace k = strata::kernels;
+    const int E = g.n_embd, HE = g.hc * E;
+    if (E != k::NG_N_EMBD || HE != k::NG_HC_DIM) {
+        err = "qwen4exp: the PLE kernels take n_embd 2560 and 4 streams";
+        return false;
+    }
+    const auto wq = [&](const char* n, int64_t n_in, int64_t n_out, WSlot& out) {
+        const auto it = ws_map_.find(n);
+        if (it == ws_map_.end() || !gf::mv_supported(it->second.type) || it->second.n_in != n_in || it->second.n_out != n_out)
+            return false;
+        out = it->second;
+        return true;
+    };
+    const auto wf = [&](const char* n) -> const float* {
+        const auto it = w_.find(n);
+        return it == w_.end() ? nullptr : it->second;
+    };
+    const float* conv = wf("blk.1.ple_conv1d.weight");
+    F->ple_w.norm_key = wf("blk.1.ple_norm_key.weight");
+    F->ple_w.norm_query = wf("blk.1.ple_norm_query.weight");
+    F->ple_w.norm_conv = wf("blk.1.ple_norm_conv.weight");
+    if (!wq("blk.1.ple_key.weight", E, HE, F->ple_key_w) || !wq("blk.1.ple_value.weight", E, E, F->ple_val_w) ||
+        conv == nullptr || F->ple_w.norm_key == nullptr || F->ple_w.norm_query == nullptr || F->ple_w.norm_conv == nullptr) {
+        err = "qwen4exp: blk.1.ple_* (key / value served natively, the norms and the conv) are missing - pack with "
+              "tools/iq_pack.py --fast";
+        return false;
+    }
+    if (ple_gguf_.empty()) {
+        err = "qwen4exp: no shard holds per_layer_token_embd (STRATA_Q4X_PLE_GGUF names the GGUF that does)";
+        return false;
+    }
+    const size_t n_conv = (size_t) k::PLE_CONV_KERNEL * HE;
+    bool ok = cudaHostAlloc((void**) &F->ple_emb_h, (size_t) E * 4, cudaHostAllocDefault) == cudaSuccess;
+    const auto dm = [&](auto** p, size_t b) { ok = ok && cudaMalloc((void**) p, b) == cudaSuccess; };
+    dm(&F->ple_emb, (size_t) E * 4);
+    dm(&F->ple_embq, (size_t) E / 32 * 36);
+    dm(&F->ple_kp, (size_t) HE * 4);
+    dm(&F->ple_val, (size_t) E * 4);
+    dm(&F->ple_hist, (size_t) k::NG_HIST * HE * 4);
+    dm(&F->ple_key, (size_t) HE * 4);
+    dm(&F->ple_norm, (size_t) HE * 4);
+    dm(&F->ple_gated, (size_t) HE * 4);
+    dm(&F->ple_conv, (size_t) HE * 4);
+    dm(&F->ple_gate, 64);
+    dm(&F->ple_conv16, n_conv * 2);
+    if (!ok) {
+        cudaGetLastError();
+        err = "qwen4exp: the PLE buffers did not allocate";
+        return false;
+    }
+    cudaMemset(F->ple_hist, 0, (size_t) k::NG_HIST * HE * 4);
+    {   // the conv taps as F16 (the pack widened the GGUF's F16 to F32: exact both ways)
+        std::vector<float> c32(n_conv);
+        std::vector<ggml_fp16_t> c16(n_conv);
+        cudaMemcpy(c32.data(), conv, n_conv * 4, cudaMemcpyDeviceToHost);
+        ggml_fp32_to_fp16_row(c32.data(), c16.data(), (int64_t) n_conv);
+        cudaMemcpy(F->ple_conv16, c16.data(), n_conv * 2, cudaMemcpyHostToDevice);
+    }
+    F->ple_w.conv1d_f16 = F->ple_conv16;
+    F->ple.reset(new k::PleTable());
+    k::PleIoOptions io;
+    if (!F->ple->open(ple_gguf_, err, io)) {
+        err = "qwen4exp: the PLE table (" + ple_gguf_ + "): " + err;
+        F->ple.reset();
+        return false;
+    }
+    F->ple_toks.assign((size_t) std::max<int64_t>(max_ctx_, 1), -1);
+    F->ple_il = 1;
+    std::fprintf(stderr, "qwen4exp: CUDA%d PLE table %llu rows from %s (direct reads)\n", dev_,
+                 (unsigned long long) F->ple->rows(), ple_gguf_.c_str());
+    return true;
+}
+
+bool Glm5Model::q4x_ple_issue(int32_t token, int64_t p, std::string& err) {
+    FastState* F = fast_;
+    namespace k = strata::kernels;
+    if (F->ple == nullptr) return true;
+    if (F->ple_issued) {   // (a token whose layers never ran: its rows are dropped)
+        if (!F->ple->collect(F->ple_emb_h, err)) return false;
+        F->ple_issued = false;
+    }
+    const size_t n = F->ple_toks.size();
+    if (p >= 0 && (size_t) p < n) F->ple_toks[(size_t) p] = token;
+    const int32_t prev[2] = {p >= 2 && (size_t) p - 2 < n ? F->ple_toks[(size_t) p - 2] : -1,
+                             p >= 1 && (size_t) p - 1 < n ? F->ple_toks[(size_t) p - 1] : -1};
+    static const k::PleConsts consts = k::ple_artifact_consts();
+    uint32_t rows[k::PLE_N_HEADS];
+    k::ngram_rows(&token, prev, 1, consts, rows);
+    if (!F->ple->issue(rows)) {
+        err = "qwen4exp: the PLE rows could not be issued";
+        return false;
+    }
+    F->ple_issued = true;
+    return true;
+}
+
+bool Glm5Model::q4x_ple_apply(std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    namespace k = strata::kernels;
+    if (F->ple == nullptr) return true;
+    if (!F->ple_issued) {
+        err = "qwen4exp: layer 1 ran without its PLE rows";
+        return false;
+    }
+    if (!F->ple->collect(F->ple_emb_h, err)) { err = "qwen4exp: PLE: " + err; return false; }
+    F->ple_issued = false;
+    const int E = g.n_embd, HE = g.hc * E;
+    cudaMemcpyAsync(F->ple_emb, F->ple_emb_h, (size_t) E * 4, cudaMemcpyHostToDevice, s);
+    gf::quantize_q8_1(F->ple_emb, F->ple_embq, E, s);
+    gf::MvJob j[2];
+    j[0] = {F->ple_key_w.q, F->ple_embq, F->ple_emb, F->ple_kp, nullptr, 1.0f, F->ple_key_w.type, E, HE};
+    j[1] = {F->ple_val_w.q, F->ple_embq, F->ple_emb, F->ple_val, nullptr, 1.0f, F->ple_val_w.type, E, E};
+    if (!gf::mv(j, 2, s)) { err = "qwen4exp: the PLE key / value"; return false; }
+    k::NativePlePostopsBuffers b;
+    b.key = F->ple_key;
+    b.query = F->ple_norm;   // (may equal normalized)
+    b.gate = F->ple_gate;
+    b.gated = F->ple_gated;
+    b.normalized = F->ple_norm;
+    b.conv = F->ple_conv;
+    b.result = state_;       // (may equal hidden)
+    k::native_ple_postops(F->ple_kp, state_, F->ple_val, F->ple_hist, F->ple_w, b, (void*) s);
+    k::ple_history_advance(F->ple_hist, F->ple_norm, (void*) s);
     return true;
 }
 
@@ -168,6 +423,8 @@ void Glm5Model::qwen35_reset() {
         cudaMemsetAsync(Ly.gdn_state, 0, S * HV * S * 4, F->cs);
         cudaMemsetAsync(Ly.gdn_conv, 0, C * (size_t) (g.d_conv - 1) * 4, F->cs);
     }
+    if (F->ple_hist != nullptr)
+        cudaMemsetAsync(F->ple_hist, 0, (size_t) strata::kernels::NG_HIST * g.hc * g.n_embd * 4, F->cs);
     q35_pend_pos_ = q35_row_done_ = -1;
     cudaStreamSynchronize(F->cs);
 }
@@ -178,10 +435,16 @@ bool Glm5Model::q35_snap_copy(bool restore) {
     const Glm5Geometry& g = g_;
     const size_t S = (size_t) g.ssm_state, HV = (size_t) g.ssm_v_heads, C = (size_t) g.ssm_conv_dim();
     const size_t state_b = S * HV * S * 4, conv_b = C * (size_t) (g.d_conv - 1) * 4;
-    const size_t pend_b = F->q35_pend_h != nullptr ? (size_t) g.n_embd * 4 : 0;
-    size_t total = pend_b;
-    for (int il = l0_; il < l1_; ++il)
+    const size_t pend_b = F->q35_pend_h != nullptr ? (size_t) (g.q4x ? g.hc : 1) * g.n_embd * 4 : 0;
+    const size_t ple_b = F->ple_hist != nullptr ? (size_t) strata::kernels::NG_HIST * g.hc * g.n_embd * 4 : 0;
+    // (qwen4exp: every attention layer's QSA raw tail - the cells of the block being filled; a position restored inside
+    // a block finds its earlier cells' keys there, not the later positions' that overwrote them)
+    const size_t tail_b = (size_t) 3 * g.idx_key * sizeof(float);
+    size_t total = pend_b + ple_b;
+    for (int il = l0_; il < l1_; ++il) {
         if (F->L[(size_t) il].recr) total += state_b + conv_b;
+        else if (F->L[(size_t) il].q4_tail != nullptr) total += tail_b;
+    }
     if (q35_snap_h_ == nullptr) {
         if (restore) return false;
         if (cudaHostAlloc(&q35_snap_h_, total, cudaHostAllocDefault) != cudaSuccess) {
@@ -198,11 +461,15 @@ bool Glm5Model::q35_snap_copy(bool restore) {
     };
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
-        if (!Ly.recr) continue;
+        if (!Ly.recr) {
+            if (Ly.q4_tail != nullptr) run(Ly.q4_tail, tail_b);
+            continue;
+        }
         run(Ly.gdn_state, state_b);
         run(Ly.gdn_conv, conv_b);
     }
     if (pend_b > 0) run(F->q35_pend_h, pend_b);
+    if (ple_b > 0) run(F->ple_hist, ple_b);   // (qwen4exp: the PLE conv's history)
     if (restore) {
         q35_pend_pos_ = q35_snap_pend_;
         q35_row_done_ = q35_snap_done_;
@@ -221,12 +488,16 @@ bool Glm5Model::q35_snap_copy(bool restore) {
 // (fast_token, a window's first token, or a draft), then its row is written; a draft step at the pending position
 // writes the row itself.  Chained drafts feed the block its own normed output as h and its argmax as the token.
 bool Glm5Model::q35_mtp_on() const {
+    if (g_.q4x)
+        return q4d_ != nullptr && fast_ != nullptr && fast_->q35_pend_h != nullptr &&
+               (fast_->emb_tab_d != nullptr || fast_->emb_q8_d != nullptr);
     return g_.qwen35() && mtp_il_ >= 0 && fast_ != nullptr && (fast_->emb_tab_d != nullptr || fast_->emb_q8_d != nullptr) && fast_->q35_pend_h != nullptr;
 }
 
 void Glm5Model::q35_mtp_pend_set(int64_t p, const float* h) {
     FastState* F = fast_;
-    cudaMemcpyAsync(F->q35_pend_h, h, (size_t) g_.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+    cudaMemcpyAsync(F->q35_pend_h, h, (size_t) (g_.q4x ? g_.hc : 1) * g_.n_embd * sizeof(float), cudaMemcpyDeviceToDevice,
+                    F->cs);
     q35_pend_pos_ = p;
 }
 
@@ -247,6 +518,7 @@ bool Glm5Model::q35_mtp_rows(int64_t p0, int n, const float* h_rows, size_t h_st
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
     if (n <= 0) return true;
+    if (g.q4x) return q4x_mtp_rows(p0, n, h_rows, h_stride, next, err);
     if (n > kVerifyMax) { err = "qwen35 mtp: " + std::to_string(n) + " rows (at most " + std::to_string(kVerifyMax) + ")"; return false; }
     const int il = mtp_il_, E = g.n_embd, D = g.head_dim, KV = g.attn_head_kv * D;
     const size_t q8e = (size_t) (E / 32) * 36, cat_b = (size_t) (2 * E / 32) * 36;
@@ -278,6 +550,7 @@ bool Glm5Model::q35_mtp_step(int64_t p, const int* tok_dev, const float* h, floa
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
+    if (g.q4x) return q4x_mtp_forward(p, 1, h, 0, tok_dev, true, conf_out, tok_out, err);
     const int il = mtp_il_, E = g.n_embd;
     const auto& Ly = F->L[(size_t) il];
     if (!gf::embed_rows_q(F->emb_tab_d ? pack_emb_type_ : 8 /* Q8_0 */, F->emb_tab_d ? F->emb_tab_d : F->emb_q8_d, tok_dev, 1, E, F->emb, s)) { err = "qwen35 mtp: the embedding"; return false; }
@@ -311,14 +584,15 @@ bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::stri
         conf[k] = 0.0f;
     }
     if (q35_pend_pos_ < 0) return true;   // (no position to draft from)
-    static const int kmax = [] {
+    // (qwen4exp's draft layer: 4 and 0.75 - prose 59.1 -> 60.5-64.1 tok/s against 3 and 0.5, code the same 81)
+    const int kmax = [this] {
         const char* v = getenv("STRATA_Q35_MTP_K");
-        return v != nullptr ? std::max(1, std::min(5, std::atoi(v))) : 3;
+        return v != nullptr ? std::max(1, std::min(5, std::atoi(v))) : g_.q4x ? 4 : 3;
     }();
-    static const float stop_below = [] {
+    const float stop_below = [this] {
         const char* v = getenv("STRATA_Q35_MTP_MIN");
         if (v == nullptr) v = getenv("STRATA_DS4_DSPARK_THR");
-        return v != nullptr ? (float) std::atof(v) : 0.5f;
+        return v != nullptr ? (float) std::atof(v) : g_.q4x ? 0.75f : 0.5f;
     }();
     cudaStream_t s = F->cs;
     const int64_t p = q35_pend_pos_;
@@ -326,7 +600,8 @@ bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::stri
     F->tok_in_h[0] = y;
     int n = 0;
     for (int k = 0; k < kmax; ++k) {
-        if (!q35_mtp_step(p + k, k == 0 ? F->tok_in_d : F->mtp_tok, k == 0 ? F->q35_pend_h : F->head_x,
+        if (!q35_mtp_step(p + k, k == 0 ? F->tok_in_d : g_.q4x ? F->q35_mt_tok + (k - 1) : F->mtp_tok,
+                          k == 0 ? F->q35_pend_h : g_.q4x ? q4x_mtp_residual() : F->head_x,
                           F->q35_mt_conf_d, F->q35_mt_tok + k, err))
             return false;
         if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "qwen35 mtp draft step", err)) return false;
@@ -416,7 +691,10 @@ bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
         q35::gdn_scan(Ly.gdn_state, F->q35_h, 1, C, F->q35_ab, F->q35_ab + HV, S, HK, HV, F->q35_o, s);
     }
     if (dumps) q35_dump(s, "gdn_o", il, F->q35_o, V);
-    strata::kernels::gdn_out_norm_silu(F->q35_o, F->q35_z, Ly.ssm_norm, F->q35_y, HV, S, g.norm_eps, (void*) s);
+    if (g.q4x)   // (qwen4exp: a sigmoid output gate)
+        strata::kernels::gdn_out_norm(F->q35_o, F->q35_z, Ly.ssm_norm, F->q35_y, HV, S, g.norm_eps, (void*) s);
+    else
+        strata::kernels::gdn_out_norm_silu(F->q35_o, F->q35_z, Ly.ssm_norm, F->q35_y, HV, S, g.norm_eps, (void*) s);
     if (F->prof_on) F->mark("q35_gdn");
     if (dumps) q35_dump(s, "final_output", il, F->q35_y, V);
     gf::quantize_q8_1(F->q35_y, F->q35_yq, V, s);
@@ -433,11 +711,16 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
     cudaStream_t s = F->cs;
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd, D = g.head_dim, HD = g.n_head * D, KV = g.attn_head_kv * D, p = (int) p64;
-    gf::MvJob j[3];
+    gf::MvJob j[5];
     j[0] = {Ly.aq.q, F->xq, F->x, F->q35_qf, nullptr, 1.0f, Ly.aq.type, E, 2 * HD};
     j[1] = {Ly.ak.q, F->xq, F->x, F->q35_k, nullptr, 1.0f, Ly.ak.type, E, KV};
     j[2] = {Ly.av.q, F->xq, F->x, F->q35_v, nullptr, 1.0f, Ly.av.type, E, KV};
-    if (!gf::mv(j, 3, s)) { err = "qwen35moe: the attention projections"; return false; }
+    const bool qsa = g.q4x && Ly.q4_pooled != nullptr;
+    if (qsa) {   // (qwen4exp: the indexer's raw key and queries from the same input)
+        j[3] = {Ly.q4_ik.q, F->xq, F->x, F->q4_iraw, nullptr, 1.0f, Ly.q4_ik.type, E, g.idx_key};
+        j[4] = {Ly.q4_iq.q, F->xq, F->x, F->q4_iq, nullptr, 1.0f, Ly.q4_iq.type, E, g.idx_heads * g.idx_key};
+    }
+    if (!gf::mv(j, qsa ? 5 : 3, s)) { err = "qwen35moe: the attention projections"; return false; }
     if (F->prof_on) F->mark("q35_attn_mv");
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     if (dumps) {
@@ -447,8 +730,38 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
     }
     q35::attn_prep(F->q35_qf, F->q35_k, F->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D, g.n_rot,
                    g.rope_base, p, Ly.kc, Ly.vc, F->q35_q, s);
-    q35::attn_decode(F->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p + 1, 1.0f / std::sqrt((float) D), F->q35_part,
-                     F->q35_ao, s);
+    namespace k = strata::kernels;
+    int width = p + 1;
+    if (qsa) {
+        const k::QsaShapes sh = k::qsa_real_shapes();
+        if (F->q4_step_at != p64) {   // the step record and the rows' positions, once a token
+            k::qsa_step_fill(F->q4_step_h, p64, sh);
+            for (int h = 0; h < 64; ++h) F->q4_pos_h[h] = p;
+            cudaMemcpyAsync(F->q4_step, F->q4_step_h, k::qsa_step_bytes(), cudaMemcpyHostToDevice, s);
+            cudaMemcpyAsync(F->q4_pos, F->q4_pos_h, 256, cudaMemcpyHostToDevice, s);
+            F->q4_step_at = p64;
+        }
+        const k::QsaIndexerBuffers ib{Ly.q4_tail, Ly.q4_dead, Ly.q4_pooled, Ly.q4_bpos};
+        k::indexer_key_append(F->q4_iraw, F->q4_step + k::kStepPos, 0, Ly.q4_ikn, g.norm_eps, ib, sh, F->q4_cos,
+                              F->q4_sin, (void*) s);
+        static const bool dense = getenv("STRATA_Q4X_DENSE") != nullptr;   // (A/B: every cell, as below 2,051)
+        width = dense ? p + 1 : (int) k::qsa_selection_width(p64 + 1, sh);
+        if (width < p + 1) {   // past 2,051 cells: the indexer's selection, gathered
+            k::rms_norm_weighted(F->q4_iq, Ly.q4_iqn, g.idx_heads, g.idx_key, g.norm_eps, (void*) s);
+            k::rope_neox_apply(F->q4_iq, F->q4_iq, g.idx_heads, g.idx_key, g.n_rot, F->q4_cos, F->q4_sin, F->q4_pos,
+                               (void*) s);
+            k::qsa_block_scores(Ly.q4_pooled, Ly.q4_dead, F->q4_iq, F->q4_step, 1, F->q4_max_blocks, sh, F->q4_scores,
+                                (void*) s);
+            k::qsa_block_topk(F->q4_scores, F->q4_step, 1, F->q4_max_blocks, F->q4_cap, sh, F->q4_ids, (void*) s);
+            q35::gather_rows(Ly.kc, Ly.vc, F->q4_ids, width, KV, F->q4_ks, F->q4_vs, s);
+        }
+    }
+    if (width < p + 1)
+        q35::attn_decode(F->q35_q, F->q4_ks, F->q4_vs, g.n_head, g.attn_head_kv, D, width, 1.0f / std::sqrt((float) D),
+                         F->q35_part, F->q35_ao, s);
+    else
+        q35::attn_decode(F->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p + 1, 1.0f / std::sqrt((float) D),
+                         F->q35_part, F->q35_ao, s);
     if (dumps) {
         q35_dump(s, "Qcur", il, F->q35_q, HD);
         q35_dump(s, "attn_pregate", il, F->q35_ao, HD);
@@ -464,6 +777,27 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
     return true;
 }
 
+// qwen4exp: build_hc_mix after the combine - R[c] += out * 2 sigmoid(inj_prev[c] / hc) (out == nullptr: none), xn =
+// the grouped norm, lo = silu(down . xn / hc), gate = up . lo, x = mean_c xn[c] sigmoid(gate[c]) (and its q8_1),
+// inj_out = inject . xn (nullptr: the head's mixer has none)
+bool Glm5Model::q4x_mix(const float* norm, const WSlot& down, const WSlot& up, const WSlot* inject, const float* out,
+                        const float* inj_prev, float* inj_out, float* x, void* xq, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int E = g.n_embd, HE = g.hc * E, LR = g.hc_lr;
+    q35::hc4_combine_norm(state_, out, inj_prev, g.hc, norm, g.norm_eps, E, g.hc, 1, F->q4_xn, s, F->q4_xnq);
+    gf::MvJob j[2];
+    j[0] = {down.q, F->q4_xnq, F->q4_xn, F->q4_lo, nullptr, 1.0f, down.type, HE, LR};
+    if (inject != nullptr) j[1] = {inject->q, F->q4_xnq, F->q4_xn, inj_out, nullptr, 1.0f, inject->type, HE, g.hc};
+    if (!gf::mv(j, inject != nullptr ? 2 : 1, s)) { err = "qwen4exp: the hyper-connection's down / inject"; return false; }
+    q35::silu_scale(F->q4_lo, LR, 1.0f / (float) g.hc, s, F->q4_loq);
+    gf::MvJob u = {up.q, F->q4_loq, F->q4_lo, F->q4_gate, nullptr, 1.0f, up.type, LR, HE};
+    if (!gf::mv(&u, 1, s)) { err = "qwen4exp: the hyper-connection's up"; return false; }
+    q35::hc4_mix(F->q4_xn, F->q4_gate, E, g.hc, 1, x, s, xq);
+    return true;
+}
+
 bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
@@ -471,6 +805,7 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
     bool pf_pending = false;
     static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
     q35_dump_pos = p;
+    if (g.q4x) return fast_q4x_layers(p, err);
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -514,6 +849,73 @@ bool Glm5Model::fast_qwen35_layers(int64_t p, std::string& err) {
         q35_dump(s, "result_norm", l1_ - 1, F->head_x, g.n_embd);
     }
     { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("qwen35moe: ") + cudaGetErrorString(e); return false; } }
+    return true;
+}
+
+// qwen4exp's layers (llama.cpp src/models/qwen4exp.cpp graph): the residual state_ is hc streams; a layer is
+// mix(attn) -> the mixer -> combine -> mix(ffn) -> the MoE -> combine (the FFN's combine runs inside the next mix);
+// the head is the output mixer (no output norm)
+bool Glm5Model::fast_q4x_layers(int64_t p, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    bool pf_pending = false;
+    static const bool dumps = getenv("GLM_CB_DIR") != nullptr;
+    if (F->prof_on) F->mark("start");
+    for (int il = l0_; il < l1_; ++il) {
+        const auto& Ly = F->L[(size_t) il];
+        bool combined = il == l0_;
+        if (il == F->ple_il) {   // the last FFN's combine, then the PLE into the streams, then the mixer reads R
+            if (!combined)
+                q35::hc4_combine_norm(state_, F->ffn, F->q4_inj[1], g.hc, Ly.hc4[0].norm, g.norm_eps, g.n_embd, g.hc, 1,
+                                      F->q4_xn, s);
+            combined = true;
+            if (!q4x_ple_apply(err)) return false;
+            if (F->prof_on) F->mark("q4x_ple");
+            if (dumps) q35_dump(s, "ple_out", il, state_, (int64_t) g.hc * g.n_embd);
+        }
+        if (!q4x_mix(Ly.hc4[0].norm, Ly.hc4[0].down, Ly.hc4[0].up, &Ly.hc4[0].inject, combined ? nullptr : F->ffn,
+                     F->q4_inj[1], F->q4_inj[0], F->x, F->xq, err))
+            return false;
+        if (F->prof_on) F->mark("q4x_hc");
+        if (dumps) {
+            q35_dump(s, "hc_norm", il, F->q4_xn, (int64_t) g.hc * g.n_embd);
+            q35_dump(s, "hc_gate", il, F->q4_gate, (int64_t) g.hc * g.n_embd);
+            q35_dump(s, "hc_mixed", il, F->x, g.n_embd);
+            q35_dump(s, "hc_inject", il, F->q4_inj[0], g.hc);
+        }
+        if (Ly.recr) {
+            if (!fast_qwen35_gdn(il, err)) return false;
+        } else {
+            if (!fast_qwen35_attn(il, p, err)) return false;
+        }
+        abl_out(il, 0, F->mixer, 1, g.n_embd, s);
+        if (!q4x_mix(Ly.hc4[1].norm, Ly.hc4[1].down, Ly.hc4[1].up, &Ly.hc4[1].inject, F->mixer, F->q4_inj[0],
+                     F->q4_inj[1], F->x, F->xq, err))
+            return false;
+        if (F->prof_on) F->mark("q4x_hc");
+        if (dumps) {   // (the FFN mixer's names a second time in llama.cpp's graph: cb_diff.py reads <name>2)
+            q35_dump(s, "hc_combine", il, state_, (int64_t) g.hc * g.n_embd);
+            q35_dump(s, "hc_norm2", il, F->q4_xn, (int64_t) g.hc * g.n_embd);
+            q35_dump(s, "hc_gate2", il, F->q4_gate, (int64_t) g.hc * g.n_embd);
+            q35_dump(s, "hc_mixed2", il, F->x, g.n_embd);
+            q35_dump(s, "hc_inject2", il, F->q4_inj[1], g.hc);
+        }
+        if (!Ly.moe) { err = "qwen4exp: a dense FFN layer (not supported)"; return false; }
+        if (!fast_moe(il, pf_pending, err)) return false;
+        abl_out(il, 1, F->ffn, 1, g.n_embd, s);
+        if (dumps) q35_dump(s, "ffn_out", il, F->ffn, g.n_embd);
+    }
+    // the head: the last FFN's combine, then the output mixer -> head_x / head_xq
+    if (!q4x_mix(F->q4_head[0], F->q4_head_w[0], F->q4_head_w[1], nullptr, F->ffn, F->q4_inj[1], nullptr, F->head_x,
+                 F->head_xq, err))
+        return false;
+    if (F->prof_on) F->mark("q35_head");
+    if (dumps) {
+        q35_dump(s, "l_last", l1_ - 1, state_, (int64_t) g.hc * g.n_embd);
+        q35_dump(s, "result_norm", l1_ - 1, F->head_x, g.n_embd);
+    }
+    { cudaError_t e = cudaGetLastError(); if (e != cudaSuccess) { err = std::string("qwen4exp: ") + cudaGetErrorString(e); return false; } }
     return true;
 }
 
