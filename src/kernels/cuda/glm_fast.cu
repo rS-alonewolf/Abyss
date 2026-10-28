@@ -2782,7 +2782,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
                 const unsigned int cj = __shfl_sync(0xffffffffu, c_i, j);
                 if (((cm >> j) & 1u) && (cj < c_i || (cj == c_i && j > i))) ++rank;
             }
-            host_i = cand && rank < to_cpu;
+            host_i = cand && (rank < to_cpu ||
+                (a.d.helper_owned != nullptr && a.d.helper_owned[(size_t) a.layer * E + s_ids[i]] != 0));
         }
         const float w = (float) ((double) p * inv * a.w_scale);
         const size_t key = on ? (size_t) a.layer * E + s_ids[i] : 0;
@@ -3854,11 +3855,17 @@ int mv_type_ok(int t) {
 
 // a failed launch is STICKY: the forward that issued it reports an error (launch_errors) instead of computing on
 std::atomic<int> g_launch_errors{0};
+thread_local bool g_helper_launch = false;
+thread_local cudaError_t g_helper_error = cudaSuccess;
 void launch_check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "glm_fast %s: %s\n", what, cudaGetErrorString(e));
-        g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+        if (g_helper_launch) {
+            if (g_helper_error == cudaSuccess) g_helper_error = e;
+        } else {
+            g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -3872,6 +3879,14 @@ bool moe_supported(int type) {   // moe_gate_up's and moe_down's instantiations
 }
 
 int launch_errors() { return g_launch_errors.load(std::memory_order_relaxed) + exl3::launch_errors(); }
+void helper_launch_begin() {
+    g_helper_error = cudaSuccess;
+    g_helper_launch = true;
+}
+cudaError_t helper_launch_end() {
+    g_helper_launch = false;
+    return g_helper_error;
+}
 
 size_t row_bytes(int type, int64_t n_in) {
     switch (type) {

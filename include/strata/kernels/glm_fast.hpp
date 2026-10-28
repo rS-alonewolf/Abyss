@@ -53,6 +53,9 @@ bool moe_supported(int type);
 /// Kernel launches of this family that failed since the process started (each is also printed); the forward
 /// that sees the count grow reports an error instead of computing on.
 int launch_errors();
+// Optional helper launches report errors to their own service thread, without poisoning the primary.
+void helper_launch_begin();
+cudaError_t helper_launch_end();
 /// Bytes of one row of `type` with n_in values (0 when unsupported).
 size_t row_bytes(int type, int64_t n_in);
 
@@ -191,6 +194,7 @@ constexpr int kSpares = 3;
 constexpr int kMaxK = 16;
 /// The per-device routing state (device memory unless noted).
 struct MoeDev {
+    const uint8_t* helper_owned = nullptr; // Decode only; null on the prompt and default paths
     unsigned long long* tab = nullptr;         // [3 tables, see above]
     int n_keys = 0;                            // N = n_layers * n_expert
     unsigned long long* scratch = nullptr;     // [kMaxK] VRAM slots for fetched experts that could not be promoted
