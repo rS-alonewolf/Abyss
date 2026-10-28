@@ -48,6 +48,14 @@ void Glm5Model::qwen35_bind(int il, std::string& missing) {
     };
     const auto q = [&](const char* n, int64_t n_in, int64_t n_out) -> WSlot {
         auto it = ws_map_.find(P + n);
+        if ((it == ws_map_.end() || it->second.type == 0) && g.q4x) {
+            // ISTA-DASLab's GSQ-RCO Qwen3.8 keeps the hyper-connections and ssm_alpha / beta in BF16 (the pack's BF16
+            // arena): the GEMVs take BF16 rows with the float activation every job here passes beside its q8_1
+            const auto b = w16_.find(P + n);
+            if (b != w16_.end()) return WSlot{nullptr, gf::kTypeBF16, b->second, n_in, n_out};
+            const auto f = w_.find(P + n);   // (a small BF16 matrix - the injects - is widened to F32 at load)
+            if (f != w_.end()) return WSlot{f->second, gf::kTypeF32, f->second, n_in, n_out};
+        }
         if (it == ws_map_.end() || it->second.type == 0 || !gf::mv_supported(it->second.type)) {
             missing += P + n + " (quant) ";
             return WSlot{};
@@ -115,14 +123,17 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
     if (g.q4x && l1_ == g.n_layers) {   // the output mixer's weights (the head's part)
         const auto nw = w_.find("output_hc_norm.weight");
         const auto dw = ws_map_.find("output_hc_down.weight"), uw = ws_map_.find("output_hc_up.weight");
-        if (nw == w_.end() || dw == ws_map_.end() || uw == ws_map_.end() || !gf::mv_supported(dw->second.type) ||
-            !gf::mv_supported(uw->second.type)) {
+        const auto db = w16_.find("output_hc_down.weight"), ub = w16_.find("output_hc_up.weight");   // (ISTA: BF16)
+        const int64_t HE = (int64_t) g.hc * g.n_embd;
+        if (nw == w_.end() || (dw == ws_map_.end() && db == w16_.end()) || (uw == ws_map_.end() && ub == w16_.end()) ||
+            (dw != ws_map_.end() && !gf::mv_supported(dw->second.type)) ||
+            (uw != ws_map_.end() && !gf::mv_supported(uw->second.type))) {
             err = "qwen4exp: output_hc_norm / output_hc_down / output_hc_up (served natively) are missing";
             return false;
         }
         F->q4_head[0] = nw->second;
-        F->q4_head_w[0] = dw->second;
-        F->q4_head_w[1] = uw->second;
+        F->q4_head_w[0] = dw != ws_map_.end() ? dw->second : WSlot{nullptr, gf::kTypeBF16, db->second, HE, g.hc_lr};
+        F->q4_head_w[1] = uw != ws_map_.end() ? uw->second : WSlot{nullptr, gf::kTypeBF16, ub->second, g.hc_lr, HE};
     }
     const size_t S = (size_t) g.ssm_state, HV = (size_t) g.ssm_v_heads, C = (size_t) g.ssm_conv_dim(), V = (size_t) g.ssm_inner;
     const size_t D = (size_t) g.head_dim, HD = (size_t) g.n_head * D, KV = (size_t) g.attn_head_kv * D;
@@ -292,6 +303,12 @@ bool Glm5Model::q4x_ple_setup(std::string& err) {
     }
     const auto wq = [&](const char* n, int64_t n_in, int64_t n_out, WSlot& out) {
         const auto it = ws_map_.find(n);
+        if (it == ws_map_.end() || it->second.type == 0) {   // ISTA-DASLab's GSQ-RCO: key / value in BF16
+            const auto b = w16_.find(n);
+            if (b == w16_.end()) return false;
+            out = WSlot{nullptr, gf::kTypeBF16, b->second, n_in, n_out};
+            return true;
+        }
         if (it == ws_map_.end() || !gf::mv_supported(it->second.type) || it->second.n_in != n_in || it->second.n_out != n_out)
             return false;
         out = it->second;

@@ -7,6 +7,29 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.76 - 2026-10-28
+
+**Qwen3.8-Flash-Next: the popular ISTA-DASLab and unsloth GGUFs on the fast path, as beta - which file fits which PC:
+[docs/qwen38](docs/qwen38/README.md#other-ggufs-beta) (日本語: [README.ja.md](docs/qwen38/README.ja.md)).**
+
+| File | Resident | vs Q8_0 (KL / same top) | Abyss vs llama.cpp (KL) | R9700, prose / code |
+| --- | ---: | --- | --- | --- |
+| ISTA-DASLab GSQ-RCO IQ3_XXS | 47.0 GB | 0.398 / 71.6% | 0.019-0.022 | 66 / 84 tok/s |
+| ISTA-DASLab GSQ-RCO IQ3_S | 54.8 GB | 0.282 / 76.5% | 0.026 | 51 / 77 tok/s |
+| unsloth UD-IQ4_XS | 64.9 GB | 0.191 / 80.4% | 0.038-0.043 | 57 / 74 tok/s |
+| unsloth UD-Q4_K_XL | 82.5 GB | 0.100 / 86.4% | 0.029-0.037 | 55 / 71 tok/s |
+
+- New in the engine: Q2_0, Q5_1 and Q8_0 expert rows; IQ4_XS / Q5_1 / Q2_0 dense rows in the verify window; Q5_1 on
+  the prompt path; BF16 hyper-connection, `ssm_alpha` / `ssm_beta` and PLE key / value rows, and F32-widened injects
+  on the prompt path (ISTA keeps those in BF16).
+- Beta: each file was checked on one PC only (correctness against llama.cpp on the same file, a short speed run with
+  the MTP drafter, and 16 GB + 64 GB / 24 GB + 64 GB caps). `./abyss.sh --bench` on these files ends with a request to
+  post the report (`tools/bench_ref.py --beta` marks a reference so); the bench issue template asks for the file's
+  folder.
+- Capped to 16 GB of VRAM + a 46 GB RAM tier (ISTA) or 24 GB + 46 GB (UD-IQ4_XS) there were no SSD reads and prose
+  stayed at 45-61 tok/s, code 54-77 on this PC - which has an iGPU lane for the RAM-tier experts; without one expect less.
+- Other models: V4 gives bit-identical token-path logits to v1.3.75.
+
 ## v1.3.75 - 2026-10-28
 
 **An opt-in second-GPU expert helper for DeepSeek V4.1's decode on CUDA (PR #22 by tjm8874, following #21):

@@ -733,7 +733,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
     }
     if (!missing.empty()) {
-        err = "glm fast: unresolved weights: " + missing.substr(0, 600);
+        err = "glm fast: unresolved weights: " + missing.substr(0, 4000);
         return false;
     }
     if (g.dsv4() && !g.v41 && (!dsv4_bind(err) || !dsv4_alloc(err))) return false;

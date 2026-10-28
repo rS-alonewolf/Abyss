@@ -93,6 +93,46 @@ Quality: against llama.cpp on 494 positions past 5,600 tokens, KL 0.026 / top-1 
 90.9% (the prompt path); llama.cpp's own HIP-vs-CPU difference on this model is KL 0.045. Greedy answers with and
 without drafts are the same tokens.
 
+## Other GGUFs (beta)
+
+From v1.3.76 the fast path also takes the popular quants below. Each was checked on one PC (the R9700 above): the
+engine's log-probs against llama.cpp's on the same file, and a short speed run. **Support for them is beta**: please
+run `./abyss.sh --bench` and post the report ([a bench issue](https://github.com/zephel01/Abyss/issues/new?template=bench.md),
+with the file's folder name), whatever the numbers; the report says so for these files.
+
+| File | Size | Resident (all but the PLE table) | Quality vs Q8_0 (KL / same top token) | Engine vs llama.cpp (KL) | Speed (R9700) |
+| --- | ---: | ---: | --- | --- | --- |
+| [ISTA-DASLab GSQ-RCO](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) IQ3_XXS | 75.8 GB | 47.0 GB | 0.398 / 71.6% | 0.019-0.022 | 66 prose / 84 code (16 GB + 64 GB: 61 / 77) |
+| ISTA-DASLab GSQ-RCO IQ3_S | 83.6 GB | 54.8 GB | 0.282 / 76.5% | 0.026 | 51 prose / 77 code (16 GB + 64 GB: 45-57 / 54) |
+| [unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) UD-IQ4_XS | 93.7 GB | 64.9 GB | 0.191 / 80.4% | 0.038-0.043 | 57 prose / 74 code (24 GB + 64 GB: 55 / 68) |
+| unsloth UD-Q4_K_XL | 111.3 GB | 82.5 GB | 0.100 / 86.4% | 0.029-0.037 | 55 prose / 71 code |
+| (for comparison) orcarouter Uncensored IQ3_XXS | 85.2 GB | | | 0.026 (5,600-token run) | see above |
+
+"Quality vs Q8_0" is llama.cpp's own KL against unsloth's Q8_0 on the same 8 chunks of 1,024 tokens (smaller is
+better); "Engine vs llama.cpp" is Abyss against llama.cpp on the same file (the port's error, not the quant's).
+
+"Speed" is greedy 300-token answers (prose: an English essay prompt, code: an LRU cache) with the MTP drafter and the
+iGPU lane on the whole R9700; the GPU + RAM figures in brackets cap the engine with `STRATA_GLM_VRAM_GB` and
+`STRATA_GLM_RAM_GB=46`. Runs vary by several tok/s.
+
+Which to pick: go down this list and take the first file whose resident part fits in your GPU's memory + the RAM
+the engine may use (about 75% of the RAM: `STRATA_GLM_RAM_GB`). The PLE table (28.8 GB) stays on the SSD, so the
+file's full size does not have to fit.
+
+| Your GPU + RAM | File | Resident |
+| --- | --- | ---: |
+| 32 GB + 96 GB or more | unsloth UD-Q4_K_XL | 82.5 GB |
+| 24 GB + 64 GB or more | **unsloth UD-IQ4_XS** - the best quality per GB measured here; the first pick when it fits | 64.9 GB |
+| 16 GB + 64 GB | ISTA IQ3_S (83.6 GB file) | 54.8 GB |
+| less (12 GB + 64 GB, 16 GB + 48 GB) | ISTA IQ3_XXS (75.8 GB file) | 47.0 GB |
+
+A file a step too big still runs (what does not fit is read from the SSD each token), only slower; `--bench` shows
+how many reads a token waits for.
+
+New in the engine for these files: Q2_0, Q5_1 and Q8_0 expert rows, IQ4_XS / Q5_1 / Q2_0 in the verify window's
+dense rows, Q5_1 on the prompt path, and BF16 hyper-connection, `ssm_alpha` / `ssm_beta` and PLE key / value
+rows (ISTA keeps those in BF16).
+
 ## Limits
 
 - One GPU: a split across cards has not been tried with this model, and the drafter loads only when one card runs

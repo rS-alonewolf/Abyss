@@ -2769,7 +2769,8 @@ def bench_quality(cfg: dict, pack: Path | None, SV) -> dict | None:
     kl = float(m.group(4))
     return {"tokens": int(m.group(1)), "nll": float(m.group(2)), "kl": kl, "kl_max": float(m.group(5)),
             "same_top": float(m.group(6)), "ref_nll": r.get("nll"), "ref_made": r.get("made_with", "?"),
-            "verdict": "OK" if kl <= 0.02 else "slightly off" if kl <= 0.05 else "OFF", "lossy_off": off}
+            "verdict": "OK" if kl <= 0.02 else "slightly off" if kl <= 0.05 else "OFF", "lossy_off": off,
+            "beta": bool(r.get("beta"))}
 
 
 def sweep_report(shares, own, own_disk, start, now, lane_name, how) -> list:
@@ -3005,6 +3006,10 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
                      "rounds differently from the GPU the reference ran on")
     if quality and "kl" in quality and quality["verdict"] == "OFF":
         lines.append("  a large KL means this PC computes something the known-good run did not - please report it")
+    if quality and quality.get("beta"):
+        # beta support (tools/bench_ref.py --beta): measured on one PC only - the reports are how it gets checked
+        lines.append("  this model's support is BETA: it was measured on one PC only - please post this report "
+                     "(https://github.com/zephel01/Abyss/issues/new?template=bench.md), whatever the numbers")
     lines += ["", "<details><summary>engine lines</summary>", "", "```"] + \
              [x.replace(str(Path.home()), "~") for x in stats[-40:]] + ["```", "", "</details>"]
     out = ROOT / "abyss-bench.txt"

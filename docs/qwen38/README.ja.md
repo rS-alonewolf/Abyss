@@ -94,6 +94,45 @@ Qwen3.8-Flash-Next（llama.cpp の `qwen4exp`）は、v1.3.74 から Abyss の�
 0.035 / 90.9% でした。このモデルでは llama.cpp 自身の HIP と CPU の差が KL 0.045 です。貪欲生成では、下書きがあっても
 無くても同じトークンが出ます。
 
+## ほかの GGUF（ベータ）
+
+v1.3.76 から、速い経路で下の人気の量子化も使えます。どれも 1 台（上の R9700）で、同じファイルの llama.cpp との
+対数確率の差と、短い速度の測定だけを確かめています。**対応はベータです**。数字がどうであっても、`./abyss.sh --bench`
+を回して、結果を [bench の issue](https://github.com/zephel01/Abyss/issues/new?template=bench.md) に貼ってください
+（ファイルのフォルダ名も添えてください）。これらのファイルでは、`--bench` の結果にもそのお願いが出ます。
+
+| ファイル | サイズ | 常駐分（PLE 表以外） | Q8_0 との差（KL / 1 位一致） | Abyss と llama.cpp の差（KL） | 速度（R9700） |
+| --- | ---: | ---: | --- | --- | --- |
+| [ISTA-DASLab GSQ-RCO](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) IQ3_XXS | 75.8 GB | 47.0 GB | 0.398 / 71.6% | 0.019-0.022 | 文章 66 / コード 84（16 GB + 64 GB: 61 / 77） |
+| ISTA-DASLab GSQ-RCO IQ3_S | 83.6 GB | 54.8 GB | 0.282 / 76.5% | 0.026 | 文章 51 / コード 77（16 GB + 64 GB: 45〜57 / 54） |
+| [unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) UD-IQ4_XS | 93.7 GB | 64.9 GB | 0.191 / 80.4% | 0.038-0.043 | 文章 57 / コード 74（24 GB + 64 GB: 55 / 68） |
+| unsloth UD-Q4_K_XL | 111.3 GB | 82.5 GB | 0.100 / 86.4% | 0.029-0.037 | 文章 55 / コード 71 |
+| （比較用）orcarouter Uncensored IQ3_XXS | 85.2 GB | | | 0.026（5,600 トークンの実行） | 上の表 |
+
+「Q8_0 との差」は、llama.cpp 自身で unsloth の Q8_0 と比べた KL です（1,024 トークン × 8 区間、小さいほど良い）。
+「Abyss と llama.cpp の差」は同じファイルでの比較で、量子化ではなく移植の誤差を見ています。
+
+「速度」は貪欲生成で 300 トークンの答え（文章: 英語の作文、コード: LRU キャッシュ）、MTP ドラフターと iGPU レーンあり、
+R9700 まるごとでの値です。かっこ内の GPU + RAM は `STRATA_GLM_VRAM_GB` と `STRATA_GLM_RAM_GB=46` で制限した値です。
+回ごとに数 tok/s ぶれます。
+
+選び方: 上から順に見て、常駐分が「GPU のメモリ + エンジンが使える RAM（RAM のおよそ 75%、`STRATA_GLM_RAM_GB`）」に
+収まる最初のファイルを選んでください。PLE 表（28.8 GB）は SSD に置いたままなので、ファイル全体が収まる必要はありません。
+
+| GPU + RAM | ファイル | 常駐分 |
+| --- | --- | ---: |
+| 32 GB + 96 GB 以上 | unsloth UD-Q4_K_XL | 82.5 GB |
+| 24 GB + 64 GB 以上 | **unsloth UD-IQ4_XS**: ここで測った中で品質がいちばん良く、収まるならまずこれ | 64.9 GB |
+| 16 GB + 64 GB | ISTA IQ3_S（ファイル 83.6 GB） | 54.8 GB |
+| それより少ない（12 GB + 64 GB、16 GB + 48 GB） | ISTA IQ3_XXS（ファイル 75.8 GB） | 47.0 GB |
+
+一段大きいファイルでも動きます（収まらない分を毎トークン SSD から読む）が、遅くなります。`--bench` で、1 トークンが
+SSD の読み込みをどれだけ待っているかがわかります。
+
+これらのファイルのためにエンジンへ足したもの: エキスパートの Q2_0 / Q5_1 / Q8_0、検証窓の密な重みの IQ4_XS / Q5_1 /
+Q2_0、プロンプト経路の Q5_1、BF16 の hyper-connection・`ssm_alpha` / `ssm_beta`・PLE の key / value（ISTA はこれらを
+BF16 で持っています）。
+
 ## 制限
 
 - GPU は 1 枚: 複数枚への分割はこのモデルでは試していません。ドラフターは 1 枚でモデル全体を動かすときだけ読み込まれます。

@@ -2,7 +2,7 @@
 """tools/bench_ref.py - the quality check's reference for one model: `./abyss.sh --bench` scores the same tokens
 on another PC and compares (KL) its log-probs with these.
 
-    .venv/bin/python tools/bench_ref.py <config.json> [--tokens 512] [--k 32] [--check] [--variant <tag>]
+    .venv/bin/python tools/bench_ref.py <config.json> [--tokens 512] [--k 32] [--check] [--variant <tag>] [--beta]
 
 Runs the config's engine on a known-good PC in the score mode (STRATA_GLM_SCORE, teacher-forced through the one-token
 decode path), keeps each position's top-k log-probs and writes bench/ref/<model>.json (the token ids, the GGUF set's
@@ -11,7 +11,8 @@ position k int32 ids, best first, and their k float32 log-probs).  <model> is th
 suffix (abyss.model_key), so a copy with other files - another quant - finds no reference.  --variant <tag> writes
 bench/ref/<model>.<tag>.json / .topk instead, for a second copy under the same name (an overlay of the stock files):
 the check picks the reference whose GGUF size matches.  --check scores once more
-against the new reference (the KL should be ~0: the run-to-run floor).
+against the new reference (the KL should be ~0: the run-to-run floor).  --beta marks the model's support as beta:
+--bench then asks for the report whatever the numbers.
 
 The text is the start of README.md and README.ja.md, English then Japanese; its token ids are stored, so later edits
 of the READMEs do not change a reference."""
@@ -38,6 +39,7 @@ def main() -> int:
     ap.add_argument("--k", type=int, default=32)
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--variant", default="", help="write <model>.<variant>.json: another copy under the same name")
+    ap.add_argument("--beta", action="store_true", help="mark the model's support as beta: --bench asks for the report")
     a = ap.parse_args()
     import numpy as np
     import abyss as A
@@ -96,6 +98,8 @@ def main() -> int:
     ref = {"model": name, "gguf_bytes": size, "dense_bytes": dense.stat().st_size if dense.exists() else 0, "skip": 0, "k": a.k, "topk": topk.name, "ids": ids,
            "nll": float(m.group(1)), "top1": float(m.group(2)),
            "made_with": f"Abyss v{(ROOT / 'VERSION').read_text().strip()}, {gpu}, {Path(a.config).name}"}
+    if a.beta:
+        ref["beta"] = True
     (out / f"{stem}.json").write_text(json.dumps(ref) + "\n", encoding="utf-8")
     print(f"written: {out / (stem + '.json')} and {topk.name} ({os.path.getsize(topk) / 1024:.0f} KB)")
     if a.check:

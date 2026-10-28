@@ -2004,6 +2004,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             const int n = std::min(rows, N - r0);
             if (w.type == gf::kTypeBF16)
                 gb::bf16_to_f16((const uint16_t*) w.q + (size_t) r0 * Kd, S->w16, (int64_t) n * Kd, s);
+            else if (w.type == gf::kTypeF32)   // (ISTA's Qwen3.8: the injects, BF16 in the GGUF, widened at load)
+                gb::f32_to_f16((const float*) w.q + (size_t) r0 * Kd, S->w16, (int64_t) n * Kd, s);
             else if (x3w)
                 strata::kernels::exl3::reconstruct_rows(
                     strata::kernels::exl3::view(*(const strata::kernels::exl3::Mat*) w.q, r0, n), S->w16, false, s);

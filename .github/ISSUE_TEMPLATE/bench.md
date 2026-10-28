@@ -9,5 +9,7 @@ labels: bench
      abyss-bench.txt below. It has no host name, user name or folder path; read it before you post.
      docs/BENCH.md explains each line. -->
 
+**Which files** (the GGUF folder, e.g. `ISTA-DASLab/.../IQ3_S`; needed for a model whose support is beta):
+
 **What you expected / what felt slow** (optional):
 
