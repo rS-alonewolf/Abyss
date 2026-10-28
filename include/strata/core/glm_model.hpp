@@ -170,6 +170,9 @@ public:
     /// setup's calibration (per request, no restart); false when this engine has no CPU lane.
     double pcie_share() const;
     bool set_pcie_share(double share);
+    // Decode-only optional expert tier; unsupported or failed helpers leave the CPU lane in charge.
+    void expert_helper_decode_begin(bool speculative);
+    void expert_helper_decode_end();
     int cpu_lane_threads() const;
     bool set_cpu_lane_threads(int n);
     /// Conversation reuse (the fast path): save the sequence state at the current position - the recurrent KDA

@@ -302,6 +302,7 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 | [Port notes](docs/deepseek4/PORT.md) | what Abyss adds and how it was validated |
 | [Spec](docs/deepseek4/SPEC.md) | DeepSeek V4's forward pass as implemented |
 | [DeepSeek V4.1](docs/deepseek41/README.md) | V4.1 Flash (1017): which GGUFs load, packing, running it, quality and speed, its options |
+| [Decode expert helper](docs/EXPERT_HELPER.md) | opt-in CUDA second-GPU expert tier (`STRATA_GLM_EXPERT_HELPER`), CPU fallback, and memory-capacity comparisons |
 | [V4.1 spec](docs/deepseek41/SPEC.md) | what V4.1 changes against V4's forward pass, and where Abyss implements it |
 | [EXL3](docs/exl3/README.md) | exllamav3 quants of GLM-5.3-Flash: which PCs they suit, the quants offered, packing, measurements, settings |
 | [Maya docs](docs/maya/README.md) | Maya's documentation, unchanged: GLM-5.3-Flash, its installer (`./abyss.sh`), tuning, AMD, multi-GPU |

@@ -8,6 +8,7 @@
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "glm_memory.hpp"
+#include "glm_expert_helper.hpp"
 #include "glm_layer_graphs.hpp"
 
 #include "ggml.h"
@@ -560,6 +561,7 @@ struct Glm5Model::FastState {
     //      PCIe pulls and this pool, which computes its share from the pinned blobs meanwhile; the device adds the
     //      weighted sum (cpu_ans_h) before its down combine.  cpu_plan: how many of f RAM-tier experts go to the host.
     //      A split of 3+ GPUs shares one pool across its parts (fast_cpu_lane_setup).
+    std::unique_ptr<GlmExpertHelper> expert_helper;
     std::shared_ptr<glmfast::Workers> cpu_pool;
     int cpu_node = -1;                         // the NUMA node the pool is pinned to (-1: unpinned) ...
     std::vector<int> cpu_pin;                  // ... and its CPUs (the service thread runs there too)

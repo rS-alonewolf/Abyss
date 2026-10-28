@@ -1129,6 +1129,7 @@ bool Glm5Model::load(const std::string& gguf_path, int64_t max_ctx, std::string&
 void Glm5Model::reset() {
     if (!loaded_) return;
     cudaSetDevice(dev_);
+    expert_helper_decode_end();
     // The state zeroed on the stream that reads it next, and waited for: the fast path's streams are non-blocking, so
     // nothing orders a legacy-stream memset before them. Windows' HIP runtime submits queued work only when the host
     // waits on it - the next conversation's prompt read the previous one's state, and the memset landed in the middle

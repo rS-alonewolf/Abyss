@@ -39,6 +39,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <climits>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -1571,7 +1572,103 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->svc = std::thread([this] { fast_service(); });
         glmfast::pin_thread(F->svc.native_handle(), F->cpu_pin);   // (the CPU lane's last worker: on its pool's node)
     }
+    // Lazily allocate the opt-in tier after Prefill, so it cannot change the primary pool or prompt buffers.
+    if (const char* helper = getenv("STRATA_GLM_EXPERT_HELPER"); helper && std::strcmp(helper, "0") != 0) {
+        char* end = nullptr;
+        const long device = std::strtol(helper, &end, 10);
+        const char* cap = getenv("STRATA_GLM_EXPERT_HELPER_GIB");
+        char* cap_end = nullptr;
+        const double gib = cap ? std::strtod(cap, &cap_end) : 13.0;
+        const char* reason = nullptr;
+#if defined(STRATA_USE_HIP)
+        reason = "this prototype supports CUDA only";
+#endif
+        if (end == helper || *end || device < 0 || device > INT_MAX ||
+            (cap && (cap_end == cap || *cap_end)) || !std::isfinite(gib) || gib < 0.25 || gib > 128)
+            reason = "invalid device or VRAM budget";
+        else if (!g.v41 || n_parts_ != 1 || l0_ != 0 || l1_ != g.n_layers || exl3_)
+            reason = "requires an unsplit DeepSeek V4.1 native pack";
+        else if (!F->cpu_pool || !F->cpu_plan || F->igpu_experts)
+            reason = "requires the CPU lane without an iGPU lane";
+        if (reason) std::fprintf(stderr, "expert helper disabled: %s; using the existing lane\n", reason);
+        else F->expert_helper = std::make_unique<GlmExpertHelper>((int) device, (size_t) (gib * 1073741824.0));
+    }
     return true;
+}
+
+void Glm5Model::expert_helper_decode_begin(bool speculative) {
+    auto* F = fast_;
+    if (!F || !F->expert_helper || F->expert_helper->failed) return;
+    auto& H = *F->expert_helper;
+    H.active = false;
+    if (speculative || (getenv("STRATA_GLM_KDA_GRAPH") && std::atoi(getenv("STRATA_GLM_KDA_GRAPH")) != 0)) {
+        std::fprintf(stderr, "expert helper inactive: speculative decoding or layer graphs; using the CPU lane\n");
+        return;
+    }
+    std::string err;
+    if (!H.opened && !H.open(dev_, g_.n_embd, g_.n_ff_exp, g_.n_layers, g_.n_expert, err)) {
+        H.disable();
+        std::fprintf(stderr, "%s; using the CPU lane\n", err.c_str());
+        F->expert_helper.reset(); // No primary route has read its ownership table yet.
+        return;
+    }
+    // Keep the RAM sources stable until every helper upload completes.
+    if (!fast_boundary(err)) {
+        H.disable();
+        std::fprintf(stderr, "expert helper disabled: %s; using the CPU lane\n", err.c_str());
+        return;
+    }
+    std::lock_guard<std::mutex> lock(F->mu);
+    std::vector<std::vector<int>> ranked((size_t) g_.n_layers);
+    std::vector<size_t> blobs((size_t) g_.n_layers, 0);
+    for (int il = 0; il < g_.n_layers; ++il) {
+        const auto& layer = F->L[(size_t) il];
+        if (!layer.moe || layer.exl3 || F->cpu_fmt[(size_t) il].n_ff <= 0 ||
+            !gf::moe_supported(layer.gu_type) || !gf::moe_supported(layer.d_type)) continue;
+        blobs[(size_t) il] = layer.blob;
+        const int cls = F->layer_rc[(size_t) il];
+        if (cls < 0) continue;
+        const auto& ram = F->rc[(size_t) cls];
+        for (int e = 0; e < g_.n_expert; ++e) {
+            const int key = il * g_.n_expert + e, slot = F->ram_of[(size_t) key];
+            if (F->slot_of[(size_t) key] < 0 && slot >= 0 && ram.st[(size_t) slot] == FastState::kRHold)
+                ranked[(size_t) il].push_back(key);
+        }
+        auto& rank = ranked[(size_t) il];
+        std::stable_sort(rank.begin(), rank.end(), [&](int a, int b) {
+            return F->usage[(size_t) a] != F->usage[(size_t) b] ?
+                F->usage[(size_t) a] > F->usage[(size_t) b] : a < b;
+        });
+    }
+    const auto source = [&](int key) -> const uint8_t* {
+        const int il = key / g_.n_expert, slot = F->ram_of[(size_t) key], cls = F->layer_rc[(size_t) il];
+        if (slot < 0 || cls < 0) return nullptr;
+        const auto& ram = F->rc[(size_t) cls];
+        return ram.st[(size_t) slot] == FastState::kRHold ? ram.base + (size_t) slot * ram.stride : nullptr;
+    };
+    if (!H.prepare(ranked, blobs, source, err)) {
+        H.disable(); // Retires any queued upload before the RAM tier may change again.
+        std::fprintf(stderr, "%s; using the CPU lane\n", err.c_str());
+        F->expert_helper.reset();
+        return;
+    }
+    H.report("prepared");
+}
+
+void Glm5Model::expert_helper_decode_end() {
+    auto* F = fast_;
+    if (!F || !F->expert_helper) return;
+    auto& H = *F->expert_helper;
+    if (!H.active && !H.failed) return;
+    // Drain published routes before changing ownership or freeing a failed helper's buffers.
+    std::string err;
+    const bool drained = fast_boundary(err);
+    H.active = false;
+    if (H.failed) H.disable();
+    if (drained) {
+        H.report("request_end");
+        if (H.failed) F->expert_helper.reset();
+    }
 }
 
 // ---------------------------------------------------------------- the CPU lane
@@ -3140,6 +3237,10 @@ void Glm5Model::fast_destroy() {
     prefill_destroy();
     F->quit.store(true);
     if (F->svc.joinable()) F->svc.join();
+    if (F->expert_helper) {
+        F->expert_helper->report("destroy");
+        F->expert_helper.reset();
+    }
     if (const uint64_t mc = F->cpu_multi_calls.load(); mc > 0)
         std::fprintf(stderr, "glm fast CPU lane CUDA%d: %llu verify-window calls of %.2f columns each, %.2f experts read "
                              "for %.2f uses\n", dev_, (unsigned long long) mc,
@@ -3999,8 +4100,46 @@ void Glm5Model::fast_service() {
                     F->igpu_falls.fetch_add(1, std::memory_order_relaxed);
                 }
             }
-            if (rc != 0)
-                fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part, rq->xq_ok ? (const void*) rq->xq : nullptr);
+            if (rc != 0) {
+                auto* H = F->expert_helper.get();
+                if (!H || !H->active || H->failed) {
+                    fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part, rq->xq_ok ? (const void*) rq->xq : nullptr);
+                } else {
+                    int hn = 0, cn = 0, hi[8];
+                    float hw[8], cw[8];
+                    const uint8_t* cb[8];
+                    for (int i = 0; i < g.n_exp_used; ++i) if ((cm >> i) & 1u) {
+                        if (H->owns(rq->layer * g.n_expert + rq->ids[i])) {
+                            hi[hn] = rq->ids[i]; hw[hn++] = rq->w[i];
+                        } else {
+                            cb[cn] = (const uint8_t*) rq->cpu_src[i]; cw[cn++] = rq->w[i];
+                        }
+                    }
+                    bool ok = false;
+                    std::string helper_err;
+                    if (hn) {
+                        const auto& L = F->L[(size_t) rq->layer];
+                        ok = H->begin(rq->layer, hn, hi, hw, rq->x, L.gu_type, L.d_type, L.down_off,
+                                      g.swiglu_exp, helper_err);
+                    }
+                    if (ok) {
+                        if (cn) fast_cpu_experts(rq->layer, cn, cb, cw, rq->x, ans->part,
+                                                rq->xq_ok ? (const void*) rq->xq : nullptr);
+                        else std::fill(ans->part, ans->part + g.n_embd, 0.0f);
+                        ok = H->finish(ans->part, helper_err);
+                    }
+                    if (!ok) {
+                        if (hn) {
+                            ++H->fallbacks;
+                            H->disable();
+                            std::fprintf(stderr, "%s; CPU fallback for this and subsequent requests\n", helper_err.c_str());
+                        }
+                        // Recompute the entire original route; a partial helper result is never published.
+                        fast_cpu_experts(rq->layer, ne, blob, w, rq->x, ans->part,
+                                         rq->xq_ok ? (const void*) rq->xq : nullptr);
+                    }
+                }
+            }
             const auto t1 = std::chrono::steady_clock::now();
             std::atomic_thread_fence(std::memory_order_release);
             ans->seq = next;
@@ -5109,6 +5248,8 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     // the prefetch list of THIS route lives in the buffer of this layer's parity (the side stream may still
     // read the previous layer's list while this route writes)
     gf::MoeDev md = F->md;
+    if (F->expert_helper && F->expert_helper->active && !F->expert_helper->failed)
+        md.helper_owned = F->expert_helper->owned_d;
     md.pf_src = F->pf_buf[il & 1];
     md.pf_dst = F->pf_buf[il & 1] + 8;
     md.pf_n = F->pf_n_buf[il & 1];

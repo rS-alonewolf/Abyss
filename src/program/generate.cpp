@@ -1867,6 +1867,13 @@ static int glm_pack_generate(const Options& o) {
         if (stop_req.load()) finish = "cancel";
         const auto t1 = std::chrono::steady_clock::now();
         const auto st1 = model.fast_stats();
+        if (!stop_req.load())
+            model.expert_helper_decode_begin(model.spec_ready() || spec_k > 0 || o.spec > 0);
+        // Covers cancellation and every early error as well as the normal end of the request.
+        struct HelperScope {
+            strata::core::Glm5Model& model;
+            ~HelperScope() { model.expert_helper_decode_end(); }
+        } helper_scope{model};
         int64_t produced = 0;
         // one emitted token: the T line, the live tier counters every 8 tokens, the stop conditions (false: stop)
         // LOOP GUARD: a heavily quantized model can fall into repeating a short pattern ("0 0 0 ...") until the
@@ -2429,6 +2436,7 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         const auto t2 = std::chrono::steady_clock::now();
+        model.expert_helper_decode_end();
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
         // the decode phase's expert-tier counters (the fast path; zeros on the reference path)
