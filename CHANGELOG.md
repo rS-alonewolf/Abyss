@@ -7,6 +7,26 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.75 - 2026-10-28
+
+**An opt-in second-GPU expert helper for DeepSeek V4.1's decode on CUDA (PR #22 by tjm8874, following #21):
+[docs/EXPERT_HELPER.md](docs/EXPERT_HELPER.md).**
+
+- `STRATA_GLM_EXPERT_HELPER=<gpu>` keeps a pool of RAM-tier experts (`STRATA_GLM_EXPERT_HELPER_GIB`, default 13 GiB)
+  on a second visible GPU and computes them there during decode, instead of on the CPU lane. Prompts, attention,
+  Engram and the head stay on the primary GPU. Off by default.
+- Measured by the contributor (RTX PRO 4500 32 GB + RTX 5070 Ti 16 GB, PCIe 5.0 x8 each, 16K prompt / 2K answer):
+  decode 45.2 -> 49.8 tok/s (+10%) with the primary's full memory, 28.8 -> 36.8 tok/s (+28%) with the primary capped
+  at 16 GiB.
+- A missing GPU, a pool that does not fit or a helper error leaves the CPU lane in charge; an error mid-route
+  recomputes the whole route on the CPU and turns the helper off. Speculative decoding and layer graphs keep it off.
+  Short requests can lose more to placing the experts than they gain, hence off by default.
+- Scope: an unsplit native V4.1 pack on CUDA with a CPU lane (no iGPU lane). HIP builds it but leaves it off.
+- Checked here before merging (AI PRO R9700): no conflicts with v1.3.74, the HIP build passes, and with the helper
+  unset V4.1 and V4 give bit-identical token-path logits to v1.3.74; `STRATA_GLM_EXPERT_HELPER=1` on HIP prints
+  "disabled" and gives the same output. Not yet run on CUDA here.
+- MANUAL.ja and README.ja list it too.
+
 ## v1.3.74 - 2026-10-28
 
 **Qwen3.8-Flash-Next (qwen4exp) on the fast path (`--glm-pack`), with its prompt path, verify window and MTP drafter:

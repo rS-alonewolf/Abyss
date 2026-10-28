@@ -290,6 +290,7 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 | [移植の記録](docs/deepseek4/PORT.md) | Abyss が足したものと、その確認方法 |
 | [仕様](docs/deepseek4/SPEC.md) | 実装した DeepSeek V4 の計算 |
 | [DeepSeek V4.1](docs/deepseek41/README.md) | V4.1 Flash（1017）: 読める GGUF、pack、動かし方、品質と速さ、設定（英語） |
+| [デコード用エキスパートヘルパー](docs/EXPERT_HELPER.md) | CUDA で 2 枚目の GPU にエキスパートを置くオプション（`STRATA_GLM_EXPERT_HELPER`）、CPU への戻し方、メモリ量別の比較（英語） |
 | [V4.1 の仕様](docs/deepseek41/SPEC.md) | V4 の計算から V4.1 で変わる点と、Abyss での実装箇所（英語） |
 | [EXL3](docs/exl3/README.md) | GLM-5.3-Flash の exllamav3 量子化: 向いている PC、選べる量子化、pack、測定結果、設定（英語） |
 | [Maya のドキュメント](docs/maya/README.md) | Maya の文書をそのまま残したもの: GLM-5.3-Flash、インストーラ（`./abyss.sh`）、チューニング、AMD、複数 GPU |
