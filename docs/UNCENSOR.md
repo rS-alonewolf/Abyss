@@ -30,8 +30,9 @@ The edit removes refusals. It adds no knowledge, and what the model then writes 
 | an abliterated GGUF (huihui-ai's V4 0731 Q2, orcarouter's V4.1 Mix-256G, orcarouter's Qwen3.8-Flash-Next-Uncensored) | the whole model | that model | no | V4.1 Mix-256G: text KL 0.083 |
 
 The run-time edit needs no second copy of the model, keeps the ordinary model one request away, and on V4.1 costs a
-third of the abliterated GGUF's KL. Qwen3.8-Flash-Next (qwen4exp) runs on the older engine path, which has no
-`--uncensor`; use orcarouter's Uncensored GGUF for it.
+third of the abliterated GGUF's KL. Qwen3.8-Flash-Next (qwen4exp) runs on the fast path from v1.3.74
+([docs/qwen38](qwen38/README.md)), but no edit file has been built or measured for it; use orcarouter's Uncensored
+GGUF for it.
 
 ## How it works
 
@@ -199,7 +200,8 @@ For comparison, orcarouter's abliterated V4.1 Mix-256G (new weights) has a text 
 - **Two speed features stay off while a file is loaded**: the hc3 fusion of the CPU lane's answer and
   `STRATA_GLM_DEFER` (the FFN output must be complete when it is edited). With the file switched off they stay off too.
 - **One file per model.** Another quant of the same model has not been measured with these files; check the KL.
-- **`--glm-pack` models only.** Not on the older engine path (Qwen3.8-Flash-Next / qwen4exp, the Maya-era packs).
+- **`--glm-pack` models only.** Not on the older engine path (the Maya-era packs, Qwen3.8-Flash-Next's older pack);
+  Qwen3.8 on the fast path has no edit file yet.
 
 ## Older ways
 

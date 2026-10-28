@@ -37,8 +37,8 @@
 - 元のモデルにはリクエスト 1 つで戻せます。
 - V4.1 では、KL が abliterated の GGUF の 3 分の 1 以下です。
 
-Qwen3.8-Flash-Next（qwen4exp）は古いエンジン経路で動いていて、この経路には `--uncensor` がありません。Qwen3.8 では
-orcarouter の Uncensored の GGUF を使ってください。
+Qwen3.8-Flash-Next（qwen4exp）は v1.3.74 から速い経路で動きます（[docs/qwen38](qwen38/README.ja.md)）が、このモデル用の
+編集ファイルはまだ作っても測ってもいません。Qwen3.8 では orcarouter の Uncensored の GGUF を使ってください。
 
 ## 仕組み
 
@@ -217,7 +217,8 @@ AI PRO R9700 で測りました。
 - **ファイルを読み込んでいる間、速度の機能が 2 つ止まります。** CPU レーンの答えの hc3 融合と `STRATA_GLM_DEFER` です（FFN の
   出力がそろってから編集するため）。ファイルをオフにしていても止まったままです。
 - **ファイルはモデルごとに 1 本です。** 同じモデルの別の量子化では、これらのファイルを測っていません。KL を確かめてください。
-- **`--glm-pack` のモデルだけです。** 古いエンジン経路（Qwen3.8-Flash-Next / qwen4exp、Maya 時代の pack）では使えません。
+- **`--glm-pack` のモデルだけです。** 古いエンジン経路（Maya 時代の pack、Qwen3.8-Flash-Next の古い pack）では使えません。
+  速い経路の Qwen3.8 には、まだ編集ファイルがありません。
 
 ## 以前からある方法
 

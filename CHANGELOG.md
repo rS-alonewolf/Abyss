@@ -7,6 +7,27 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.74 - 2026-10-28
+
+**Qwen3.8-Flash-Next (qwen4exp) on the fast path (`--glm-pack`), with its prompt path, verify window and MTP drafter:
+[docs/qwen38](docs/qwen38/README.md) (日本語: [README.ja.md](docs/qwen38/README.ja.md)).**
+
+- Measured on an AI PRO R9700 with orcarouter's Uncensored IQ3_XXS against the older engine path: prompts at 30K
+  217 -> 1,037 tok/s; answers 52 -> 64-65 tok/s on prose and 66-85 -> 86 tok/s writing code (100-107 copying code);
+  a 31K prompt's passphrase found; a conversation's next turn reuses the cache (10,802 of 10,876 tokens, 0.28 s).
+  KL 0.026 (token path) / 0.035 (prompt path) against llama.cpp, whose own HIP-vs-CPU difference is 0.045.
+- `tools/iq_pack.py --fast` packs the model for the fast path (nothing converted to BF16). The drafter is the older
+  path's MTP runtime files, `STRATA_Q4X_MTP=<dir>` (experts kept in Q2_0 in VRAM, ~1 GB); its defaults are 4 drafts at
+  confidence 0.75 (`STRATA_Q35_MTP_K`, `STRATA_Q35_MTP_MIN`).
+- The pieces: the hyper-connections (their q8_1 written in the same kernels), the gated delta-net with a sigmoid
+  output gate, layer 1's PLE (read from the SSD on a thread, kept in the snapshot and rewound after a window), QSA's
+  block selection past 2,051 cells, top-k up to 16, IQ4_NL experts, i-quant projections in the multi-column GEMV.
+- Fixed on the way: the prompt path's MMQ read past a 640-wide down matrix into a slot's unset tail (NaN rows; the tail
+  is now zeroed, only when the width is not a multiple of 512); the prompt attention kernel skipped a 12-head group.
+- Other models: token path bit-identical to v1.3.73 on V4.1, V4, GLM-5.3-Flash and Ornith; prompt path within its
+  run-to-run spread.
+- NVIDIA: this path has not been built or measured there yet.
+
 ## v1.3.73 - 2026-10-28
 
 **Docs only: the config files on one page, [docs/SETTINGS.md](docs/SETTINGS.md) (日本語:
