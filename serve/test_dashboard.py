@@ -180,7 +180,7 @@ class GpuRelease(unittest.TestCase):
         sleep.assert_called_once()
 
 
-class AmdTelemetry(unittest.TestCase):
+class AmdTelemetry(unittest.TestCase):  # (serve/test_telemetry.py has the rest of the readings)
     """Issue #14: a HIP run reads its AMD card from sysfs, not NVML's card 0 (an NVIDIA display card beside it)."""
 
     def test_reads_the_amd_card_from_sysfs(self):
@@ -213,6 +213,70 @@ class AmdTelemetry(unittest.TestCase):
             tel = T.Telemetry(gpu_index=0, amd=[(0, None, "gfx1201")])
         nvml.assert_not_called()
         self.assertIsNone(tel.static["gpu_name"])
+
+
+
+class TerminalFields(unittest.TestCase):
+    """Phase 1.5 of Abyss Terminal: what /metrics adds for it - the run's name with its quant, drafts per request and in
+    total, every STAT key's series, and the cards' roles from the run config."""
+
+    def test_label_drafts_and_tier_series(self):
+        from serve import server as SV
+        tok = ByteTokenizer()
+
+        class Drafting(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                try:
+                    yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+                finally:                                      # (the server closes it at the end-of-turn token)
+                    self.last = {"generated": 3, "prompt_tokens": len(ids), "prompt_ms": 10.0, "decode_ms": 30.0,
+                                 "finish": "stop", "drafts_accepted": 5, "drafts_offered": 8, "reused": 0}
+
+        eng = Drafting(tok, "</think>\n\nhi")
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.label = {"display_name": "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS", "quant": "UD-IQ2_XXS",
+                     "config": "abyss-dsv41.json", "backend": "hip"}
+        for _ in range(2):
+            list(svc.run(tok.encode("hello"), False, None, 16, {}, SV.threading.Event()))
+        eng.stat_history = [{"tok_s": 30.0, "disk_ms": 12.5, "lane": "igpu", "time": 1.0}, {"tok_s": 31.0, "time": 2.0}]
+        eng.stat = eng.stat_history[-1]
+        m = svc.metrics()
+        self.assertEqual((m["engine"]["display_name"], m["engine"]["quant"], m["engine"]["backend"]),
+                         ("DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS", "UD-IQ2_XXS", "hip"))
+        self.assertEqual((m["requests"][0]["drafts_accepted"], m["requests"][0]["drafts_offered"]), (5, 8))
+        self.assertEqual((m["totals"]["drafts_accepted"], m["totals"]["drafts_offered"]), (10, 16))
+        h = m["tiers"]["history"]
+        self.assertEqual(h["disk_ms"], [12.5, None])          # a new numeric key gets its series, None where absent
+        self.assertEqual(h["tok_s"], [30.0, 31.0])
+        self.assertNotIn("lane", h)                           # text keys stay in tiers.now only
+        self.assertIn("promo", h)                             # the six old series are always there
+
+    def test_roles_igpu_and_drives_from_the_config(self):
+        from unittest import mock
+        from serve import server as SV
+        self.assertEqual(SV.gpu_roles({"env": {"STRATA_GLM_EXPERT_HELPER": "1"}}, [0, 1]), {0: "main", 1: "helper"})
+        self.assertEqual(SV.gpu_roles({}, [0, 2]), {0: "main", 2: "split"})
+        nodes = [{"index": 0, "arch": "gfx1201", "igpu": False, "pci": "0000:c7:00.0"},
+                 {"index": 1, "arch": "gfx1151", "igpu": True, "pci": "0000:c8:00.0"}]
+        with mock.patch.object(SV, "amd_gpu_nodes", return_value=nodes):
+            self.assertEqual(SV.igpu_lane_device({"backend": "hip"}, [0]), (1, "0000:c8:00.0", "gfx1151"))
+            self.assertEqual(SV.igpu_lane_device({}, [0]), (None, "0000:c8:00.0", "gfx1151"))     # CUDA: no HIP number
+            self.assertIsNone(SV.igpu_lane_device({"backend": "hip", "env": {"STRATA_GLM_IGPU": "0"}}, [0]))
+            self.assertIsNone(SV.igpu_lane_device({"backend": "hip"}, [1]))                       # the model's own card
+        self.assertEqual(SV.model_drives({"env": {"STRATA_GLM_MIRROR": "/ssd2/m:/ssd3/m"}}, "/m"),
+                         [("model", "/m"), ("mirror", "/ssd2/m"), ("mirror", "/ssd3/m")])
+
+    def test_model_label(self):
+        from serve import server as SV
+        with tempfile.TemporaryDirectory() as d:
+            for i in (1, 2):
+                Path(d, f"DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-0000{i}-of-00002.gguf").write_bytes(b"x")
+            self.assertEqual(SV.model_label(d), ("DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS", "UD-IQ2_XXS"))
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "Qwen3.5-122B-IQ3_XXS-B2.gguf").write_bytes(b"x")
+            self.assertEqual(SV.model_label(d), ("Qwen3.5-122B-IQ3_XXS-B2", "IQ3_XXS"))
+            self.assertEqual(SV.model_label(Path(d, "none")), (None, None))
+        self.assertEqual(SV.model_label(None), (None, None))
 
 
 if __name__ == "__main__":

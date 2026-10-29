@@ -172,6 +172,7 @@ ENGINE_STALL_S = _stall_seconds()
 STALL_CPU_SHARE = 0.02      # the engine may use 2% of one core over the window and still count as stuck: its idle
                             # threads' polls (the GLM service threads sleep 2 ms at a time when quiet); work is cores
 STALL_IO_EPS_B = 1 << 20    # bytes it may read or write in that window
+TIER_SERIES = ("tok_s", "ms_tok", "vram_hit", "ram_fetch", "disk", "promo")   # /metrics tiers.history: these first
 STALL_GPU_BUSY = 5.0        # a GPU busier than this (%, NVML) is work
 
 
@@ -977,6 +978,70 @@ def hip_gpu_list(cfg: dict) -> list[int]:
     return gpus
 
 
+def _cfg_env(cfg: dict, key: str) -> str:
+    """An engine setting as the engine will see it: the config's "env" first, then this server's environment."""
+    v = (cfg.get("env") or {}).get(key)
+    return str(v if v is not None else os.environ.get(key, ""))
+
+
+def gpu_roles(cfg: dict, gpus: list[int]) -> dict:
+    """{GPU number: "main" | "split" | "helper"} for the Monitor: the first card holds the model, the others a layer
+    split's share - but the STRATA_GLM_EXPERT_HELPER card (its place in the visible list, docs/EXPERT_HELPER.md)
+    only holds decode experts beside it."""
+    roles = {g: "main" if n == 0 else "split" for n, g in enumerate(gpus)}
+    helper = _cfg_env(cfg, "STRATA_GLM_EXPERT_HELPER").strip()
+    if helper.isdigit() and 0 < int(helper) < len(gpus):
+        roles[gpus[int(helper)]] = "helper"
+    return roles
+
+
+def igpu_lane_device(cfg: dict, gpus: list[int]) -> tuple | None:
+    """(HIP number or None, PCI address, arch) of the integrated Radeon the iGPU lane can compute on, for the Monitor -
+    None when the lane is off (STRATA_GLM_IGPU=0), there is none, the model itself runs on it or a HIP layer split
+    leaves it out (child_env lists it only beside one discrete card).  A CUDA run numbers it nowhere: None."""
+    if _cfg_env(cfg, "STRATA_GLM_IGPU").strip() == "0":
+        return None
+    hip = cfg.get("backend") == "hip"
+    if hip and len(gpus) > 1:
+        return None
+    node = next((g for g in amd_gpu_nodes() if g["igpu"]), None)
+    if node is None or (hip and node["index"] in gpus):
+        return None
+    return (node["index"] if hip else None), node["pci"], node["arch"]
+
+
+def model_drives(cfg: dict, model_dir) -> list[tuple[str, str]]:
+    """[(role, folder)] whose drives the Monitor reads: the model's shards ("model") and each STRATA_GLM_MIRROR copy
+    ("mirror", folders separated by ':')."""
+    out = [("model", str(model_dir))] if model_dir else []
+    for d in _cfg_env(cfg, "STRATA_GLM_MIRROR").split(":"):
+        if d.strip():
+            out.append(("mirror", d.strip()))
+    return out
+
+
+QUANT_RE = re.compile(r"(?:UD-)?(?:IQ\d_[A-Z]+|Q\d_K(?:_[A-Z]+)?|Q\d_\d|MXFP4|BF16|F16|F32)(?![A-Za-z0-9])")
+
+
+def model_label(model_dir) -> tuple[str | None, str | None]:
+    """(the model's name with its quant, the quant) from its GGUF set, as `--bench` names it (abyss.py model_key: the
+    first shard's name without "-00001-of-0000N", else the largest .gguf): ("DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS",
+    "UD-IQ2_XXS").  None for what can't be told (no GGUF beside the pack: EXL3)."""
+    try:
+        names = sorted(p.name for p in Path(model_dir).glob("*.gguf")) if model_dir else []
+    except OSError:
+        names = []
+    first = [n for n in names if re.search(r"-00001-of-\d{5}\.gguf$", n)]
+    if first:
+        stem = re.sub(r"-00001-of-\d{5}\.gguf$", "", first[0])
+    elif names:
+        stem = Path(max(names, key=lambda n: (Path(model_dir) / n).stat().st_size)).stem
+    else:
+        return None, None
+    q = QUANT_RE.findall(stem)
+    return stem, (q[-1] if q else None)
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -1071,7 +1136,7 @@ class Service:
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
-                       "prompt_ms": 0.0, "decode_ms": 0.0}
+                       "prompt_ms": 0.0, "decode_ms": 0.0, "drafts_accepted": 0, "drafts_offered": 0}
         self.last_timings = None                         # the last finished request's, llama.cpp's names (/v1/status)
         self.last_request_at = None                      # when a request last started or finished
         self.started_at = time.time()
@@ -1079,6 +1144,8 @@ class Service:
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.config_path = None                          # the run config (a context change is saved into it)
         self.model_dir = None                            # the model's folder (free disk on the dashboard)
+        # what the Monitor and Abyss Terminal name the run by (main: the config, the GGUF set): /metrics "engine"
+        self.label = {"display_name": None, "quant": None, "config": None, "backend": None}
         self.trained_context = None                      # what the model was trained for (its GGUF): the slider's top
         self.reload = None                               # a context change: {state, from, to, started, error}
         self.updater = Updater(MAYA_VERSION)             # About > Updates: a newer release, and updating to it
@@ -1281,14 +1348,16 @@ class Service:
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
                                        gpu_indices=getattr(self, "gpu_indices", None),
-                                       amd=getattr(self, "amd_gpus", None))
+                                       amd=getattr(self, "amd_gpus", None), roles=getattr(self, "gpu_roles", None),
+                                       igpu=getattr(self, "igpu", None), drives=getattr(self, "drives", None))
             if isinstance(self.engine, StrataEngine):
                 self.engine.gpu_busy = self._gpu_busy     # the stall watchdog's third sign of work
 
     def _gpu_busy(self) -> bool:
-        """Any of the engine's GPUs busier than STALL_GPU_BUSY in the telemetry's last sample (one a second)."""
+        """Any of the engine's GPUs busier than STALL_GPU_BUSY in the telemetry's last sample (one a second); the
+        iGPU lane's Radeon is not counted - it also draws the desktop."""
         now = self.telemetry.now
-        utils = [g.get("util") for g in now.get("gpus") or []] or [now.get("gpu_util")]
+        utils = [g.get("util") for g in now.get("gpus") or [] if g.get("role") != "igpu"] or [now.get("gpu_util")]
         return any(isinstance(u, (int, float)) and u > STALL_GPU_BUSY for u in utils)
 
     def _tok_s(self):
@@ -1347,17 +1416,20 @@ class Service:
             live["prompt_read"], live["prompt_total"] = progress
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
-                  "trained_context": self.trained_context}
+                  "trained_context": self.trained_context, **self.label}
         with self.status_lock:
             reload = dict(self.reload) if self.reload else None
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
-        # the GLM engine's expert tiers (STAT lines): the latest reading and the recent series for the sparklines
+        # the GLM engine's expert tiers (STAT lines): the latest reading and the recent series for the sparklines -
+        # every numeric key the lines carried, so keys a newer engine adds have their series too (None where a line
+        # had no such key)
         tiers = None
         stat = getattr(self.engine, "stat", None)
         if stat:
             sh = list(getattr(self.engine, "stat_history", []) or [])
-            tiers = {"now": stat, "history": {k: [s.get(k) for s in sh] for k in
-                                              ("tok_s", "ms_tok", "vram_hit", "ram_fetch", "disk", "promo")}}
+            keys = list(TIER_SERIES) + sorted({k for st in sh for k, v in st.items()
+                                               if k != "time" and k not in TIER_SERIES and isinstance(v, (int, float))})
+            tiers = {"now": stat, "history": {k: [s.get(k) for s in sh] for k in keys}}
         return {"engine": engine, "live": live, "tiers": tiers, "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -1676,7 +1748,9 @@ class Service:
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None,
-                        "hit_rate": hit_rate})
+                        "hit_rate": hit_rate,
+                        # the drafter's proposals this request (MTP / NextN / DSpark): None without a DONE that says
+                        "drafts_accepted": last.get("drafts_accepted"), "drafts_offered": last.get("drafts_offered")})
                     t = self.totals
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
@@ -1684,6 +1758,8 @@ class Service:
                     t["output_tokens"] += n
                     t["prompt_ms"] += last.get("prompt_ms") or 0.0
                     t["decode_ms"] += last.get("decode_ms") or 0.0
+                    t["drafts_accepted"] += last.get("drafts_accepted") or 0
+                    t["drafts_offered"] += last.get("drafts_offered") or 0
                     fresh = getattr(self.engine, "last", None)
                     if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                         timings = request_timings(len(ids), n, last)
@@ -2949,6 +3025,10 @@ def main() -> int:
         nodes = {g["index"]: g for g in amd_gpu_nodes()}
         svc.amd_gpus = [(i, nodes[i]["pci"] if i in nodes else None, nodes[i]["arch"] if i in nodes else "")
                         for i in (hip_gpu_list(cfg) or [0])]
+    cards = hip_gpu_list(cfg) if cfg.get("backend") == "hip" else gpu_list(cfg)
+    if a.engine == "strata":                            # the cards' roles and the iGPU lane's Radeon (the Monitor)
+        svc.gpu_roles = gpu_roles(cfg, cards or [0])
+        svc.igpu = igpu_lane_device(cfg, cards or [0])
     if a.config:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
     args = [str(x) for x in cfg.get("args") or []]
@@ -2956,6 +3036,13 @@ def main() -> int:
         svc.model_dir = Path(args[args.index("--glm-pack") + 1]).resolve().parent
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
                          daemon=True).start()
+    name, quant = model_label(svc.model_dir)
+    # the quant: the GGUF name's, else the installer's pick (its model list's name: "Maya-S-v2-IQ2_XXS", "EXL3-3.05bpw")
+    svc.label = {"display_name": name or (cfg.get("installer") or {}).get("quant") or None,
+                 "quant": quant or (cfg.get("installer") or {}).get("quant") or None,
+                 "config": Path(a.config).name if a.config else None,
+                 "backend": (cfg.get("backend") or "cuda") if a.engine == "strata" else "mock"}
+    svc.drives = model_drives(cfg, svc.model_dir) if a.engine == "strata" else None
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:
