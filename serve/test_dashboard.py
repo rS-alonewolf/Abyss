@@ -279,5 +279,135 @@ class TerminalFields(unittest.TestCase):
         self.assertEqual(SV.model_label(None), (None, None))
 
 
+class Shutdown(unittest.TestCase):
+    """POST /api/shutdown: allowed with an API key or from this PC, as JSON from no foreign page; the request in flight is
+    cut first, and an engine that does not stop it is killed."""
+
+    def setUp(self):
+        tok = ByteTokenizer()
+        self.svc = Service(MockEngine(tok, "</think>\n\nhello"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, body=b"{}", headers=None):
+        h = {"Content-Type": "application/json", **(headers or {})}
+        r = urllib.request.Request(self.base + "/api/shutdown", method="POST", data=body, headers=h)
+        try:
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read() or b"{}")
+
+    def test_from_this_pc_without_a_key(self):
+        s, j = self.post(b'{"force": true}')
+        self.assertEqual((s, j["shutdown"]["force"], j["shutdown"]["request_in_flight"]), (202, True, False))
+        self.assertTrue(self.svc.quit.is_set())
+        self.assertTrue(self.svc.quit_force)
+
+    def test_refused(self):
+        from unittest import mock
+        from serve import server as SV
+        self.assertEqual(self.post(headers={"Content-Type": "text/plain"})[0], 415)        # a form can't send it
+        self.assertEqual(self.post(headers={"Origin": "http://evil.example"})[0], 403)    # nor another site's page
+        with mock.patch.object(SV, "is_loopback", return_value=False):
+            s, j = self.post()
+            self.assertEqual(s, 403)
+            self.assertIn("API key", j["error"]["message"])
+            self.svc.api_key = "k"
+            self.assertEqual(self.post()[0], 401)                                          # a key: it must be sent
+            self.assertEqual(self.post(headers={"Authorization": "Bearer k"})[0], 202)     # ... and then from anywhere
+        self.svc.quit.clear()
+        self.svc.allow_shutdown = False
+        self.assertEqual(self.post(headers={"Authorization": "Bearer k"})[0], 403)
+        self.assertFalse(self.svc.quit.is_set())
+
+    def test_loopback(self):
+        from serve.server import is_loopback
+        for a, want in (("127.0.0.1", True), ("127.8.0.1", True), ("::1", True), ("::ffff:127.0.0.1", True),
+                        ("100.64.1.2", False), ("192.168.1.5", False), ("fe80::1%eth0", False), ("x", False)):
+            self.assertEqual(is_loopback(a), want, a)
+
+
+class CutInFlight(unittest.TestCase):
+    class Engine:
+        def __init__(self, svc, stops):
+            self.svc, self.stops, self.ended = svc, stops, None
+
+        def stop(self):
+            if self.stops:                                    # a working engine: the request ends at its next step
+                self.svc.fifo.release()
+
+        def _end(self, why):                                  # a killed engine: the request ends with an error
+            self.ended = why
+            if not self.stops:
+                self.svc.fifo.release()
+
+    def svc(self):
+        from serve import server as SV
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.fifo.acquire()                                    # a request holds the engine
+        svc.status["busy"] = True
+        return SV, svc
+
+    def test_a_working_engine_stops_the_request(self):
+        SV, svc = self.svc()
+        eng = self.Engine(svc, stops=True)
+        self.assertEqual(SV.cut_in_flight(svc, eng, wait_s=2), "stopped")
+        self.assertIsNone(eng.ended)
+
+    def test_a_runaway_engine_is_killed(self):
+        SV, svc = self.svc()
+        eng = self.Engine(svc, stops=False)
+        t = time.time()
+        self.assertEqual(SV.cut_in_flight(svc, eng, wait_s=0.3), "killed")
+        self.assertIsNotNone(eng.ended)
+        self.assertLess(time.time() - t, 5)
+
+    def test_idle_and_force(self):
+        from serve import server as SV
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        eng = self.Engine(svc, stops=True)
+        self.assertEqual(SV.cut_in_flight(svc, eng), "idle")
+        self.assertEqual(SV.cut_in_flight(svc, eng, force=True), "killed")       # force: ended even when idle
+        self.assertIsNotNone(eng.ended)
+
+
+class ShutdownProcess(unittest.TestCase):
+    """The whole server ends on POST /api/shutdown (the mock engine: no GPU)."""
+
+    def test_the_server_exits(self):
+        import socket
+        import subprocess
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        p = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "mock", "--port", str(port)],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(ROOT))
+        try:
+            for _ in range(100):
+                try:
+                    urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1).close()
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            r = urllib.request.Request(f"http://127.0.0.1:{port}/api/shutdown", method="POST", data=b"{}",
+                                       headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                self.assertEqual(resp.status, 202)
+            self.assertEqual(p.wait(timeout=20), 0)
+            self.assertIn("asked over HTTP", p.stdout.read())
+        finally:
+            if p.poll() is None:
+                p.kill()
+                p.wait()
+            p.stdout.close()
+
 if __name__ == "__main__":
     unittest.main()

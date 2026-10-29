@@ -652,6 +652,8 @@ class StrataEngine:
         """QUIT, then wait for the engine to end: with kept conversations (STRATA_GLM_SLOT_KEEP) it first writes the
         one it holds, so it gets STRATA_ENGINE_QUIT_S seconds (50; llama-swap's unloadTimeout should exceed it)."""
         wait = float(os.environ.get("STRATA_ENGINE_QUIT_S", "50") or 50)
+        if self.proc.poll() is not None:                # already ended (killed by a forced shutdown)
+            return
         try:
             if self.can_stop:                           # a request in flight ends at its next step first: QUIT
                 self.proc.stdin.write("STOP\n")         # alone lets it run to max_tokens before the engine ends
@@ -1129,6 +1131,9 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.fifo = threading.Lock()
         self.stopping = False            # the server is ending: a request still queued is refused, not started
+        self.quit = threading.Event()    # POST /api/shutdown: main() ends the server (cut_in_flight, then the engine)
+        self.quit_force = False          # ... killing the engine instead of asking it to end
+        self.allow_shutdown = True       # the run config's "allow_shutdown": false turns POST /api/shutdown off
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
@@ -2247,6 +2252,39 @@ def key_list(value) -> list[str]:
     return [k.strip() for k in str(value).split(",") if k.strip()]
 
 
+def is_loopback(addr: str) -> bool:
+    """A client on this PC itself (127.0.0.0/8, ::1, an IPv4-mapped 127.x).  A reverse proxy here - `tailscale serve`,
+    nginx - makes every client look like this: give such a server an API key."""
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return False
+    return ip.is_loopback or (ip.version == 6 and ip.ipv4_mapped is not None and ip.ipv4_mapped.is_loopback)
+
+
+def cut_in_flight(svc: Service, engine, wait_s: float = 15.0, force: bool = False) -> str:
+    """POST /api/shutdown: the request in flight ends now instead of being wrapped up - STOP (its answer is cut at the
+    next step), then up to `wait_s` for it to let go of the FIFO.  An engine that does not get there (a runaway: stuck
+    in a kernel, deaf to STOP) or `force` is killed: the request then ends with an error and lets go itself.
+    -> "idle" | "stopped" | "killed" | "stuck" (killed, and the request still did not end: the server ends anyway)."""
+    with svc.status_lock:
+        busy = bool(svc.status.get("busy"))
+    if busy and not force and hasattr(engine, "stop"):
+        engine.stop()
+        if svc.fifo.acquire(timeout=wait_s):
+            svc.fifo.release()
+            return "stopped"
+        print(f"[abyss] stopping: the engine did not stop the request in {wait_s:.0f} s - ending it", flush=True)
+    if not (busy or force) or not hasattr(engine, "_end"):
+        return "idle" if not busy else "stuck"
+    engine._end("stopping: the engine is ended (POST /api/shutdown)")
+    if svc.fifo.acquire(timeout=20):
+        svc.fifo.release()
+        return "killed"
+    return "stuck"
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
@@ -2461,6 +2499,9 @@ def make_handler(svc: Service):
                 if path == "/api/update":
                     self._update()
                     return
+                if path == "/api/shutdown":
+                    self._shutdown()
+                    return
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("the request body must be a JSON object")
@@ -2560,6 +2601,36 @@ def make_handler(svc: Service):
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
             self._json(202, {"update": state})
+
+        def _shutdown(self):
+            # Ends the server and the engine for every client (a runaway engine, Abyss Terminal's quit-and-stop): only
+            # with an API key configured (do_POST checked it) or from this PC itself, and only as JSON from no foreign
+            # page - without a key, a web page open in a browser here could otherwise post it to 127.0.0.1
+            body = self._body()
+            if not svc.allow_shutdown:
+                self._json(403, {"error": {"type": "permission_error",
+                                           "message": "stopping the server over HTTP is off (\"allow_shutdown\": false "
+                                                      "in the run config)"}})
+                return
+            if not svc.api_key and not is_loopback(self.client_address[0]):
+                self._json(403, {"error": {"type": "permission_error",
+                                           "message": "without an API key the server can only be stopped from this PC "
+                                                      "(set \"api_key\" in the run config to allow it from others)"}})
+                return
+            if not self._own_page("the server can be stopped"):
+                return
+            try:
+                req = json.loads(body or b"{}")
+            except ValueError:
+                req = {}
+            force = bool(req.get("force")) if isinstance(req, dict) else False
+            with svc.status_lock:
+                busy = bool(svc.status.get("busy"))
+            print(f"[abyss] stopping: asked over HTTP by {self.client_address[0]}"
+                  f"{' (force: the engine is ended at once)' if force else ''}", flush=True)
+            svc.quit_force = force
+            svc.quit.set()                                  # main() takes it from here (this answer still goes out)
+            self._json(202, {"shutdown": {"state": "stopping", "request_in_flight": busy, "force": force}})
 
         def _settings(self):
             # They change what every client gets, so only the app's own page may set them
@@ -2731,7 +2802,7 @@ class Server(ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 
-SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB")
+SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_SHUTDOWN_WAIT_S")
 
 
 def apply_server_env(cfg: dict) -> None:
@@ -3019,6 +3090,7 @@ def main() -> int:
     if svc.think_budget:
         print(f"[maya] thinking budget: {svc.think_budget} tokens (then the answer)", flush=True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
+    svc.allow_shutdown = cfg.get("allow_shutdown", True) is not False
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
     if cfg.get("backend") == "hip":                     # AMD: those cards from sysfs, never NVML's card 0 (issue #14)
@@ -3099,16 +3171,27 @@ def main() -> int:
         import signal
         signal.signal(signal.SIGTERM, on_term)
     try:
-        threading.Event().wait()
+        while not svc.quit.wait(0.5):                   # POST /api/shutdown sets it; Ctrl+C / SIGTERM interrupt it
+            pass
     except KeyboardInterrupt:
-        stop.set()
-        if os.name != "nt":
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        httpd.shutdown()
+        pass
+    stop.set()
+    if os.name != "nt":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    httpd.shutdown()
+    svc.stopping = True
+    if svc.quit.is_set():
+        # asked over HTTP - often because the engine runs away: the request in flight is cut, not wrapped up, and
+        # an engine that does not stop it in STRATA_SHUTDOWN_WAIT_S seconds (15) is killed
+        how = cut_in_flight(svc, engine, float(os.environ.get("STRATA_SHUTDOWN_WAIT_S", "15") or 15),
+                            force=svc.quit_force)
+        if how != "idle":
+            print(f"[abyss] stopping: the request in progress was {'cut' if how == 'stopped' else 'ended with the engine'}",
+                  flush=True)
+    else:
         # a request in progress is wrapped up, not dropped: its thinking is closed and it answers, for up to
         # STRATA_ENGINE_WRAP_S seconds (40), so the client still gets an answer and the turn ends; past that it is cut.
         # Requests still queued are refused. Then the engine ends (and keeps its conversation).
-        svc.stopping = True
         wrap_s = float(os.environ.get("STRATA_ENGINE_WRAP_S", "40") or 0)
         if wrap_s > 0 and hasattr(engine, "wrap") and svc.status.get("busy"):
             print(f"[maya] stopping: the request in progress closes its thinking and answers (up to {wrap_s:.0f} s)",
@@ -3124,12 +3207,12 @@ def main() -> int:
                 # last lines are read by the request and not by close()
                 with svc.fifo:
                     pass
-        if hasattr(engine, "close"):
-            engine.close()
-        if vision:
-            vision.close()
-        if hub is not None:
-            hub.close()
+    if hasattr(engine, "close"):
+        engine.close()
+    if vision:
+        vision.close()
+    if hub is not None:
+        hub.close()
     return 0
 
 
