@@ -46,6 +46,9 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
 - **生成は llama.cpp の約 3 倍、prompt の読み込みは約 5 倍**（同じ GGUF・同じマシン。llama.cpp は `-ncmoe` で調整した状態。エキスパートを CPU に置いた llama.cpp と比べると 10 倍以上）。prompt は約 1,600〜3,300 tok/s、生成は約 92〜95 tok/s
 - **長いコンテキストでも落ちない** — lightning indexer と prompt の attention を tensor core で計算する。125K トークンの prompt を約 2,800 tok/s で読み、125K でも生成は約 65 tok/s
 - **AMD APU の内蔵 GPU を 2 本目のレーンに** — Ryzen AI Max では Radeon の内蔵 GPU が RAM 層のエキスパートをその場で計算する。生成でも prompt でも使う（ROCm。起動時に CPU より速ければ使う）
+- **RAID なしで SSD を 2 枚（オプトイン）** — モデルのシャードを 2 枚目の NVMe にコピーして `STRATA_GLM_MIRROR=<フォルダ>`
+  を指定すると、エキスパートを読むたびに早く終わりそうな方の SSD から読む。SSD 待ち −20%、GPU 32 GB + メモリ 64 GB の
+  DeepSeek V4.1 UD-IQ2_XXS は、2 枚目が半分の速さの USB4 でも 21% 速くなった（[SSD2](docs/SSD2.ja.md)）
 - **ドラフトモデルなしの投機デコード** — prompt や応答に出てきた並び（n-gram）を候補にして、次のトークンと一緒に 1 回で確かめる。出力は同じで、コードで +10〜13%。既定でオン
 - **DeepSeek の DSpark ドラフトモデル（任意）** — DeepSeek V4 の 3 層が本体の 40〜42 層の出力を読んで次の 5 トークンを下書きし、最大 6 トークンの検証の窓でまとめて確かめる。AI PRO R9700 の swe-bench で +28%（内蔵 GPU なしで 48.4 → 61.9 tok/s）。VRAM を約 6.5 GB 使う
 - **実行時の無検閲化（任意）** — `--uncensor <file>` で、動かしながら残差への書き込みすべてから拒否の方向を取り除く。
@@ -69,9 +72,10 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
 | | huihui-ai の abliterated Q2、antirez の deepseek-v4-gguf（`--compat-bf16`） | 約 83 GB | 動作確認済み（llama.cpp との KL 0.0075） |
 | | unsloth のほかの量子化で、expert の型が IQ1_S〜IQ4_XS、Q2_K〜Q6_K、MXFP4 のもの | | 動くはず、未確認 |
 | | DeepSeek の DSpark ドラフトモデル（bleysg の [GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF)、`--dspark`、v1.3.43） | 6.9 GB | AI PRO R9700 で計測済み（swe-bench +28%）。NVIDIA はビルドのみ、未計測 |
-| DeepSeek V4.1 Flash 1017 | unsloth の [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)（v1.3.46 からのおすすめ） | 300 GB | 計測済み: nazeshinjite Q2 と同じ速さで KL 0.186（Q2 は 0.228） |
+| DeepSeek V4.1 Flash 1017 | unsloth の [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)、2026-10-28 の再アップロード版（品質重視のおすすめ） | 300 GB | AI PRO R9700 で計測済み: KL 0.141（旧版 0.188）、swe-bench 8 問で GPU 32 GB + メモリ 96 GB 33.9 tok/s、32 GB + 64 GB 29.5 tok/s（[どれを選ぶか](docs/deepseek41/README.md#ggufs-that-load)） |
+| | unsloth の [UD-IQ1_M](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)、2026-10-28 の再アップロード版（速さ重視のおすすめ） | 250 GB | 同じ測り方で: KL 0.199（旧版 0.270）、32 GB + 96 GB で **40.6 tok/s**、32 GB + 64 GB で 30.5 tok/s |
 | | nazeshinjite の [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) | 366 GB | 計測済み、swe-bench 最初の35問中34 |
-| | unsloth の [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)（v1.3.38）、UD-IQ1_M | 233 / 266 GB | 計測済み: 速いが品質は下がる（KL 0.36 / 0.27） |
+| | unsloth の [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF)（2026-10-28 の再アップロード版） | 233 GB | 計測済み: 動くがおすすめしない（KL 0.257、旧版 0.36） |
 | | mrfakename の Q2_K、Lucebox の dense + Engram と mrfakename の expert の組み合わせ（ハイブリッド） | 247 / 201 GB | 動作確認済み: 単体では低品質 / 最も正確だが遅い |
 | | unsloth のほかの量子化、Project Maya の Maya-S | 178〜508 GB | UD-IQ1_S と同じ形式、未確認 |
 | | ISTA-DASLab の [GSQ-RCO](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) IQ2_XXS / IQ1_M（v1.3.53、Engram の表は別の GGUF） | 138 / 121 GB | AI PRO R9700 で計測済み: KL 0.31 / 0.38。サイズは Engram の表を除いた値。表を除くと UD-IQ1_M は 139.5 GB で KL 0.27 なので、同じサイズなら unsloth のほうが良い（v1.3.53 で「サイズあたりの品質が最も高い」と書いたのは、表を含むサイズと含まないサイズを比べた誤り） |
@@ -284,6 +288,7 @@ FP32 のものと 2e-6 程度で一致し、投機デコードは 1 トークン
 | --- | --- |
 | [マニュアル](docs/MANUAL.ja.md) · [Manual](docs/MANUAL.md) | セットアップ、設定、API、複数 GPU、AMD、設定項目、トラブル対応 |
 | [設定ファイル](docs/SETTINGS.ja.md) · [Config files](docs/SETTINGS.md) | 設定ファイルと起動スクリプトの場所、変えたいこと別の書き換え場所、全項目、書き換えたあとの反映 |
+| [SSD を 2 枚](docs/SSD2.ja.md) · [Two SSDs](docs/SSD2.md) | `STRATA_GLM_MIRROR`: 2 枚目の NVMe に置いたモデルの写しを 1 枚目と一緒に読む、実測、必要な容量 |
 | [無検閲化](docs/UNCENSOR.ja.md) · [Uncensoring](docs/UNCENSOR.md) | `--uncensor` の有効化、自分のモデル用のファイル作り、実測、以前からある方法 |
 | [AMD Radeon](docs/amd/README.ja.md) · [English](docs/amd/README.md) | AMD: ドライバ、ROCm（アーキテクチャ別のパッケージ）、単体の Radeon と APU の iGPU、トラブル対応 |
 | [更新履歴](CHANGELOG.md) | 各リリースの内容と測定結果 |

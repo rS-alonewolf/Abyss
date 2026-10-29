@@ -53,6 +53,28 @@ Engram tables in one `per_layer_token_embd.weight` and folds the Engram q / k no
 unsloth's `engram/` folder offers the tables in MXFP8 / Q6_K / Q5_K / IQ4_NL (the pack points at whichever file it
 was made from).
 
+**unsloth's re-upload of 2026-10-28** (revision `85f81fb970add013033f25e94006713ca2c0aaf2`; v1.3.77). unsloth
+replaced UD-IQ2_XXS / UD-IQ1_M / UD-IQ1_S with new quants, clearly better at the same sizes. AI PRO R9700 + Radeon
+8060S lane, 8 held-out texts, KL against the unquantized model:
+
+| | size | exact routing: a token / KL / same top | everyday (tail skip 4 + disk, affinity 0.08) | swe-bench 8 tasks, 32 GB + 96 GB / 32 GB + 64 GB |
+| --- | ---: | :---: | :---: | :---: |
+| unsloth UD-IQ2_XXS (new) | 300 GB | 50.0 ms / **0.141** / 83.7% | 36.8 ms / 0.149 | 33.9 / 29.5 tok/s |
+| unsloth UD-IQ1_M (new) | 250 GB | 39.4 ms / 0.199 / 81.5% | 30.9 ms / 0.203 | **40.6** / 30.5 tok/s |
+| unsloth UD-IQ1_S (new) | 233 GB | 30.6 ms / 0.257 / 78.7% | - | - |
+| ISTA-DASLab GSQ-RCO IQ2_XXS (new 6-shard layout) | 138 GB + Engram | 39.7 ms / 0.315 / 76.5% | - | - |
+
+- The picks: **UD-IQ2_XXS** for quality (KL 0.188 → 0.141 against the old files), **UD-IQ1_M** for speed (0.270 →
+  0.199, 40 tok/s on swe-bench with the DSpark drafter on 32 GB + 96 GB).
+- UD-IQ1_S and ISTA run but are not recommended: past KL 0.25 the loss shows in the text (our line for a pick).
+- swe-bench rows: the everyday settings + the DSpark drafter (`--dspark`, threshold 0.6), iGPU lane off, 8 tasks.
+- ISTA's new layout keeps the Engram table in shard 6 under another name; point a symlink named like shard 6 at
+  `Engram-IQ4_NL.gguf` before packing.
+- Download the measured files with `--revision 85f81fb970add013033f25e94006713ca2c0aaf2` (files made before 10-28 are
+  the old quants). Two SSDs cut the SSD waits by ~20% ([SSD2](../SSD2.md)).
+
+The tables below are the old files (before 2026-10-28).
+
 **unsloth UD-IQ1_S against nazeshinjite Q2** (2026-10-20, RTX 5090 + 60 GB RAM tier, model SSD 3.4 GB/s):
 
 | | nazeshinjite Q2 | unsloth UD-IQ1_S |

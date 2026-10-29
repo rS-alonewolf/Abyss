@@ -286,6 +286,7 @@ public:
         uint64_t size = 0, data_start = 0;
         int fd = -1;                                   // kept open for posix_fadvise reads (prefetch)
         int fd_direct = -1;                            // O_DIRECT: expert reads that bypass the page cache
+        int fd_mirror = -1;                            // O_DIRECT: the same file on a 2nd SSD (STRATA_GLM_MIRROR)
         void* h_direct = nullptr;                      // Windows: the same, a FILE_FLAG_NO_BUFFERING HANDLE
     };
     std::vector<Shard> pack_shards_;

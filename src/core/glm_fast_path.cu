@@ -410,6 +410,25 @@ constexpr int kVramReserveMb = 1536;
 constexpr int kVramReserveMb = 700;
 #endif
 
+// The 2nd SSD (STRATA_GLM_MIRROR, see pack_shard_mmap), best effort: every read goes to the drive that should finish
+// it first - the one with the least in flight for its measured speed (a running average of bytes per microsecond a
+// read, both drives start equal) - so two drives of any speeds add up and a slow or busy one simply takes less.  A
+// shard without a copy reads from its own drive; a failed mirror read is done again there and turns the mirror off.
+// mirror_bytes[0 / 1]: bytes read from the shards' own drive / the mirror (the stats line).
+std::atomic<uint64_t> mirror_bytes[2];
+static std::atomic<bool> mirror_off{false};
+static std::atomic<int> mirror_inflight[2];
+static std::atomic<float> mirror_speed[2] = {1.0f, 1.0f};   // bytes / us, a running average
+static std::atomic<uint32_t> mirror_reads{0};
+static int mirror_pick() {
+    const float c0 = (float) (mirror_inflight[0].load(std::memory_order_relaxed) + 1) / mirror_speed[0].load(),
+                c1 = (float) (mirror_inflight[1].load(std::memory_order_relaxed) + 1) / mirror_speed[1].load();
+    const int best = c1 < c0 ? 1 : 0;
+    // one read in 32 goes to the other drive: a drive that looked slow once (a busy spell, the warm-up) gets measured
+    // again - without it, its stale speed kept it unpicked for the rest of the run (0.0% from the mirror, 2026-10-29)
+    return (mirror_reads.fetch_add(1, std::memory_order_relaxed) & 31) == 31 ? 1 - best : best;
+}
+
 // [off, off + len) of a shard into dst: O_DIRECT through an aligned per-thread bounce buffer when the shard has a
 // direct fd (no page cache), a buffered pread otherwise, the mapping as the last resort
 void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* dst) {
@@ -432,15 +451,33 @@ void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* d
             cap = bounce ? need : 0;
         }
         if (bounce != nullptr) {
-            size_t got = 0;
-            while (got < need) {
-                const ssize_t r = pread(sh.fd_direct, bounce + got, need - got, (off_t) (a0 + got));
-                if (r <= 0) break;   // EOF: the last aligned read is short where the file ends
-                got += (size_t) r;
-            }
-            if (got >= (size_t) (off - a0) + len) {
-                std::memcpy(dst, bounce + (off - a0), len);
-                return;
+            const bool two = sh.fd_mirror >= 0 && !mirror_off.load(std::memory_order_relaxed);
+            for (int pass = two && mirror_pick() == 1 ? 0 : 1; pass < 2; ++pass) {
+                const int fdr = pass == 0 ? sh.fd_mirror : sh.fd_direct, d = pass == 0 ? 1 : 0;
+                if (two) mirror_inflight[d].fetch_add(1, std::memory_order_relaxed);
+                const auto t0 = std::chrono::steady_clock::now();
+                size_t got = 0;
+                while (got < need) {
+                    const ssize_t r = pread(fdr, bounce + got, need - got, (off_t) (a0 + got));
+                    if (r <= 0) break;   // EOF: the last aligned read is short where the file ends
+                    got += (size_t) r;
+                }
+                if (two) {
+                    mirror_inflight[d].fetch_sub(1, std::memory_order_relaxed);
+                    const float us = (float) std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - t0).count() + 1.0f;
+                    // per read in flight: the drive's speed while it was shared with the others in flight
+                    const float sp = (float) got / us * (float) (mirror_inflight[d].load(std::memory_order_relaxed) + 1);
+                    mirror_speed[d].store(0.9f * mirror_speed[d].load() + 0.1f * sp, std::memory_order_relaxed);
+                }
+                if (got >= (size_t) (off - a0) + len) {
+                    std::memcpy(dst, bounce + (off - a0), len);
+                    mirror_bytes[pass == 0 ? 1 : 0].fetch_add(need, std::memory_order_relaxed);
+                    return;
+                }
+                if (pass == 0 && !mirror_off.exchange(true))
+                    fprintf(stderr, "[mirror] read failed at %llu: the mirror is off, reading from the shards' drive\n",
+                            (unsigned long long) off);
             }
         }
     }
@@ -3307,6 +3344,10 @@ void Glm5Model::fast_destroy() {
                      (unsigned long long) F->prefetches.load(), (unsigned long long) F->miss_layers.load(),
                      (double) F->miss_us.load() / 1000.0);
         if (g_.v41) dsv41_engram_report();
+        if (const uint64_t m0 = glmfast::mirror_bytes[0].load(), m1 = glmfast::mirror_bytes[1].load(); m1 > 0)
+            std::fprintf(stderr, "glm fast mirror CUDA%d: %.2f GB from the shards' drive, %.2f GB from the mirror "
+                                 "(%.1f%%)\n", dev_, (double) m0 / 1e9, (double) m1 / 1e9,
+                         100.0 * (double) m1 / (double) (m0 + m1));
         if (F->disk_lane)
             std::fprintf(stderr, "glm fast disk lane CUDA%d: %llu disk experts computed in RAM, %.1f ms; %llu evicted at "
                                  "the miss\n", dev_, (unsigned long long) F->dlane_experts.load(),

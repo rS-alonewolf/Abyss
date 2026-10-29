@@ -7,6 +7,46 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.77 - 2026-10-29
+
+**Two SSDs without a RAID: copy the model's shards to a second NVMe and `STRATA_GLM_MIRROR=<folder>` reads every
+expert from whichever drive will finish first ([docs/SSD2](docs/SSD2.md), 日本語: [SSD2.ja.md](docs/SSD2.ja.md)).**
+For PCs that cannot take more RAM but have a free M.2 slot.
+
+DeepSeek V4.1 Flash 1017 unsloth UD-IQ2_XXS, AI PRO R9700 + the iGPU lane, drive 1 a 6.2 GB/s internal NVMe, drive 2
+an NVMe in a USB4 enclosure (3.5 GB/s); medians of 2 sequences x 3 rounds, one and two drives alternating:
+
+| GPU + RAM | a token (1 → 2 drives) | SSD wait a token | read from drive 2 |
+| --- | --- | --- | --- |
+| 32 GB + 96 GB | 51.4 → 49.2 ms (+4.5%) | 19.7 → 15.7 ms (−20%) | 37-45% |
+| 32 GB + 64 GB | 71.9 → 59.3 ms (+21%) | 27.9 → 22.2 ms (−20%) | 38-45% |
+| 16 GB + 64 GB | 92.0 → 77.7 ms (+18%) | 42.8 → 34.0 ms (−21%) | 39-47% |
+
+- Each read picks the drive by (reads in flight + 1) / its recent speed, measured again on every read; one read in 32
+  goes to the other drive so a drive that looked slow once is measured again (without it one run read 0.0% from the
+  mirror). The start-up fill of RAM and VRAM reads from both too (5.2 → 6.9 GB/s).
+- A copy is used only when its name, size and first and last MiB match; a failed read from it is read again from the
+  first drive and the mirror is then left out. The output does not change. Linux (O_DIRECT reads).
+- `STRATA_GLM_DISK_LANE=1` is slower with it (and without it) on this PC: do not combine them.
+- As far as we checked (Strata v0.2.7.1, Project Maya v1.1.36, llama.cpp, ik_llama.cpp, KTransformers), no other
+  engine reads the same file from two SSDs while answering; Maya's `MAYA_DS4_LOAD_INTERLEAVE` speeds up the start-up
+  copy of shards split over two drives.
+
+**DeepSeek V4.1: unsloth's re-upload of 2026-10-28 measured** (revision `85f81fb970add013033f25e94006713ca2c0aaf2`;
+[docs/deepseek41](docs/deepseek41/README.md#ggufs-that-load)):
+
+| file | size | KL (old file) | swe-bench 8 tasks, 32 GB + 96 GB / 32 GB + 64 GB |
+| --- | ---: | --- | --- |
+| UD-IQ2_XXS - the pick for quality | 300 GB | 0.141 (0.188) | 33.9 / 29.5 tok/s |
+| UD-IQ1_M - the pick for speed | 250 GB | 0.199 (0.270) | 40.6 / 30.5 tok/s |
+| UD-IQ1_S - runs, not recommended | 233 GB | 0.257 (0.36) | - |
+| ISTA-DASLab GSQ-RCO IQ2_XXS (new layout) - runs, not recommended | 138 GB + Engram | 0.315 | - |
+
+swe-bench rows: tail skip 4 + disk, affinity 0.08, the DSpark drafter (threshold 0.6), iGPU lane off.
+`./abyss.sh --bench`'s quality check has references for the new UD-IQ2_XXS and UD-IQ1_M (the re-upload is 55 bytes
+smaller, so the old UD-IQ2_XXS reference skipped the check on new files; it stays for the old files as
+`*.old1020.json`).
+
 ## v1.3.76 - 2026-10-28
 
 **Qwen3.8-Flash-Next: the popular ISTA-DASLab and unsloth GGUFs on the fast path, as beta - which file fits which PC:

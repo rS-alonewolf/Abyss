@@ -56,6 +56,9 @@ the APU's iGPU as a lane).
 - **DeepSeek's DSpark drafter (opt-in)** — three DeepSeek V4 layers read the model's own layer 40–42 outputs and draft
   5 tokens a step, verified in windows of up to 6 tokens: +28% on swe-bench tasks on an AI PRO R9700 (48.4 → 61.9
   tok/s without an iGPU). It takes ~6.5 GB of VRAM.
+- **Two SSDs without a RAID (opt-in)** — copy the model's shards to a second NVMe and `STRATA_GLM_MIRROR=<folder>`
+  reads every expert from whichever drive will finish first: SSD waits −20%, and on 32 GB VRAM + 64 GB RAM DeepSeek
+  V4.1 UD-IQ2_XXS decodes 21% faster even with the second drive on USB4 at half the speed ([SSD2](docs/SSD2.md)).
 - **Uncensoring at run time (opt-in)** — `--uncensor <file>` takes the refusal direction out of every residual write
   while it runs, switchable per request; `--abl-build` makes the 16-82 KB file from public prompt sets. V4.1 / V4 /
   GLM-5.3-Flash: harmful prompts refused 85-88% → 3-8%, text KL 0.013-0.053 ([UNCENSOR](docs/UNCENSOR.md)).
@@ -79,9 +82,10 @@ the APU's iGPU as a lane).
 | | huihui-ai's abliterated Q2, antirez's deepseek-v4-gguf (`--compat-bf16`) | ~83 GB | runs (KL 0.0075 against llama.cpp) |
 | | unsloth's other quants with these expert types: IQ1_S-IQ4_XS, Q2_K-Q6_K, MXFP4 | | should run, untested |
 | | DeepSeek's DSpark drafter for it, bleysg's [GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF) (`--dspark`, v1.3.43) | 6.9 GB | measured on an AI PRO R9700 (swe-bench +28%); NVIDIA: builds, not measured |
-| DeepSeek V4.1 Flash 1017 | unsloth [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (the pick from v1.3.46) | 300 GB | measured: nazeshinjite Q2's speed at KL 0.186 against 0.228 |
+| DeepSeek V4.1 Flash 1017 | unsloth [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), re-uploaded 2026-10-28 (the pick for quality) | 300 GB | measured on an AI PRO R9700: KL 0.141 (old file 0.188), swe-bench 8 tasks 33.9 tok/s on 32 GB + 96 GB, 29.5 on 32 GB + 64 GB ([which file](docs/deepseek41/README.md#ggufs-that-load)) |
+| | unsloth [UD-IQ1_M](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), re-uploaded 2026-10-28 (the pick for speed) | 250 GB | measured the same way: KL 0.199 (old 0.270), **40.6 tok/s** on 32 GB + 96 GB, 30.5 on 32 GB + 64 GB |
 | | nazeshinjite [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) | 366 GB | measured, swe-bench 34 of the first 35 |
-| | unsloth [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (v1.3.38), UD-IQ1_M | 233 / 266 GB | measured: faster, lower quality (KL 0.36 / 0.27) |
+| | unsloth [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (re-uploaded 2026-10-28) | 233 GB | measured: runs, not recommended (KL 0.257; old file 0.36) |
 | | mrfakename Q2_K; Lucebox dense + Engram with mrfakename's experts (a hybrid) | 247 / 201 GB | runs: low quality alone / the most accurate, slow |
 | | unsloth's other quants, Project Maya's Maya-S | 178-508 GB | same layout as UD-IQ1_S, untested |
 | | ISTA-DASLab [GSQ-RCO](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) IQ2_XXS / IQ1_M (v1.3.53, the Engram table as a separate GGUF) | 138 / 121 GB | measured on an AI PRO R9700: KL 0.31 / 0.38. The sizes leave out the Engram table: without it UD-IQ1_M is 139.5 GB at KL 0.27, so at the same size unsloth's is better (v1.3.53 called IQ2_XXS the best per GB, comparing sizes with and without the table - wrong) |
@@ -297,6 +301,7 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 | [Manual](docs/MANUAL.md) · [マニュアル](docs/MANUAL.ja.md) | setup, configuration, API, several GPUs, AMD, settings, troubleshooting |
 | [Config files](docs/SETTINGS.md) · [設定ファイル](docs/SETTINGS.ja.md) | where the config file and start script are, what to change where, every key, how a change takes effect |
 | [Uncensoring](docs/UNCENSOR.md) · [無検閲化](docs/UNCENSOR.ja.md) | `--uncensor`: turning it on, making the file for your model, measurements, the older ways |
+| [Two SSDs](docs/SSD2.md) · [SSD を 2 枚](docs/SSD2.ja.md) | `STRATA_GLM_MIRROR`: a copy of the model on a second NVMe read alongside the first, measurements, space needed |
 | [AMD Radeon](docs/amd/README.md) · [日本語](docs/amd/README.ja.md) | AMD: the driver, ROCm (per-architecture packages), a discrete Radeon + the APU's iGPU, troubleshooting |
 | [Changelog](CHANGELOG.md) | every release with its measurements |
 | [Port notes](docs/deepseek4/PORT.md) | what Abyss adds and how it was validated |

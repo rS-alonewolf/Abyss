@@ -2714,6 +2714,41 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
     // the fast path reads experts with O_DIRECT (no page cache: on a host whose RAM is mostly the pinned
     // expert tier, buffered reads pushed the system into swap); absent where the filesystem refuses it
     s.fd_direct = open(path.c_str(), O_RDONLY | O_DIRECT);
+    // STRATA_GLM_MIRROR=<dir>[:<dir>...]: a copy of this shard (same name, same size, same first and last MiB) on
+    // another SSD - the expert reads then go to both drives, each read worker to one of them (read_slice), so two
+    // SSDs add up their speed without a RAID; anything not mirrored is read from here as before
+    if (const char* mv = getenv("STRATA_GLM_MIRROR"); mv != nullptr && *mv != 0 && s.fd_direct >= 0) {
+        const std::string base_name = path.substr(path.find_last_of('/') + 1);
+        std::string dirs = mv;
+        for (size_t a = 0; a <= dirs.size() && s.fd_mirror < 0;) {
+            const size_t b = std::min(dirs.find(':', a), dirs.size());
+            const std::string mp = dirs.substr(a, b - a) + "/" + base_name;
+            a = b + 1;
+            struct stat ms{};
+            if (stat(mp.c_str(), &ms) != 0) continue;
+            if ((uint64_t) ms.st_size != s.size) {
+                fprintf(stderr, "[mirror] %s: size %llu != %llu, not used\n", mp.c_str(),
+                        (unsigned long long) ms.st_size, (unsigned long long) s.size);
+                continue;
+            }
+            const int mf = open(mp.c_str(), O_RDONLY);
+            if (mf < 0) continue;
+            bool same = true;
+            std::vector<uint8_t> x(1u << 20), y(1u << 20);
+            for (uint64_t at : {(uint64_t) 0, s.size > (1u << 20) ? s.size - (1u << 20) : (uint64_t) 0}) {
+                const size_t n = (size_t) std::min<uint64_t>(1u << 20, s.size - at);
+                same = same && pread(fd, x.data(), n, (off_t) at) == (ssize_t) n &&
+                       pread(mf, y.data(), n, (off_t) at) == (ssize_t) n && std::memcmp(x.data(), y.data(), n) == 0;
+            }
+            close(mf);
+            if (!same) {
+                fprintf(stderr, "[mirror] %s: content differs from %s, not used\n", mp.c_str(), path.c_str());
+                continue;
+            }
+            s.fd_mirror = open(mp.c_str(), O_RDONLY | O_DIRECT);
+            if (s.fd_mirror >= 0) fprintf(stderr, "[mirror] %s also read from %s\n", base_name.c_str(), mp.c_str());
+        }
+    }
     return true;
 #endif
 }
