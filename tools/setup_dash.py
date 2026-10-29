@@ -208,12 +208,13 @@ def gpus(m: dict) -> Table:
                        ("PCIe", True)):
         t.add_column(col, justify="right" if right else "left", no_wrap=True)
     for i, g in enumerate(cards):
-        name = names[i] if len(names) == len(cards) else ""
+        name = g.get("name") or (names[i] if len(names) == len(cards) else "")
         name = name.replace("NVIDIA ", "").replace("GeForce ", "").replace("AMD ", "").replace("Radeon ", "")
         util, temp = g.get("util"), g.get("temp")
         gen = g.get("pcie_gen_max") or g.get("pcie_gen")
         rx = g.get("pcie_rx_mb")
-        t.add_row(Text.assemble((f"{g.get('index')} ", f"bold {INK}"), (name, MUTED)),
+        label = "iGPU" if g.get("role") == "igpu" else "helper" if g.get("role") == "helper" else g.get("index")
+        t.add_row(Text.assemble((f"{label} ", f"bold {INK}"), (name, MUTED)),
                   Text.assemble(bar((util or 0) / 100, 10), (f" {fmt(util):>3}%", INK)),
                   Text.assemble((gb(g.get("mem_used")), INK), (f" / {gb(g.get('mem_total'), 0)} GB", MUTED)),
                   Text.assemble((fmt(g.get("power")), INK), (f" / {fmt(g.get('power_limit'))} W", MUTED)),

@@ -395,8 +395,8 @@ function renderBanners(m) {
   } else if (rl && rl.state === "failed" && rl.ended && Date.now() / 1000 - rl.ended < 600) {
     out.push(["error", `The context change did not work: ${rl.error || "the engine did not start"}. It runs with ${ctxfmt(rl.context)} again.`]);
   }
-  const gpus = (m.hardware || {}).gpus || [{index: null, temp: (m.hardware || {}).gpu_temp}];
-  for (const g of gpus) {
+  const gpus = modelGpus(m.hardware || {});
+  for (const g of gpus.length ? gpus : [{index: null, temp: (m.hardware || {}).gpu_temp}]) {
     if (g.temp != null && g.temp >= 87) out.push(["warn", `${g.index == null ? "The GPU" : `GPU ${g.index}`} is at ${fmt(g.temp)} °C: it may slow itself down to cool off.`]);
   }
   $("banners").innerHTML = out.map(([k, t]) => `<div class="banner banner--${k}" role="${k === "error" ? "alert" : "status"}">${icon(k === "info" ? "info" : k === "error" ? "error" : "warning", "st-icon st-icon--sm")}<span>${esc(t)}</span></div>`).join("");
@@ -435,10 +435,16 @@ function renderHero(live, h, last, eng, tiers, totals) {
   $("hero-req").textContent = totals && totals.requests != null ? fmt(totals.requests) : "–";
 }
 
+// the cards the model's layers run on (the gpu_* totals' cards): "gpus" also lists one card alone, a decode expert
+// helper and the iGPU lane's Radeon, each with its role
+function modelGpus(hw) {
+  return (hw.gpus || []).filter((g) => !g.role || g.role === "main" || g.role === "split");
+}
+
 // five GPUs or more: one row each (up to four, the hardware cards list every GPU's own value - each figure once)
 const GPU_TABLE_FROM = 5;
 function renderGpus(hw) {
-  const gpus = hw.gpus || [];
+  const gpus = modelGpus(hw);
   $("gpus-card").hidden = gpus.length < GPU_TABLE_FROM;
   if (gpus.length < GPU_TABLE_FROM) return;
   $("gpus-sub").textContent = `${gpus.length} cards`;
@@ -500,7 +506,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
 
   // the hardware cards: the total (or the mean / the hottest) and its history; with two to four GPUs the line under it
   // has every GPU's own value (from five, the GPUs table above has them and the cards keep their totals)
-  const gpus = hw.gpus || [];
+  const gpus = modelGpus(hw);
   const multi = gpus.length > 1, each = multi && gpus.length < GPU_TABLE_FROM;
   const per = (f) => gpus.map((g) => `GPU ${g.index} ${f(g)}`.replace(/ /g, " ")).join(" · ");   // wraps between GPUs only
   const rate = (mb) => (mb == null ? "–" : mb >= 1000 ? `${fmt(mb / 1024, 1)} GB/s` : `${fmt(mb, mb < 10 ? 1 : 0)} MB/s`);
@@ -620,7 +626,7 @@ function renderAbout(eng, hw, st, storage) {
                   : "off (one GPU, or no draft block in this model file)"],
     ["Images", eng.images ? "on" : "off"],
   ]);
-  const gpus = hw.gpus || [];
+  const gpus = modelGpus(hw);
   const pcie = gpus.length > 1 ? gpus.map((g) => `GPU ${g.index}: Gen${g.pcie_gen_max || g.pcie_gen || "?"}${g.pcie_width ? ` x${g.pcie_width}` : ""}`).join(" · ")
              : (hw.gpu_pcie_gen_max || hw.gpu_pcie_gen) ? `Gen${hw.gpu_pcie_gen_max || hw.gpu_pcie_gen}${hw.gpu_pcie_width ? ` x${hw.gpu_pcie_width}` : ""}` : null;
   facts($("facts-hw"), [
