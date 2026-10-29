@@ -268,6 +268,34 @@ in the browser, `--gpu 0` picks the GPU.
   request (a timestamp), reads the prompt again. Whether a request was reused: `usage.prompt_tokens_details.cached_tokens`
   (OpenAI), `cache_read_input_tokens` (Anthropic) or `timings.cache_n` in the stream. Ornith reuses it from v1.3.65.
 - **One request at a time;** others wait in line.
+- **Stopping the server from another program** (Abyss Terminal, a script, a phone over Tailscale when the engine runs
+  away): `POST /api/shutdown` with a JSON body.
+
+  ```sh
+  curl -X POST http://127.0.0.1:8082/api/shutdown -H 'Content-Type: application/json' -d '{}'
+  ```
+
+  The request in progress is cut at its next step (not wrapped up as Ctrl+C does), and an engine that does not stop
+  it within `STRATA_SHUTDOWN_WAIT_S` seconds (15) - stuck in a GPU kernel, say - is killed; then the engine ends and
+  the server exits. `{"force": true}` kills the engine at once (its kept conversation is not saved). It answers
+  `202` before it stops. Who may: with an `api_key` in the config, anyone who sends the key; without one, only
+  programs on this PC (loopback) - another PC gets a `403`. A browser page cannot post it (it needs a JSON body and
+  no foreign `Origin`). `"allow_shutdown": false` in the config turns it off. **Tailscale:** with `"host": "0.0.0.0"`
+  (or the PC's Tailscale address) the other devices are not loopback, so give the server an `api_key` to stop it
+  from your phone or laptop; behind `tailscale serve` (or any reverse proxy on this PC) every client looks like
+  loopback - set an `api_key` there too, or anyone on your tailnet can stop it.
+- **What `/metrics` reports for monitors** (the web app's Monitor, Abyss Terminal): the model's name with its quant
+  (`engine.display_name`, `engine.quant`, `engine.config`, `engine.backend`); every card in `hardware.gpus` with its
+  `role` (`main`, `split`, `helper`, `igpu` - the iGPU lane's Radeon, in shared memory) and `source` (the backends
+  that answered: `nvml`, `nvidia-smi`, `sysfs`, `gpu_metrics`, `amd-smi`, `rocm-smi`, `pdh`), clocks, junction and
+  memory temperatures and throttle reasons; an AMD card's PCIe link is the narrowest link up to the root port, as
+  `--bench` reports it (an R9700 on OCuLink: Gen4 x4, not the card's internal x16) - AMD has no PCIe throughput
+  counter on RDNA 3/4, so `pcie_rx_mb` stays empty; each model and `STRATA_GLM_MIRROR` drive's MB/s
+  (`hardware.drives`); swap, page cache and memory pressure (Linux PSI); the CPU per core (load, clocks, clusters),
+  its temperature, power and instruction sets (`cpu_*`); drafts accepted / offered per request and in `totals`. A
+  value that cannot be read is `null` (shown as `--`), never 0. CPU power comes from RAPL, which most Linux
+  distributions let only root read: `sudo chmod o+r /sys/class/powercap/intel-rapl:0/energy_uj` (until the next
+  boot) shows it; an AMD APU falls back to its own power table.
 
 ### With Strata-tools' strata.sh
 

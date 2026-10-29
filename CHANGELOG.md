@@ -7,6 +7,34 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased
+
+**Server side of Abyss Terminal (phase 1.5): `/metrics` names the run and reads the whole machine, and
+`POST /api/shutdown` stops a runaway engine from another program ([MANUAL](docs/MANUAL.md#using-it)).**
+
+- `POST /api/shutdown` (JSON body, `{"force": true}` optional): the request in progress is cut, an engine that does
+  not stop it within `STRATA_SHUTDOWN_WAIT_S` (15 s) is killed, then the server exits. Allowed with the `api_key`, or
+  from this PC (loopback) when there is none; never from a foreign web page; `"allow_shutdown": false` turns it off.
+  Over Tailscale set an `api_key` (behind `tailscale serve` every client looks like loopback).
+- AMD PCIe link: the narrowest link up to the root port, as `--bench` reports it - an AI PRO R9700 on OCuLink now reads
+  Gen4 x4 (it read the card's internal Gen5 x16). AMD's PCIe MB/s stays empty: RDNA 3/4 has no counter (amd-smi says
+  N/A too).
+- GPUs are read through backends tried in order per card, each filling what the ones before left empty, with
+  `source` naming them: NVML, else `nvidia-smi`; AMD sysfs + the binary `gpu_metrics` table (throttle reasons,
+  junction / memory temperatures, an APU's RAM traffic), else `amd-smi` / `rocm-smi`; Windows' GPU performance
+  counters as the last resort. `hardware.gpus` lists one card too, with its `role` (`main` / `split` / `helper` /
+  `igpu`, the iGPU lane's Radeon); the `gpu_*` totals and the stall watchdog count only the model's cards. New per
+  card: `clock_mhz`, `mem_clock_mhz`, `temp_junction`, `temp_mem`, `throttle`, `pcie_width_max`, `name`.
+- CPU (`serve/telemetry_cpu.py`): load and clock per core, clusters (cpufreq policies: big.LITTLE, a Ryzen's CCDs),
+  frequency driver / governor / EPP, temperature (k10temp, coretemp, Arm thermal zones), power (RAPL, amd_energy,
+  hwmon, an AMD APU's power table - RAPL is root-only on most distributions), Intel throttle counts, and the
+  instruction sets the CPU lane uses (AVX-512 / VBMI / AVX-VNNI, NEON / SVE).
+- `hardware.drives`: each model / `STRATA_GLM_MIRROR` drive's own MB/s (Linux); swap, page cache and memory pressure
+  (PSI).
+- `engine.display_name` / `quant` / `config` / `backend`; drafts accepted / offered per request and in `totals`;
+  `tiers.history` carries every numeric STAT key (keys a newer engine adds get their series).
+- A value that cannot be read is `null` (shown as `--`), never 0.
+
 ## v1.3.77 - 2026-10-29
 
 **Two SSDs without a RAID: copy the model's shards to a second NVMe and `STRATA_GLM_MIRROR=<folder>` reads every

@@ -177,6 +177,7 @@ As `./setup-deepseek.sh` writes it (an AMD GPU, the DSpark drafter on):
 | --- | --- | --- |
 | `host` | the address the server listens on; default `127.0.0.1` (this PC only), `0.0.0.0` lets other PCs in | `"0.0.0.0"` |
 | `api_key` | the key `/v1/*` requires (`Authorization: Bearer ...` or `x-api-key`), several separated by commas. Always set it when `host` is open | `"my-secret"` |
+| `allow_shutdown` | `false`: `POST /api/shutdown` (stopping the server and engine from another program, e.g. when the engine runs away) is refused. Default on: allowed with the `api_key`, or from this PC when there is no key. Over Tailscale, set an `api_key` ([MANUAL](MANUAL.md#using-it)) | `false` |
 | `fit_max_tokens` | `true`: a `max_tokens` beyond the context left is shortened instead of refused with a 400 | `true` |
 | `mcp_servers` | MCP servers the Chat page can use (Claude Desktop's format) | `{"name": {...}}` |
 

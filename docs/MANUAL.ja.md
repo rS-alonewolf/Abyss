@@ -262,6 +262,33 @@ GGUF_PY=~/llm/apps/llama.cpp/gguf-py LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin
 - **会話の再利用:** 前のリクエストの続き（同じメッセージ + 新しいメッセージ）は、新しいトークンだけを読む。同じプロンプトをもう一度送ると、最後のトークンだけを読む（V4.1：5K と 23K のトークンで、最初のトークンまで 0.04 秒）。
   残すのは直前の会話 1 つだけで、間に別のリクエストが入るか、再起動すると置き換わる。トークンは先頭から一致している必要があり、システムプロンプト・推論レベル・ツールの一覧が違う場合や、リクエストごとに変わるもの（タイムスタンプなど）が入る場合は、プロンプトを読み直す。再利用されたかは `usage.prompt_tokens_details.cached_tokens`（OpenAI）、`cache_read_input_tokens`（Anthropic）、ストリームの `timings.cache_n` で分かる。Ornith は v1.3.65 から再利用する。
 - **リクエストは 1 つずつ**処理する。ほかは順番待ち。
+- **別のプログラムからサーバーを止める**（Abyss Terminal、スクリプト、エンジンが暴走したときに Tailscale 越しのスマホから）：
+  JSON の本文を付けて `POST /api/shutdown`。
+
+  ```sh
+  curl -X POST http://127.0.0.1:8082/api/shutdown -H 'Content-Type: application/json' -d '{}'
+  ```
+
+  処理中のリクエストは次のステップで打ち切る（Ctrl+C のように回答をまとめさせない）。`STRATA_SHUTDOWN_WAIT_S` 秒（15）以内に
+  止まらないエンジン（GPU カーネルの中で固まっている等）は強制終了し、そのあとエンジンを終えてサーバーも終わる。
+  `{"force": true}` はエンジンをすぐ強制終了する（保持中の会話は保存しない）。止まる前に `202` を返す。
+  使える人: 設定に `api_key` があれば、そのキーを送った人。無ければこの PC 上のプログラムだけ（ループバック）で、
+  他の PC からは `403`。ブラウザのページからは送れない（JSON 本文と、よその `Origin` が無いことが必要）。
+  設定の `"allow_shutdown": false` で無効にできる。**Tailscale:** `"host": "0.0.0.0"`（か PC の Tailscale アドレス）
+  なら他の機器はループバックではないので、スマホやノート PC から止めるには `api_key` を設定する。`tailscale serve`
+  （やこの PC 上のリバースプロキシ）の後ろでは全員がループバックに見えるので、そこでも `api_key` を設定する
+  （しないと tailnet の誰でも止められる）。
+- **`/metrics` がモニター向けに返すもの**（Web アプリの Monitor、Abyss Terminal）: 量子化付きのモデル名
+  （`engine.display_name`、`engine.quant`、`engine.config`、`engine.backend`）、`hardware.gpus` に全カードとその
+  `role`（`main`、`split`、`helper`、`igpu` = iGPU レーンの Radeon、共有メモリ）と `source`（答えた読み取り方法:
+  `nvml`、`nvidia-smi`、`sysfs`、`gpu_metrics`、`amd-smi`、`rocm-smi`、`pdh`）、クロック、ジャンクション/メモリ温度、
+  スロットル理由。AMD の PCIe リンクはルートポートまでで一番狭いリンクで、`--bench` と同じ（OCuLink の R9700 は
+  カード内の x16 ではなく Gen4 x4）。RDNA 3/4 には PCIe 転送量のカウンタが無いので `pcie_rx_mb` は空。モデルと
+  `STRATA_GLM_MIRROR` のドライブ毎の MB/s（`hardware.drives`）、スワップ・ページキャッシュ・メモリ圧（Linux PSI）、
+  CPU のコア毎の負荷・クロック・クラスタ、温度、電力、命令セット（`cpu_*`）、リクエスト毎と `totals` のドラフト
+  受理数/提示数。読めない値は `null`（`--` と表示）で、0 にはしない。CPU の電力は RAPL から読むが、多くの Linux
+  ディストリビューションでは root しか読めない: `sudo chmod o+r /sys/class/powercap/intel-rapl:0/energy_uj`
+  （次の起動まで）で出る。AMD の APU は自身の電力テーブルで代わりに出す。
 
 ### Strata-tools の strata.sh を使う場合
 
