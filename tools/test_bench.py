@@ -49,6 +49,17 @@ class BenchTests(unittest.TestCase):
             self.assertIn("STRATA_GLM_PCIE_SHARE", A.BENCH_ADVICE_HIP[k])
             self.assertIn("CUDA-only", A.BENCH_ADVICE_HIP["cpu"])
 
+    def test_the_rules_are_shared_with_abyss_terminal(self):   # (tools/bench_rules.py: one place for both)
+        import bench_rules as R
+        self.assertIs(A.bench_verdict, R.bench_verdict)
+        self.assertIs(A.BENCH_ADVICE, R.BENCH_ADVICE)
+        self.assertEqual(R.advice("cpu", "hip"), (R.BENCH_ADVICE["cpu"][0], R.BENCH_ADVICE_HIP["cpu"]))
+        self.assertEqual(R.advice("gpu", "cuda"), R.BENCH_ADVICE["gpu"])
+        self.assertEqual(R.advice("", "cuda"), ("", ""))
+        self.assertEqual(R.lane_name(["glm fast: CUDA0 iGPU lane: an expert 0.042 ms vs 0.085 on the CPU's 16 "
+                                      "threads -> the iGPU computes the lane"]), "iGPU lane")
+        self.assertEqual(R.lane_name(["glm fast: loaded"]), "CPU lane")
+
     def test_sweep_compares_with_the_engines_best_run(self):
         # issue #19: own 24.8 (cold, 6.8 SSD reads a token) / 44.8 (warm, 0.06); share 0 42.6 is no win
         shares = [(0.0, 42.6), (0.25, 39.4), (0.5, 32.3), (0.75, 32.3), (1.0, 32.1)]
