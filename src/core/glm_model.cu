@@ -17,6 +17,7 @@
 // lands), so a batched call is literally the same per-token steps as single-token calls - which
 // is what glm_model_test's batched-vs-streamed equivalence pins.
 #include "glm_fast_state.hpp"
+#include "shard_io.hpp"
 
 #include "strata/kernels/glm_dsa.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -2714,7 +2715,7 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
     // the fast path reads experts with O_DIRECT (no page cache: on a host whose RAM is mostly the pinned
     // expert tier, buffered reads pushed the system into swap); absent where the filesystem refuses it
     s.fd_direct = open(path.c_str(), O_RDONLY | O_DIRECT);
-    // STRATA_GLM_MIRROR=<dir>[:<dir>...]: a copy of this shard (same name, same size, same first and last MiB) on
+    // STRATA_GLM_MIRROR=<dir>[:<dir>...]: a copy of this shard (same name, same size, the same bytes where sampled) on
     // another SSD - the expert reads then go to both drives, each read worker to one of them (read_slice), so two
     // SSDs add up their speed without a RAID; anything not mirrored is read from here as before
     if (const char* mv = getenv("STRATA_GLM_MIRROR"); mv != nullptr && *mv != 0 && s.fd_direct >= 0) {
@@ -2733,16 +2734,13 @@ static bool pack_shard_mmap(const std::string& path, strata::core::Glm5Model::Sh
             }
             const int mf = open(mp.c_str(), O_RDONLY);
             if (mf < 0) continue;
-            bool same = true;
-            std::vector<uint8_t> x(1u << 20), y(1u << 20);
-            for (uint64_t at : {(uint64_t) 0, s.size > (1u << 20) ? s.size - (1u << 20) : (uint64_t) 0}) {
-                const size_t n = (size_t) std::min<uint64_t>(1u << 20, s.size - at);
-                same = same && pread(fd, x.data(), n, (off_t) at) == (ssize_t) n &&
-                       pread(mf, y.data(), n, (off_t) at) == (ssize_t) n && std::memcmp(x.data(), y.data(), n) == 0;
-            }
+            // the same bytes: head, tail and 32 blocks spread over the file (shard_io::same_content) - a copy that
+            // stopped part way or a file only fallocated to the size has the right size and head
+            std::string why;
+            const bool same = strata::core::shard_io::same_content(fd, mf, s.size, why);
             close(mf);
             if (!same) {
-                fprintf(stderr, "[mirror] %s: content differs from %s, not used\n", mp.c_str(), path.c_str());
+                fprintf(stderr, "[mirror] %s: not a copy of %s (%s), not used\n", mp.c_str(), path.c_str(), why.c_str());
                 continue;
             }
             s.fd_mirror = open(mp.c_str(), O_RDONLY | O_DIRECT);
