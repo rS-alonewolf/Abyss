@@ -2656,16 +2656,42 @@ class Server(ThreadingHTTPServer):
 
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB")
+# ... read by this server at the moment they matter (the thinking budget's floor, the shutdown's waits): the config's
+# values reach it the same way (MANUAL lists STRATA_GLM_THINK_RESERVE as a config setting; they went to the engine only)
+SERVER_ENV_LATE = ("STRATA_GLM_THINK_RESERVE", "STRATA_ENGINE_WRAP_S", "STRATA_ENGINE_QUIT_S")
+# every one of them is a number: a value that is not one is dropped here, with a line, instead of a float() / int() at
+# shutdown or in a request (`STRATA_ENGINE_QUIT_S=50s` ended the server with a traceback)
+SERVER_ENV_INT = ("STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_GLM_THINK_RESERVE")
+
+
+def clean_server_env() -> list[str]:
+    """Drops the server's own STRATA_* settings whose value is not a number (an int where one is read as int), so the
+    default applies; returns what was dropped, for the log."""
+    bad = []
+    for k in SERVER_ENV + SERVER_ENV_LATE:
+        v = os.environ.get(k)
+        if v is None or v.strip() == "":
+            continue
+        try:
+            n = float(v)
+            if k in SERVER_ENV_INT:
+                os.environ[k] = str(int(n))
+        except ValueError:
+            bad.append(f"{k}={v!r}")
+            del os.environ[k]
+    return bad
 
 
 def apply_server_env(cfg: dict) -> None:
     """The config's "env" entries this server reads itself (`--env` puts every setting there; the rest go to the
     engine): in effect before it starts."""
     global ENGINE_STALL_S
-    for k in SERVER_ENV:
+    for k in SERVER_ENV + SERVER_ENV_LATE:
         v = (cfg.get("env") or {}).get(k)
         if v is not None:
             os.environ[k] = str(v)
+    for what in clean_server_env():
+        print(f"[maya] {what} is not a number: ignored (the default applies)", flush=True)
     ENGINE_STALL_S = _stall_seconds()
     Server.request_queue_size = _backlog()
 

@@ -17,6 +17,7 @@
 // resident experts are excluded, and every other layer's slots are untouched.
 #include "glm_fast_state.hpp"
 #include "shard_io.hpp"
+#include "strata/core/knobs.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
@@ -411,6 +412,21 @@ constexpr int kVramReserveMb = 1536;
 #else
 constexpr int kVramReserveMb = 700;
 #endif
+
+// RAM left free beside the pinned expert tier (STRATA_GLM_RAM_HEADROOM_GB): 6 GB with a discrete card, 16 on a
+// unified-memory APU, whose pool is that RAM - the one place both tier sizings read it from (the AMD setup writes 16
+// into its configs on purpose)
+inline double ram_headroom_gb(bool unified) {
+    return strata::core::env_num("STRATA_GLM_RAM_HEADROOM_GB", unified ? 16.0 : 6.0, 0.0, 4096.0);
+}
+// the VRAM kept free, from the build's default or STRATA_GLM_RESERVE_MB (never negative: it was cast to size_t)
+inline size_t vram_reserve_bytes(int default_mb) {
+    return (size_t) strata::core::env_num("STRATA_GLM_RESERVE_MB", default_mb, 0.0, 1048576.0) << 20;
+}
+// STRATA_GLM_POOL_GB / STRATA_GLM_VRAM_GB as bytes, or 0 when unset
+inline size_t env_gib(const char* name) {
+    return (size_t) (strata::core::env_num(name, 0.0, 0.0, 65536.0) * 1073741824.0);
+}
 
 // The 2nd SSD (STRATA_GLM_MIRROR, see pack_shard_mmap), the O_DIRECT bounce buffers, the fallbacks and their counters
 // live in shard_io.cpp (host-only, tested by tools/test_shard_io.py).
@@ -956,8 +972,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                          (double) (sc_bytes_ + F->arena_bytes + 8 * sstride) / G, (used - known) / G);
         }
         // headroom: the context's own growth is already allocated (state arena); see kVramReserveMb
-        size_t reserve = (size_t) (F->unified_memory ? 1024 : glmfast::kVramReserveMb) << 20;
-        if (const char* r = getenv("STRATA_GLM_RESERVE_MB")) reserve = (size_t) std::atoll(r) << 20;
+        const size_t reserve = glmfast::vram_reserve_bytes(F->unified_memory ? 1024 : glmfast::kVramReserveMb);
         size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
 #if defined(STRATA_USE_HIP)
         if (F->unified_memory) {
@@ -970,8 +985,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                     if (std::sscanf(line, "MemAvailable: %lld kB", &avail_kb) == 1) break;
                 std::fclose(mf);
             }
-            double head_gb = 16.0;
-            if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+            const double head_gb = glmfast::ram_headroom_gb(true);
             size_t expert_bytes = 0;
             for (int il = l0_; il < lt_; ++il) {
                 const auto& Ly = F->L[(size_t) il];
@@ -985,12 +999,11 @@ bool Glm5Model::fast_setup(std::string& err) {
                          (double) expert_bytes / 1073741824.0, (double) avail / 1073741824.0);
         }
 #endif
-        if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
-            avail = std::min(avail, (size_t) (std::atof(cap) * 1073741824.0));
+        if (getenv("STRATA_GLM_POOL_GB")) avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
         // STRATA_GLM_VRAM_GB=<n>: behave like a card with n GB - the cap counts everything this process already
         // holds on the device (context, dense weights, state, arenas), so the pool gets what such a card would have
-        if (const char* vc = getenv("STRATA_GLM_VRAM_GB")) {
-            const size_t cap = (size_t) (std::atof(vc) * 1073741824.0);
+        if (getenv("STRATA_GLM_VRAM_GB")) {
+            const size_t cap = glmfast::env_gib("STRATA_GLM_VRAM_GB");
             const size_t used = total_b - free_b;
             const size_t room = cap > used + reserve ? cap - used - reserve : 0;
             std::fprintf(stderr, "glm fast: CUDA%d VRAM cap %.1f GB: %.2f GB already in use, %.2f GB left for experts\n",
@@ -1312,8 +1325,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         const int later = n_parts_ - 1 - part_;   // the parts that start after this one
         const int64_t unseen_pf = (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.staging +
                                   (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.hop;
-        double head_gb = F->unified_memory ? 16.0 : 6.0;
-        if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+        const double head_gb = glmfast::ram_headroom_gb(F->unified_memory);
         const int64_t head_b = (int64_t) (head_gb * 1073741824.0);
         // the disk staging pinned after the tier (one set of max(8, k) experts per in-flight route, below)
         const int64_t stage_b = (int64_t) std::max(8, g.n_exp_used) * gf::kCpuAnswers *
@@ -1358,8 +1370,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                     // prompt 301 s instead of 11) - the page cache the Engram tables and the shards go through
                     // needs the room
 #ifdef __linux__
-                    double frac = F->unified_memory ? 1.0 : 0.73;
-                    if (const char* fr = getenv("STRATA_GLM_RAM_FRAC")) frac = std::max(0.0, std::atof(fr));
+                    // (a value of 1.0 or more would lift the cap - the thrash case itself: a discrete card's is held
+                    // to 0.95; a unified-memory APU has no cap unless one is set)
+                    const double frac = strata::core::env_num("STRATA_GLM_RAM_FRAC", F->unified_memory ? 1.0 : 0.73,
+                                                              0.05, F->unified_memory ? 1.0 : 0.95);
                     if (const int64_t mt = mem_total(); mt > 0 && frac < 1.0)
                         total = std::min<int64_t>(total, std::max<int64_t>(0, (int64_t) ((double) mt * frac) - stage_b));
 #endif
@@ -5926,13 +5940,11 @@ void Glm5Model::gap_report() {
 // prompt path and the layer split search size from the same number, before the pool is carved (a discrete card's:
 // fast_setup prices a unified-memory APU's pool itself).
 size_t Glm5Model::pool_avail(size_t free_b, size_t total_b) {
-    size_t reserve = (size_t) glmfast::kVramReserveMb << 20;
-    if (const char* r = getenv("STRATA_GLM_RESERVE_MB")) reserve = (size_t) std::atoll(r) << 20;
+    const size_t reserve = glmfast::vram_reserve_bytes(glmfast::kVramReserveMb);
     size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
-    if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
-        avail = std::min(avail, (size_t) (std::atof(cap) * 1073741824.0));
-    if (const char* vc = getenv("STRATA_GLM_VRAM_GB")) {
-        const size_t cap = (size_t) (std::atof(vc) * 1073741824.0);
+    if (getenv("STRATA_GLM_POOL_GB")) avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
+    if (getenv("STRATA_GLM_VRAM_GB")) {
+        const size_t cap = glmfast::env_gib("STRATA_GLM_VRAM_GB");
         const size_t used = total_b - free_b;
         avail = std::min(avail, cap > used + reserve ? cap - used - reserve : (size_t) 0);
     }

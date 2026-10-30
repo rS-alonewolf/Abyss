@@ -18,7 +18,8 @@ inline double env_num(const char* name, double def, double lo, double hi, const 
     if (raw == nullptr || *raw == 0) return def;
     char* end = nullptr;
     const double v = std::strtod(raw, &end);
-    if (end == raw) {
+    while (end != nullptr && *end != 0 && std::strchr(" \t\r\n", *end) != nullptr) ++end;   // (trailing blanks)
+    if (end == raw || (end != nullptr && *end != 0)) {   // nothing read, or "1,0" / "50s": not a number
         if (changed != nullptr) *changed = true;
         std::fprintf(stderr, "%s=%s is not a number: using %g\n", name, raw, def);
         return def;

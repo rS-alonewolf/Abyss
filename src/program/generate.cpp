@@ -15,6 +15,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/knobs.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -718,8 +719,7 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
 // the server starts it again instead of the GPU spinning forever.  Issue #31: before it does, it reports what every
 // part was doing (stall_report), so one occurrence says where the wait is.  Issue #40: the GLM serve has it too.
 void start_serve_watchdog(int default_s) {
-    const char* ws = std::getenv("STRATA_WATCHDOG_S");
-    const int limit = ws ? std::atoi(ws) : default_s;
+    const int limit = (int) strata::core::env_num("STRATA_WATCHDOG_S", default_s, 0, 86400);   // (a typo: the default, said)
     if (limit <= 0) return;
     std::thread([limit] {
         strata::core::Progress& p = strata::core::progress();

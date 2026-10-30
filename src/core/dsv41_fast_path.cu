@@ -12,6 +12,7 @@
 //     with the last FFN's.
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/knobs.hpp"
 #include "strata/kernels/dsv41_fast.hpp"
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -350,8 +351,7 @@ bool Glm5Model::dsv41_bind(std::string& err) {
         }
     E->hist.assign((size_t) max_ctx_ + 1, kEngDead);
     {   // the raw row cache (a power of two of rows) and the read threads
-        const char* cm = getenv("STRATA_DS41_ENGRAM_CACHE_MB");
-        const uint64_t mb = cm != nullptr ? (uint64_t) std::max(0, std::atoi(cm)) : 256u;
+        const uint64_t mb = (uint64_t) strata::core::env_num("STRATA_DS41_ENGRAM_CACHE_MB", 256, 0, 65536);
         uint64_t n = 1;
         while (n * 2 * (uint64_t) E->row_bytes <= mb << 20) n *= 2;
         if (mb > 0 && n >= 1024) {
@@ -359,8 +359,8 @@ bool Glm5Model::dsv41_bind(std::string& err) {
             E->cache.resize(n * (uint64_t) E->row_bytes);
             E->cmask = n - 1;
         }
-        const char* tn = getenv("STRATA_DS41_ENGRAM_THREADS");
-        E->pool = std::make_unique<EngPool>(tn != nullptr ? std::max(0, std::atoi(tn)) : 15);
+        // (the reader threads live as long as the process: a bound, so a typo does not start hundreds)
+        E->pool = std::make_unique<EngPool>((int) strata::core::env_num("STRATA_DS41_ENGRAM_THREADS", 15, 0, 64));
         std::fprintf(stderr, "deepseek41: Engram row cache %.0f MB (%llu rows), %zu read threads\n",
                      (double) E->cache.size() / 1048576.0, (unsigned long long) (E->cmask ? E->cmask + 1 : 0),
                      E->pool->th.size() + 1);
