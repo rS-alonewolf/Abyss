@@ -699,6 +699,7 @@ public:
     size_t prefill_v41_row() const;   // those two per row, in bytes (0: not deepseek41)
     bool prefill_setup(std::string& err);                  // in fast_setup: sizes, host buffers (no device memory)
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
+    int prefill_keep() const;                              // slots a layer the pool keeps from a prompt (issue #23)
     size_t prefill_trim_prestage(size_t max_borrow);       // ... at most this many: a smaller prestage buffer (the new bytes)
     bool prefill_bind(uint8_t* region, size_t bytes, std::string& err);   // its buffers inside the borrowed region
     size_t prefill_carve(int T);                           // ... laid out for chunks of T (the bytes it uses)

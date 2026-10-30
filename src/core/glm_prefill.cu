@@ -433,6 +433,12 @@ struct Glm5Model::PrefillState {
     std::function<std::pair<int64_t, int>(int64_t)> choose;
     int64_t lend_pct = 90;
     bool lend_pct_fixed = false;
+    // the slots a layer the pool keeps while a prompt runs: a route, the spares and 2 - or, on a pool that could lend
+    // no chunk at that (an 8 GB card: 9 slots a layer, issue #23), the spares and 1: the prompt stages nearly every
+    // expert anyway, and the decode's misses refill the tail after it (keep_small; STRATA_GLM_PREFILL_KEEP sets it)
+    int64_t keep = 0, keep_small = 0;
+    bool small = false;              // ... the small keep is in use (said once)
+    size_t need_min = 0, lend_max = 0;   // a 256-token chunk's bytes, and what the pool can lend at most (the refusal)
     std::string mode;
     int sub_env = 0;                 // STRATA_GLM_PREFILL_SUB: every sub-batch (0: mixer_sub, the shared expert kSub)
     int sh_sub() const { return sub_env > 0 ? sub_env : kSub; }   // the shared expert's sub-batch
@@ -627,7 +633,8 @@ void Glm5Model::prefill_settle(double pinned_share) {
     std::fprintf(stderr, "glm prefill: CUDA%d %.0f%% of the experts' bytes are held pinned: the pool lends at most 85%% "
                          "of its slots\n", dev_, 100.0 * pinned_share);
     if (pick.first == 0) {
-        std::fprintf(stderr, "glm prefill: CUDA%d the expert pool can lend no prompt chunk - token by token\n", dev_);
+        std::fprintf(stderr, "glm prefill: CUDA%d the expert pool can lend no prompt chunk at 85%% (a 256-token chunk needs "
+                             "%zu MB, it can lend %zu MB) - token by token\n", dev_, S->need_min >> 20, S->lend_max >> 20);
         prefill_destroy();
         return;
     }
@@ -845,7 +852,16 @@ bool Glm5Model::prefill_setup(std::string& err) {
     }
     int64_t per = std::min<int64_t>(g.n_expert, (int64_t) (avail / std::max<size_t>(1, blob_sum)));
     while (per > 0 && (size_t) per * stride_sum > avail) --per;
-    const int64_t keep = g.n_exp_used + gf::kSpares + 2;
+    // what every layer keeps from the prompt: a route's experts, the spares and 2 (fast_setup's floor).  A pool that
+    // can lend no chunk at that keeps only the spares and 1 instead (issue #23: an 8 GB RTX A2000 ran Ornith-1.5-122B
+    // IQ3_XXS with 9 slots a layer - no chunk against a keep of 13, 16 tok/s token by token.  A prompt runs alone and
+    // stages nearly every expert of a layer whatever the pool holds, so its residents are worth little to it, and the
+    // decode's misses refill the tail after it - 9 slots x 48 layers x 3.4 MB = 1.5 GB, a fraction of a second).
+    // STRATA_GLM_PREFILL_KEEP=<slots> sets that small keep (1..); the full keep stays first whenever it lends a chunk
+    const int64_t keep_full = g.n_exp_used + gf::kSpares + 2;
+    S->keep = keep_full;
+    S->keep_small = std::min<int64_t>(keep_full, gf::kSpares + 1);
+    if (const char* v = getenv("STRATA_GLM_PREFILL_KEEP")) S->keep_small = std::max<int64_t>(1, std::atoll(v));
     const char* pct_env = getenv("STRATA_PREFILL_LEND_PCT");
     const char* mb_env = getenv("STRATA_GLM_PREFILL_MB");
     const size_t gbuf = has_moe ? (size_t) PrefillState::NG * PrefillState::GE * gstride : 0;
@@ -855,16 +871,16 @@ bool Glm5Model::prefill_setup(std::string& err) {
     if (const char* v = getenv("STRATA_GLM_PRESTAGE")) ring_max = has_moe ? std::max(0, std::atoi(v)) : 0;
     // the chunk and its prestage slots for a lend cap of `pct`% of the pool's slots ({0, 0}: no chunk fits)
     S->choose = [=, this](int64_t pct) -> std::pair<int64_t, int> {
-        size_t lendable = 0;   // the bytes the pool can lend the prompt path
-        if (mb_env != nullptr) {
-            lendable = (size_t) (std::atof(mb_env) * 1048576.0);
-        } else if (stride_sum == 0) {
-            lendable = avail;
-        } else {
+        PrefillState* S = pf_;
+        // the bytes the pool can lend the prompt path when every layer keeps `keep` slots
+        const auto lendable_at = [&](int64_t keep) -> size_t {
+            if (mb_env != nullptr) return (size_t) (std::atof(mb_env) * 1048576.0);
+            if (stride_sum == 0) return avail;
             int64_t k = std::max<int64_t>(0, per - keep);
             if (is_auto) k = std::min<int64_t>(k, pct * per / 100);
-            lendable = (size_t) k * stride_sum;
-        }
+            return (size_t) k * stride_sum;
+        };
+        size_t lendable = lendable_at(keep_full);
         const auto nonring = [&](int64_t T) -> size_t {
             const auto pu = prefill_bytes_for((size_t) T);
             Carve c;
@@ -897,23 +913,45 @@ bool Glm5Model::prefill_setup(std::string& err) {
             }
             return best;
         };
-        int64_t T = 0;
-        if (is_auto && n_parts_ > 1) {
-            // a split: the chunk first (8192 at most - the parts' pipeline wants it whole), the prestage buffer from
-            // what it leaves (none below 16 slots) - a small card keeps its chunk
-            T = biggest(0);
-        } else if (is_auto) {
-            T = biggest(ring_max);
-            if (T == 0 && ring_max > kRingMin) T = biggest(kRingMin);
-            if (T == 0) T = biggest(0);
-        } else {
-            for (int64_t c = ceiling; c >= 256; c /= 2)
-                if (room(c) >= 0) {
-                    T = c;
-                    break;
-                }
-            if (T == 0 && ceiling > 0 && ceiling < 256 && room(ceiling) >= 0) T = ceiling;
+        const auto pick_T = [&]() -> int64_t {
+            int64_t T = 0;
+            if (is_auto && n_parts_ > 1) {
+                // a split: the chunk first (8192 at most - the parts' pipeline wants it whole), the prestage buffer
+                // from what it leaves (none below 16 slots) - a small card keeps its chunk
+                T = biggest(0);
+            } else if (is_auto) {
+                T = biggest(ring_max);
+                if (T == 0 && ring_max > kRingMin) T = biggest(kRingMin);
+                if (T == 0) T = biggest(0);
+            } else {
+                for (int64_t c = ceiling; c >= 256; c /= 2)
+                    if (room(c) >= 0) {
+                        T = c;
+                        break;
+                    }
+                if (T == 0 && ceiling > 0 && ceiling < 256 && room(ceiling) >= 0) T = ceiling;
+            }
+            return T;
+        };
+        int64_t T = pick_T();
+        int64_t keep = keep_full;
+        if (T == 0 && S->keep_small < keep_full && mb_env == nullptr && stride_sum > 0) {   // the small keep (above)
+            lendable = lendable_at(S->keep_small);
+            T = pick_T();
+            if (T > 0) {
+                keep = S->keep_small;
+                if (!S->small)
+                    std::fprintf(stderr, "glm prefill: CUDA%d the expert pool (%lld slots a layer) can lend no prompt "
+                                         "chunk while every layer keeps %lld slots - it keeps %lld while a prompt runs "
+                                         "(small VRAM; STRATA_GLM_PREFILL_KEEP)\n", dev_, (long long) per,
+                                 (long long) keep_full, (long long) keep);
+                S->small = true;
+            }
         }
+        S->keep = keep;
+        // (what a 256-token chunk would take against what the pool can lend at most: the refusal's "how much short")
+        S->need_min = nonring(256) + 256;
+        S->lend_max = lendable;
         const int64_t r = T > 0 ? room(T) : 0;
         return {T, T >= kPreMinT && r >= kRingMin ? (int) r : 0};
     };
@@ -923,8 +961,13 @@ bool Glm5Model::prefill_setup(std::string& err) {
     const auto pick = S->choose(S->lend_pct);
     const int64_t T = pick.first;
     if (T == 0) {
-        std::fprintf(stderr, "glm prefill: CUDA%d the expert pool (%lld slots a layer) can lend no prompt chunk "
-                             "(--prefill %s) - token by token\n", dev_, (long long) per, mode.c_str());
+        // (how much VRAM is short for the smallest chunk, and what frees it: Maya's refusal lines say as much)
+        const size_t short_b = S->need_min > S->lend_max ? S->need_min - S->lend_max : 0;
+        std::fprintf(stderr, "glm prefill: CUDA%d the expert pool (%lld slots a layer, %lld kept) can lend no prompt "
+                             "chunk (--prefill %s): a 256-token chunk needs %zu MB, the pool can lend %zu MB - %zu MB of "
+                             "VRAM short; a smaller --max-context, --kv q4_0 or a lighter dense pack (docs/SMALL-VRAM.md) "
+                             "frees it - token by token\n", dev_, (long long) per, (long long) S->keep, mode.c_str(),
+                     S->need_min >> 20, S->lend_max >> 20, (short_b + 1048575) >> 20);
         prefill_destroy();
         return true;
     }
@@ -1049,6 +1092,12 @@ bool Glm5Model::prefill_setup(std::string& err) {
 }
 
 size_t Glm5Model::prefill_borrow_bytes() const { return pf_ ? pf_->borrow_bytes : 0; }
+
+// the slots a layer the pool keeps while a prompt runs (prefill_setup: the full keep, or the small one on a pool that
+// could lend no chunk at that); without a prompt path, the full keep
+int Glm5Model::prefill_keep() const {
+    return pf_ != nullptr && pf_->keep > 0 ? (int) pf_->keep : g_.n_exp_used + gf::kSpares + 2;
+}
 
 // a pool that cannot lend the whole borrow: the prestage buffer shrinks to what it can (none below 16 slots)
 size_t Glm5Model::prefill_trim_prestage(size_t max_borrow) {

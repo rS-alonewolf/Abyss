@@ -1029,13 +1029,37 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (tot <= avail) break;
             --per;
         }
-        if (per < g.n_exp_used) {
-            err = "glm fast: not enough VRAM for the expert pool (" + std::to_string(per) + " slots per layer)";
-            return false;
-        }
         size_t stride_sum = 0;
         for (int il = l0_; il < lt_; ++il)
             if (F->L[(size_t) il].moe) stride_sum += slot_stride(il);
+        // THE FLOOR (issue #23): a route's experts need not all fit.  A miss lands in a spare slot or, with none free,
+        // in its own scratch slot (one a routed entry: glm_fast.cu's route), and the CPU lane computes its share from
+        // RAM - so the pool may run below top-k: the spares and one resident at least.  An 8 GB RTX A2000 ran
+        // GLM-5.3-Flash Maya-S-v2 with 6 slots of a route's 8, KL 0 against itself.  Such a pool misses most of a
+        // route and refills its spares every token - a lighter dense pack is the better fix (docs/SMALL-VRAM.md), and
+        // the refusal says how much is short.  STRATA_GLM_POOL_FLOOR=<slots> moves the floor (1..)
+        static const int pool_floor = [] {
+            const char* v = getenv("STRATA_GLM_POOL_FLOOR");
+            return v != nullptr ? std::max(1, std::atoi(v)) : gf::kSpares + 1;
+        }();
+        const auto short_mb = [&](int slots) {   // MB of VRAM short of `slots` a layer
+            const size_t need = (size_t) slots * stride_sum;
+            return (unsigned long long) ((need > avail ? need - avail : 0) + 1048575) >> 20;
+        };
+        if (per < pool_floor) {
+            char buf[640];
+            std::snprintf(buf, sizeof buf,
+                          "glm fast: not enough VRAM for the expert pool: %d slots per layer, %d at least (%llu MB short; "
+                          "a whole route's %d slots: %llu MB short) - a smaller --max-context, --kv q4_0 or a lighter "
+                          "dense pack (tools/requant_dense.py IQ4_XS, docs/SMALL-VRAM.md) frees it",
+                          per, pool_floor, short_mb(pool_floor), g.n_exp_used, short_mb(g.n_exp_used));
+            err = buf;
+            return false;
+        }
+        if (per < g.n_exp_used)
+            std::fprintf(stderr, "glm fast: CUDA%d the expert pool holds %d slots a layer, below a route's %d: the rest "
+                                 "of every route runs from the scratch slots and the CPU lane (%llu MB more VRAM would "
+                                 "hold a route; docs/SMALL-VRAM.md)\n", dev_, per, g.n_exp_used, short_mb(g.n_exp_used));
         // the prompt path borrows the pool's TAIL: the last k slots of every layer, laid out as one region after all
         // the main segments - the prompt path's buffers while a prompt runs, expert slots the rest of the time
         int k_extra = 0;
@@ -1045,11 +1069,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (pf_ != nullptr) {
             k_extra = tail_slots(prefill_borrow_bytes());
             // (the prestage buffer is the part that can shrink: to what the pool can lend, else none)
-            const int k_max = per - (g.n_exp_used + gf::kSpares + 2);
+            const int keep = prefill_keep();   // (prefill_setup: a route, the spares and 2 - or the small keep, #23)
+            const int k_max = per - keep;
             if (k_extra > k_max && k_max > 0) k_extra = tail_slots(prefill_trim_prestage((size_t) k_max * stride_sum));
             // (a prompt runs alone - no decode beside it, unlike the vision encoder's lending below - so its main
             // slots need little more than one route's experts and the spares)
-            if (per - k_extra < g.n_exp_used + gf::kSpares + 2) {
+            if (per - k_extra < keep) {
                 std::fprintf(stderr, "glm prefill: CUDA%d the pool (%d slots/layer) cannot lend %zu MB - token by token\n",
                              dev_, per, prefill_borrow_bytes() >> 20);
                 prefill_destroy();
@@ -1122,8 +1147,9 @@ bool Glm5Model::fast_setup(std::string& err) {
                 const int cap = g.n_expert + gf::kSpares;
                 // the floor: a route's experts, the spares and the lendable tail, +16 when the budget has room for
                 // it (a 24 GB card running the whole model has ~30 slots a layer: the +16 floor alone overran it)
+                // (a pool below the floor - issue #23 - gives every layer what it has: per)
                 const int need = g.n_exp_used + gf::kSpares + k_extra;
-                const int fl = std::min(cap, std::max(need, std::min(per, need + 16)));
+                const int fl = std::min({cap, per, std::max(need, std::min(per, need + 16))});
                 size_t used = 0;
                 for (int il = l0_; il < lt_; ++il)
                     if (F->L[(size_t) il].moe) {
