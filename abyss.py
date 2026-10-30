@@ -2156,8 +2156,9 @@ def server_command(cfg_path: Path, a) -> tuple:
         cmd += ["--api-key", a.api_key]
     if a.gpus or a.gpu is not None:                    # this start only, on these cards
         cmd += ["--gpu", str(a.gpus or a.gpu)]
-    if WIN or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+    if (WIN or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and not os.environ.get("ABYSS_NO_BROWSER"):
         cmd.append("--open")                           # a desktop: the browser opens when the model is ready
+                                                       # (not for Abyss Terminal's detached start: ABYSS_NO_BROWSER)
     here = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     ctx = args[args.index("--max-context") + 1] if "--max-context" in args[:-1] else None
     gpus = str(a.gpus or a.gpu if a.gpus or a.gpu is not None else cfg.get("gpu", 0)).strip("[]").split(",")
@@ -2957,6 +2958,20 @@ def setup_screen(a, asks: bool = True) -> bool:
     return True
 
 
+def terminal(a) -> int:
+    """./abyss.sh --terminal: Abyss Terminal (tools/abyss_terminal.py) - on its Textual screen (installed from
+    third_party/wheels the first time, as the setup's), else in plain text."""
+    import abyss_terminal
+    argv = []
+    for flag, val in (("--url", a.url), ("--key-env", a.key_env), ("--config", a.config), ("--demo", a.demo)):
+        if val is not None:
+            argv += [flag, str(val)]
+    argv += ["--interval", str(a.interval)]
+    argv += [f for f, on in (("--plain", a.plain), ("--once", a.once), ("--json", a.json)) if on]
+    screen = not (a.plain or a.once or a.json) and setup_screen(a, asks=False)
+    return abyss_terminal.main(argv, textual=screen)
+
+
 def set_up(a, prev: dict) -> Path | None:
     """Steps 1-8, then the tuning: the config written, or None when the model was not downloaded.  `prev`: the
     config of the setup before (its answers are the defaults)."""
@@ -3028,7 +3043,8 @@ def main() -> int:
     ap.add_argument("--yes", action="store_true",
                     help="take the recommended answers (the model download still needs --download-model)")
     ap.add_argument("--plain", action="store_true",
-                    help="the setup in plain text, the answers typed (not on the setup's own screen)")
+                    help="the setup in plain text, the answers typed (not on the setup's own screen); with "
+                         "--terminal: no Textual, plain text redrawn every second")
     ap.add_argument("--download-model", action="store_true",
                     help="download the model without asking (the commands and the size are still printed)")
     ap.add_argument("--model", choices=list(MODELS), help=f"which download (default: asked, {next(iter(MODELS))} "
@@ -3076,6 +3092,17 @@ def main() -> int:
                     help="measure the engine's per-GPU kernel choices on this PC's GPU(s) (no model, about a minute "
                          "each), write the faster ones into the installed configs and abyss-gpu-tune.txt (a report to "
                          "paste into an issue)")
+    ap.add_argument("--terminal", action="store_true",
+                    help="Abyss Terminal: watch the server (speed, where a token's time goes, GPUs, memory, requests), "
+                         "start / stop / switch models; closing it keeps the server running (docs/MANUAL.md)")
+    ap.add_argument("--url", help="with --terminal: a server on another PC, e.g. http://192.168.1.20:8082 (read-only)")
+    ap.add_argument("--key-env", metavar="NAME",
+                    help="with --terminal --url: the environment variable that holds the server's API key")
+    ap.add_argument("--interval", type=float, default=1.0, help="with --terminal: seconds between readings (0.5-10)")
+    ap.add_argument("--once", action="store_true", help="with --terminal: print one reading and exit")
+    ap.add_argument("--json", action="store_true", help="with --terminal: print one reading as JSON and exit")
+    ap.add_argument("--demo", metavar="SCENARIO", help="with --terminal: recorded readings, no server (r9700, lowspec, "
+                                                       "split, loading, down)")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
                                               "for --bench or --report (default: most recently used)")
     a = ap.parse_args()
@@ -3090,6 +3117,8 @@ def main() -> int:
         say("Starting through ./abyss.sh, which runs Maya with its own Python environment (.venv) ...")
         sys.stdout.flush()
         os.execve("/bin/sh", ["/bin/sh", str(HERE / "abyss.sh"), *sys.argv[1:]], dict(os.environ, MAYA_SH="1"))
+    if a.terminal:
+        return terminal(a)
     version = maya_version()
     say(f"Abyss v{version} - big MoE models on your own GPU, RAM and SSD.")
     if a.report:
