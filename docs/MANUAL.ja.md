@@ -290,6 +290,52 @@ GGUF_PY=~/llm/apps/llama.cpp/gguf-py LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin
   ディストリビューションでは root しか読めない: `sudo chmod o+r /sys/class/powercap/intel-rapl:0/energy_uj`
   （次の起動まで）で出る。AMD の APU は自身の電力テーブルで代わりに出す。
 
+### Abyss Terminal（`./abyss.sh --terminal`）
+
+サーバー（この PC のものでも別の PC のものでも）を見るターミナル UI。開いても閉じてもモデルは止まらない。
+
+```sh
+./abyss.sh --terminal                       # 動いているサーバー、無ければ最後に使った設定（Enter で起動）
+./abyss.sh --terminal --config abyss-dsv41-iq2xxs-r9700l.json
+ABYSS_API_KEY=... ./abyss.sh --terminal --url http://192.168.1.20:8082 --key-env ABYSS_API_KEY   # 別の PC
+./abyss.sh --terminal --plain               # Textual 無し: 1 秒毎に書き直すプレーン表示（古い Windows のコンソール）
+./abyss.sh --terminal --once                # 1 回読んで表示、--json は JSON で（issue 報告用）
+./abyss.sh --terminal --demo r9700          # 記録した値でサーバー無しに表示（r9700, lowspec, split, loading, down）
+```
+
+Windows は `START-ABYSS.bat --terminal`（オプションは同じ）。abyss.sh を使わない場合は `python tools/abyss_terminal.py ...`。
+画面は Textual で、初回に `third_party/wheels` から `.venv` へ入る（ダウンロードはしない）。
+
+- **ビュー**（`1`-`8`、`←` `→`）: **Overview** - decode と prompt の tok/s を大きく（動作中はライブ、待機中は前の
+  リクエストの値とラベルで区別）、1 トークンの時間の行き先を 1 本のバーで（SSD 待ち / GPU、CPU・iGPU レーンは並行
+  なので別線で示し足さない）、`--bench` と同じ判定と助言（同じコード `tools/bench_rules.py`）、一番忙しいカード、
+  VRAM、一番熱いカード（ジャンクション温度も）、電力、作業中の PCIe リンク、CPU、ディスク（`STRATA_GLM_MIRROR` の
+  SSD 毎）、コンテキスト、VRAM のエキスパート、RAM tier、スワップとメモリ圧込みのシステム RAM、ドラフタ受理率、
+  全カード（main / split / helper / iGPU レーン）、最近のリクエスト。**Speed** - 内訳と判定の根拠、ドライブ毎の SSD
+  読み出しと待ち、ミラーの分担、レーン、ドラフタ、最後の `--bench` と今の比較。**Memory** - エキスパートの居場所、
+  KV、RAM、「何が遅くしているか」。**Requests** - 保持中の全リクエスト（`↑` `↓`: Terminal を開いてから答えたものは
+  エンジンの 1 トークン内訳も）。**Hardware** - カード毎のクロック、edge / junction / メモリ温度、スロットル理由、
+  PCIe、CPU のコア・クラスタ毎、ドライブ。**Logs** - 色分けしたエンジンログ（`/` で絞り込み）。**Connect** - API の
+  アドレスと疎通確認（`h`）。**Models** - インストール済みの設定: `Enter` で起動（動いているサーバーは先に止める）、
+  `s` で停止、`B` で `--bench`（出力は Logs）、`y` でベンチ要約行をコピー。
+- **デタッチ:** Terminal が起動したサーバーは別セッションで動く（`abyss.py --config <設定> --plain`、出力は
+  `<設定>.server.log`、PID は `<設定>.pid`）。終了時に「提供を続ける / 止める」を聞く。既に動いていたサーバーには
+  触らない。停止は `POST /api/shutdown`、使えなければサーバーのプロセスグループへ Ctrl+C、60 秒で強制終了。次の
+  `--terminal` でまた繋がる。
+- **ヘッダ**は必ず量子化付きでモデルを示し（例 *DeepSeek V4.1 Flash 1017 UD-IQ2_XXS*）、答えが変わる設定をバッジで
+  出す（`UNCENSOR`、`TAIL SKIP n`、`DEFER`、`ABL`。`MTP`、`MIRROR`、`HELPER`）。状態: 接続中、ロード中（エンジンログ
+  からの warm-up 進捗）、待機、プロンプト読込、生成中、待ち行列、リロード、エラー、STALE（最後の値を保持）、切断
+  （間隔を空けて再試行）、認証が必要、Abyss ではない、停止。
+- **`--` は「報告されていない」**で、0 ではない。エンジンの次のカウンタ（phase 2）待ちのもの: 生成中ライブの
+  SSD 待ち・レーンの ms（それまではこの PC のエンジンログから回答毎に出す）、レーンの帯域、ドラフタの 1 ステップ
+  当たりトークン数、ヘルパーカードの分担。
+- **リモート:** 読み取りのみ（この PC のファイルを読む Models / Logs / 1 トークン内訳は出ない）。キーは `--key-env`
+  で指定した環境変数から読み、保存しない。別の PC へ平文の `http://` で送ると読まれうる - Tailscale か SSH トンネル
+  （`ssh -L 8082:127.0.0.1:8082 host` の後 `--url http://127.0.0.1:8082`）を使う。
+- **キー:** `r` すぐ再取得、`space` 表示を止める、`t` テーマ（dark / light / mono。`NO_COLOR` なら mono で始まる）、
+  `L` 温度の CSV を 2 秒毎に `bench/thermal/` へ記録、`b` web アプリを開く、`c` API アドレスをコピー（OSC 52）、
+  `?` ヘルプ、`q` / Ctrl+C で終了。80x24 で崩れず（箱を詰め、ビューはスクロール）、110 桁以上で表示が増える。
+
 ### Strata-tools の strata.sh を使う場合
 
 `strata.sh`（start / stop / log）を使うなら、Abyss のフォルダに起動スクリプトと設定を `run-<名前>.sh`,

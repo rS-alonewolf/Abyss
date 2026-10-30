@@ -58,6 +58,9 @@ SSD に残る。V4 から変わった点は [V4.1 の仕様](docs/deepseek41/SPE
 - **DeepSeek V4 / V4.1 のアテンションを全部実装** — スライディングウィンドウ、CSA/HCA 圧縮 KV（V4.1 は 4 つの共有スロットと 16K 超の候補ブロック）、インデクサの top-512、sinks
 - **思考とツール呼び出し** — 思考レベル `none` / `low` / `high` / `max`、DeepSeek の DSML 形式のツール呼び出し（同時呼び出しも可）
 - **OpenAI / Anthropic 互換 API** と、エキスパートの配置をリアルタイムで見られるブラウザのダッシュボード
+- **Abyss Terminal** — `./abyss.sh --terminal`: decode / prompt の tok/s、1 トークンの時間の行き先と `--bench` と同じ
+  判定、GPU、メモリ、リクエストをターミナルで。この PC でも別の PC のサーバーでも見られ、モデルの起動・停止・切替もでき、
+  閉じてもサーバーは動き続ける（[MANUAL](docs/MANUAL.ja.md#abyss-terminalabysssh---terminal)）。
 - **複数 GPU、AMD、V100** — NVIDIA の複数カードに層を分けて載せる。Radeon 向けの HIP ビルド（試験的）、CUDA 12 での sm_70 ビルド
 - **コマンド 1 つでセットアップ** — エンジン、モデル、pack、設定、運用スクリプトの `Abyss-tools` まで
 - **EXL3 量子化（GLM-5.3-Flash、試験的）** — exllamav3 のトレリス量子化をそのまま読む。turboderp の sc_2.10bpw は

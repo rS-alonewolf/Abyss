@@ -9,6 +9,21 @@ was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.
 
 ## Unreleased
 
+**Abyss Terminal (phase 1): `./abyss.sh --terminal` watches and runs the server from a terminal - this PC's or
+another's - and closing it leaves the model serving ([MANUAL](docs/MANUAL.md#abyss-terminal-abysssh---terminal)).**
+
+- Eight views: Overview (decode and prompt tok/s in big, where a token's time goes as one bar with `--bench`'s verdict
+  and advice, GPU / VRAM / temperature / power / PCIe while working / CPU / each SSD of a mirror, context, experts in
+  VRAM, the RAM tier, RAM with swap and memory pressure, the drafter, every card with its role, the last requests),
+  Speed, Memory, Requests, Hardware, Logs, Connect, Models (start / stop / switch a config, run `--bench`).
+- The server it starts runs detached (PID file, output beside the config); quit asks keep serving or stop. A stop is
+  `POST /api/shutdown`, else Ctrl+C to its process group.
+- Remote: `--url` with `--key-env NAME` (the key read from that variable, never stored), read-only, a warning for a key
+  over plain http. `--plain` (no Textual), `--once`, `--json`, `--demo <scenario>` (recorded readings, no server).
+- `--bench`'s bottleneck rules and advice moved to `tools/bench_rules.py`, which both use (the bench's output is
+  unchanged). A value not reported is `--`, never 0; the live per-token ms wait for the engine's next STAT keys
+  (phase 2) and come from the engine log on this PC until then.
+
 **Server side of Abyss Terminal (phase 1.5): `/metrics` names the run and reads the whole machine, and
 `POST /api/shutdown` stops a runaway engine from another program ([MANUAL](docs/MANUAL.md#using-it)).**
 

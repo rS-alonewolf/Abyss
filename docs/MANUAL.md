@@ -297,6 +297,54 @@ in the browser, `--gpu 0` picks the GPU.
   distributions let only root read: `sudo chmod o+r /sys/class/powercap/intel-rapl:0/energy_uj` (until the next
   boot) shows it; an AMD APU falls back to its own power table.
 
+### Abyss Terminal (`./abyss.sh --terminal`)
+
+A terminal UI for the server - this PC's or another's - that you open and close without stopping the model.
+
+```sh
+./abyss.sh --terminal                       # the running server, else the last-used config's (Enter starts it)
+./abyss.sh --terminal --config abyss-dsv41-iq2xxs-r9700l.json
+ABYSS_API_KEY=... ./abyss.sh --terminal --url http://192.168.1.20:8082 --key-env ABYSS_API_KEY   # another PC
+./abyss.sh --terminal --plain               # no Textual: plain text redrawn every second (an old Windows console)
+./abyss.sh --terminal --once                # one reading printed; --json the same as JSON (issue reports)
+./abyss.sh --terminal --demo r9700          # recorded readings, no server (r9700, lowspec, split, loading, down)
+```
+
+Windows: `START-ABYSS.bat --terminal` with the same options; without abyss.sh: `python tools/abyss_terminal.py ...`.
+The screen is Textual, installed into `.venv` from `third_party/wheels` the first time (nothing is downloaded).
+
+- **Views** (`1`-`8`, `←` `→`): **Overview** - decode and prompt tok/s in big (live while it works, else the last
+  request's, labelled), where a token's time goes as one bar (SSD wait / GPU, the CPU or iGPU lane alongside - it runs
+  in parallel and is never added) with `--bench`'s verdict and advice (the same code, `tools/bench_rules.py`), the
+  busiest card, VRAM, the hottest card (junction too), power, the PCIe link while working, CPU, disk (each SSD of a
+  `STRATA_GLM_MIRROR` pair), context fill, experts in VRAM, the RAM tier, system RAM with swap and memory pressure, the
+  drafter's acceptance, every card (main / split / helper / iGPU lane) and the last requests; **Speed** - the
+  breakdown with the verdict's evidence, SSD reads and waits per drive and the mirror's share, the lane, the drafter,
+  the last `--bench` against now; **Memory** - where the experts live, KV, RAM, and what is slowing you down;
+  **Requests** - all kept requests (`↑` `↓`: the engine's per-token line of one answered while the Terminal was open);
+  **Hardware** - per card clocks, edge / junction / memory temperatures, throttle reasons, PCIe, the CPU per core and
+  cluster, the drives; **Logs** - the engine log coloured (`/` filters); **Connect** - the API addresses and a check
+  (`h`); **Models** - the installed configs: `Enter` starts one (the running server stops first), `s` stops, `B` runs
+  `--bench` (its output in Logs), `y` copies the bench line.
+- **Detached:** a server the Terminal starts runs in a session of its own (`abyss.py --config <config> --plain`,
+  output in `<config>.server.log`, PID in `<config>.pid`) - quitting asks *keep serving* or *stop it*; a server that
+  was already running is left alone. A stop is `POST /api/shutdown`, else Ctrl+C to the server's process group; after
+  60 s it is killed. The next `--terminal` attaches again.
+- **The header** always names the model with its quant (e.g. *DeepSeek V4.1 Flash 1017 UD-IQ2_XXS*) and shows the
+  settings that change the answers as badges (`UNCENSOR`, `TAIL SKIP n`, `DEFER`, `ABL`; `MTP`, `MIRROR`, `HELPER`).
+  States: connecting, loading (the warm-up's progress, from the engine log), idle, reading the prompt, generating,
+  queued, reloading, error, stale (the last values kept), disconnected (it retries with back-off), auth required,
+  not Abyss, stopped.
+- **`--` means not reported**, never 0. Two kinds wait for the engine's next counters (phase 2): the per-token SSD-wait
+  and lane ms live while it writes (until then they come from the engine log after each answer - on this PC only),
+  the lane's bandwidth, the drafter's tokens per step and the helper card's share.
+- **Remote:** read-only (no Models / Logs / per-token breakdown, which read this PC's files). The key is read from the
+  environment variable `--key-env` names and never stored; over plain `http://` to another PC it travels readable - use
+  Tailscale or an SSH tunnel (`ssh -L 8082:127.0.0.1:8082 host`, then `--url http://127.0.0.1:8082`).
+- **Keys:** `r` poll now, `space` freeze, `t` theme (dark / light / mono; `NO_COLOR` starts in mono), `L` records a
+  temperature CSV to `bench/thermal/` every 2 s, `b` opens the web app, `c` copies the API address (OSC 52), `?` help,
+  `q` / Ctrl+C quit. It fits 80x24 (compact boxes, the view scrolls) and shows more from 110 columns.
+
 ### With Strata-tools' strata.sh
 
 If you use the `strata.sh` helper (start / stop / log), put a run script and the config into the Abyss folder under

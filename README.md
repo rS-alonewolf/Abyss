@@ -67,6 +67,9 @@ the APU's iGPU as a lane).
   blocks past 16K), the lightning indexer's top-512, sinks.
 - **Thinking and tool calls** — reasoning levels `none` / `low` / `high` / `max`, DeepSeek's DSML tool calls, parallel calls.
 - **OpenAI and Anthropic APIs** plus a browser dashboard with a live view of the expert tiers.
+- **Abyss Terminal** — `./abyss.sh --terminal`: decode / prompt tok/s, where a token's time goes with `--bench`'s
+  verdict, GPUs, memory and requests in the terminal, for this PC's server or another's; it starts, stops and switches
+  models and leaves the server running when it closes ([MANUAL](docs/MANUAL.md#abyss-terminal-abysssh---terminal)).
 - **Several GPUs, AMD, V100** — a layer split across NVIDIA cards, an experimental HIP build for Radeon, and an sm_70
   build with CUDA 12.
 - **One-command setup** — engine, model, pack, config and the `Abyss-tools` helper scripts.
