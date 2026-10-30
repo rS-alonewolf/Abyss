@@ -9,6 +9,7 @@ sparklines and bars; numbers right-aligned.  A style is a palette role and flags
 """
 from __future__ import annotations
 
+import re
 import time
 
 from terminal_model import pretty_name
@@ -25,6 +26,7 @@ PALETTES = {
               "hilite": "#d3e9ef"},
 }
 THEMES = ("dark", "light", "mono")
+LAYOUTS = ("speed", "devices")         # the Overview: A big numbers + tiles, B every device in its own panel
 VIEWS = (("1", "OVERVIEW", "OVR"), ("2", "SPEED", "SPD"), ("3", "MEMORY", "MEM"), ("4", "REQUESTS", "REQ"),
          ("5", "HARDWARE", "HW"), ("6", "LOGS", "LOG"), ("7", "CONNECT", "CON"), ("8", "MODELS", "MOD"))
 BLOCKS = "▁▂▃▄▅▆▇█"
@@ -401,13 +403,16 @@ def tabs(view: int, w: int) -> Line:
     return fit(out, w)
 
 
-FOOT_KEYS = (("1-8", "views"), ("←→", ""), ("r", "refresh"), ("space", "freeze"), ("t", "theme"), ("L", "temp log"),
+FOOT_KEYS = (("1-8", "views"), ("←→", ""), ("l", "layout"), ("r", "refresh"), ("space", "freeze"), ("t", "theme"),
+             ("L", "temp log"),
              ("?", "help"), ("q", "quit"))
 
 
 def footer(v: dict, w: int, frozen: bool = False, message: str = "", recording: bool = False,
-           keys=FOOT_KEYS) -> Line:
+           keys=FOOT_KEYS, layout: str | None = None) -> Line:
     left = Line()
+    if layout:
+        left.add(f"▣ {layout.upper()} ", "accent b r").add(" ")
     for k, what in keys:
         piece = L(k, "accent b", (" " + what) if what else "", "muted", "  ")
         if left.width + piece.width > w - 22:
@@ -544,13 +549,16 @@ def tiles(v: dict, w: int) -> list:
     g, p, c, dk = v["gpu"], v.get("pcie"), v["cpu"], v["disk"]
     t = []
     t.append(("GPU LOAD", L(f(g.get("busiest"), 0, "%"), "accent b"),
-              L(f"busiest of {g['n']}" if g.get("n", 0) > 1 else "model card", "muted"), g.get("spark"), "accent"))
-    vram = L(gib(g.get("mem_used")), "accent b", f"/{gib(g.get('mem_total'), 0)} GB", "muted")
-    frac = g["mem_used"] / g["mem_total"] if g.get("mem_used") is not None and g.get("mem_total") else None
+              L(f"GPU{g.get('busiest_card')} busiest of {g['n']}" if g.get("n", 0) > 1 else "model card", "muted"),
+              g.get("spark"), "accent"))
+    mu = g.get("cards_mem_used") if g.get("cards_mem_used") is not None else g.get("mem_used")
+    mt = g.get("cards_mem_total") or g.get("mem_total")
+    vram = L(gib(mu, 0 if (mt or 0) >= 100 * 2**30 else 1), "accent b", f"/{gib(mt, 0)} GB", "muted")
+    frac = mu / mt if mu is not None and mt else None
     t.append(("VRAM", vram, L("pool ", "muted", f(g.get("pool_gb"), 1, " GB"), "ink"), ("bar", frac), "accent"))
     temp = L(f(g.get("temp"), 0, "°C"), tone_temp(g.get("temp")) + " b")
     temp.add("  jct ", "muted").add(f(g.get("junction"), 0, "°C"), tone_temp(g.get("junction"), True))
-    t.append(("GPU TEMP", temp, L("hottest card", "muted"),
+    t.append(("GPU TEMP", temp, L(f"GPU{g.get('hottest_card')} hottest" if g.get("n", 0) > 1 else "the card", "muted"),
               ("bar", (g.get("junction") or g.get("temp") or 0) / 110 if g.get("temp") is not None else None),
               tone_temp(g.get("junction"), True).split()[0] if g.get("junction") is not None else
               tone_temp(g.get("temp")).split()[0]))
@@ -560,6 +568,8 @@ def tiles(v: dict, w: int) -> list:
     if p:
         style = "alert b" if p.get("dropped") else "accent b"
         link = L(f"Gen{p['gen']:.0f} x{p['width']:.0f}" if p.get("width") else f"Gen{p['gen']:.0f}", style)
+        if g.get("n", 0) > 1 and g.get("slowest_link_card") is not None:
+            link.add(f" GPU{g['slowest_link_card']}", "muted")
         mx = L("max ", "muted", f"Gen{p['gen_max']:.0f}" if p.get("gen_max") else DASH, "ink",
                f" x{p['width_max']:.0f}" if p.get("width_max") else "", "ink",
                "  " + rate(p.get("rx_mb")) if p.get("rx_mb") is not None else "", "muted")
@@ -577,9 +587,10 @@ def tiles(v: dict, w: int) -> list:
     ds = Line()
     mir = [d for d in dk.get("drives") or [] if "mirror" in d["roles"] or "model" in d["roles"]]
     if len(mir) > 1:
-        for i, d in enumerate(mir[:2]):
+        dl = L(rate(dk.get("shard_mb")), "accent b", f" {len(mir)} SSDs", "muted")
+        for i, d in enumerate(mir):
             ds.add(f"SSD{i + 1} ", "violet" if "mirror" in d["roles"] else "accent2")
-            ds.add(f"{(d.get('read_mb') or 0) / 1024:.2f}  " if d.get("read_mb") is not None else DASH + "  ", "ink")
+            ds.add(f"{pct(d.get('share'))} ", "ink")
     elif mir:
         ds.add(f"{mir[0]['name']} ", "muted").add(rate(mir[0].get("read_mb")), "ink")
     else:
@@ -608,6 +619,10 @@ def tiles(v: dict, w: int) -> list:
 def tile_line(v: dict, w: int) -> list:
     """The tiles in two lines (narrow terminals)."""
     g, p, c, dk = v["gpu"], v.get("pcie"), v["cpu"], v["disk"]
+    if (g.get("n") or 0) > 1 or len(v["cards"]) > 2:
+        b = L("CPU ", "muted", f(c.get("pct"), 0, "%"), "accent b", f" {f(c.get('temp'), 0, '°C')}  ",
+              tone_temp(c.get("temp")))
+        return [gpu_summary(v, w), fit(b.cat(disk_summary(v, w - b.width)), w)]
     a = L("GPU ", "muted", f(g.get("busiest"), 0, "%"), "accent b", "  VRAM ", "muted", gib(g.get("mem_used")),
           "accent b", f"/{gib(g.get('mem_total'), 0)}G", "muted", "  ", "", f(g.get("temp"), 0, "°C"),
           tone_temp(g.get("temp")) + " b", "/", "muted", f(g.get("junction"), 0, "°C"),
@@ -667,19 +682,56 @@ def memory_bars(v: dict, w: int) -> list:
     return [meter(lab, fr, w, val, sty, lw, vw) for lab, fr, val, sty in items]
 
 
+def link_text(c: dict, own_max: bool = True) -> str:
+    """A card's working PCIe link, with its own max (each card its own: a mixed box shows each card's)."""
+    if c.get("pcie_gen") is None:
+        return DASH
+    t = f"G{c['pcie_gen']:.0f}x{(c.get('pcie_width') or 0):.0f}"
+    if own_max and c.get("pcie_gen_max"):
+        t += f"/{c['pcie_gen_max']:.0f}x{(c.get('pcie_width_max') or 0):.0f}"
+    return t
+
+
+def link_tone(c: dict) -> str:
+    return "alert b" if c.get("drop") or c.get("weak") else "warn" if c.get("behind") else "ink"
+
+
+def layers_text(c: dict) -> str:
+    lay = c.get("layers")
+    return f"L{lay[0]}-{lay[1] - 1}" if lay else DASH
+
+
+def card_flags(c: dict) -> Line:
+    out = Line()
+    if c.get("drop"):
+        fg, fw = c.get("drop_from") or (0, 0)
+        out.add(f"▲ DROPPED from G{(fg or 0):.0f}x{(fw or 0):.0f} ", "alert b")
+    if c.get("weak"):
+        out.add("▲ WEAK LINK - holds the split back ", "alert b")
+    elif c.get("behind"):
+        out.add("behind its twins' link ", "warn")
+    thr = [t for t in (c.get("throttle") or []) if t not in ("idle", "gpu_idle")]
+    if thr:
+        out.add("throttle " + ", ".join(thr), "warn")
+    return out
+
+
 def card_rows(v: dict, w: int, full: bool = False) -> list:
-    """One row a card: role, name, load, VRAM, temps (edge / junction / memory), clocks, power, PCIe, source."""
-    cols = [("ROLE", 7, "l"), ("CARD", 0, "l"), ("LOAD", 5, "r"), ("VRAM GB", 11, "r"), ("TEMP °C", 10, "r"),
-            ("MHz", 11 if full else 5, "r"), ("W", 9, "r"), ("PCIe", 10, "r")]
+    """One row a card: role, name, load, VRAM, layers and expert pool (a layer split), temps (edge / junction /
+    memory), clocks, power against its own limit, PCIe against its own max, its share of the token (phase 2), source.
+    The busiest card is starred; a card holding the split back (dropped / weak link) is pink."""
+    cols = [("ROLE", 7, "l"), ("CARD", 0, "l"), ("LOAD", 5, "r"), ("VRAM GB", 11, "r"), ("LAYERS", 7, "r"),
+            ("POOL", 5, "r"), ("TEMP °C", 7, "r"), ("MHz", 11 if full else 5, "r"), ("W", 7, "r"),
+            ("PCIe", 12, "r")]
     if full:
-        cols.insert(5, ("MEM°C", 5, "r"))
-        cols.append(("SOURCE", 18, "l"))
-    fixed = sum(c[1] + 1 for c in cols)
-    namew = max(6, w - fixed)
-    while namew < 10 and len(cols) > 5:       # (narrow: drop the right-most columns)
-        cols.pop()
-        fixed = sum(c[1] + 1 for c in cols)
-        namew = max(6, w - fixed)
+        cols.insert(7, ("MEM°C", 5, "r"))
+        cols += [("TOK%", 4, "r"), ("SOURCE", 12, "l")]
+    namew = max(6, w - sum(c[1] + 1 for c in cols))
+    for drop in ("SOURCE", "TOK%", "MEM°C", "POOL", "LAYERS", "MHz", "W"):   # (narrow: the least needed go first)
+        if namew >= 14:
+            break
+        cols = [c for c in cols if c[0] != drop]
+        namew = max(6, w - sum(c[1] + 1 for c in cols))
     cols = [(n, cw or namew, a) for n, cw, a in cols]
 
     def row(cells):
@@ -694,36 +746,279 @@ def card_rows(v: dict, w: int, full: bool = False) -> list:
     for c in v["cards"]:
         role = c.get("role") or "main"
         util = c.get("util")
-        p = (f"G{c['pcie_gen']:.0f}x{(c.get('pcie_width') or 0):.0f}" if c.get("pcie_gen") is not None else DASH)
-        if c.get("pcie_gen_max") and full:
-            p += f"/{c['pcie_gen_max']:.0f}"
-        temps = f"{f(c.get('temp'), 0)}/{f(c.get('temp_junction'), 0)}"
         hot = max([x for x in (c.get("temp"), (c.get("temp_junction") or 0) - 13) if x is not None], default=None)
-        clk = f"{f(c.get('clock_mhz'))}" + (f"/{f(c.get('mem_clock_mhz'))}" if full else "")
-        cells = [(ROLE.get(role, role.upper()), "violet b" if role in ("helper", "igpu") else "accent b"),
-                 ((("" if c.get("index") is None else f"{c['index']} ") + short(c.get("name") or "")), "ink"),
-                 (f(util, 0, "%"), "accent b" if (util or 0) >= 80 else "ink"),
-                 (f"{gib(c.get('mem_used'))}/{gib(c.get('mem_total'), 0)}" if c.get("mem_total") else
-                  ("shared" if c.get("shared_memory") else DASH), "ink"),
-                 (temps, tone_temp(hot)), ]
-        if full:
-            cells.append((f(c.get("temp_mem"), 0), tone_temp(c.get("temp_mem"))))
-        cells += [(clk, "ink"), (f"{f(c.get('power'), 0)}/{f(c.get('power_limit'), 0)}" if c.get("power_limit")
-                                 else f(c.get("power"), 0), "ink"),
-                  (p, "alert b" if v.get("pcie") and v["pcie"].get("dropped") and role in ("main", "split")
-                   else "ink")]
-        if full:
-            src = c.get("source")
-            cells.append(("+".join(src) if isinstance(src, list) else str(src or DASH), "faint"))
-        out.append(row(cells))
-        if full and c.get("throttle"):
-            out.append(L("        throttle: ", "muted", ", ".join(c["throttle"]), "warn"))
+        bad = c.get("drop") or c.get("weak")
+        cell = {"ROLE": (("★" if c.get("busiest") else " ") + ROLE.get(role, role.upper()),
+                         "alert b" if bad else "violet b" if role in ("helper", "igpu") else "accent b"),
+                "CARD": ((("" if c.get("index") is None else f"{c['index']} ") + short(c.get("name") or "")),
+                         "alert" if bad else "ink b" if c.get("busiest") else "ink"),
+                "LOAD": (f(util, 0, "%"), "accent b r" if c.get("busiest") else "accent b" if (util or 0) >= 80
+                         else "ink"),
+                "VRAM GB": (f"{gib(c.get('mem_used'))}/{gib(c.get('mem_total'), 0)}" if c.get("mem_total") else
+                            ("shared" if c.get("shared_memory") else DASH), "ink"),
+                "LAYERS": (layers_text(c), "ink" if c.get("layers") else "muted"),
+                "POOL": (f(c.get("pool_gb"), 1), "ink" if c.get("pool_gb") is not None else "muted"),
+                "TEMP °C": (f"{f(c.get('temp'), 0)}/{f(c.get('temp_junction'), 0)}", tone_temp(hot)),
+                "MEM°C": (f(c.get("temp_mem"), 0), tone_temp(c.get("temp_mem"))),
+                "MHz": (f"{f(c.get('clock_mhz'))}" + (f"/{f(c.get('mem_clock_mhz'))}" if full else ""), "ink"),
+                "W": (f"{f(c.get('power'), 0)}/{f(c.get('power_limit'), 0)}" if c.get("power_limit")
+                      else f(c.get("power"), 0), "ink"),
+                "PCIe": (link_text(c), link_tone(c)),
+                "TOK%": (pct(c.get("tt_share")), "muted" if c.get("tt_share") is None else "ink"),
+                "SOURCE": ("+".join(c["source"]) if isinstance(c.get("source"), list) else str(c.get("source") or DASH),
+                           "faint")}
+        out.append(row([cell[n] for n, _, _ in cols]))
+        flags = card_flags(c)
+        if full and flags.width:
+            out.append(L("         ", "", flags.plain, "alert b" if bad else "warn"))
+    return out
+
+
+# ------------------------------------------------------------------------------------------------ devices
+def gpu_summary(v: dict, w: int) -> Line:
+    """Many cards in one line: how many, the busiest, VRAM of the model's cards, the hottest, the slowest link."""
+    g = v["gpu"]
+    byi = {c.get("index"): c for c in v["cards"]}
+    n = g.get("n") or len(v["cards"])
+    tight = w < 100
+    ln = L(f"{n} GPU{'s' if n != 1 else ''}", "accent b")
+    b = byi.get(g.get("busiest_card"))
+    if b is not None and n > 1:
+        ln.add(" · busiest " if not tight else " · busy ", "muted").add(f"GPU{b.get('index')} {f(b.get('util'), 0, '%')}",
+                                                                         "accent b")
+    elif v["cards"]:
+        ln.add(f" {f(v['cards'][0].get('util'), 0, '%')}", "accent b")
+    if g.get("cards_mem_total"):
+        ln.add(" · VRAM ", "muted").add(f"{gib(g.get('cards_mem_used'), 0)}/{gib(g['cards_mem_total'], 0)}"
+                                        + ("G" if tight else " GB"), "ink b")
+    hc = byi.get(g.get("hottest_card"))
+    if hc is not None and n > 1:
+        ln.add(" · hottest " if not tight else " · hot ", "muted").add(
+            f"GPU{hc.get('index')} {f(hc.get('temp'), 0, '°C')}", tone_temp(hc.get("temp")))
+    sc = byi.get(g.get("slowest_link_card"))
+    if sc is not None and n > 1:
+        ln.add(" · lowest link " if not tight else " · link ", "muted").add(
+            f"GPU{sc.get('index')} {link_text(sc, False)}", link_tone(sc))
+    return fit(ln, w)
+
+
+def disk_summary(v: dict, w: int) -> Line:
+    dk = v["disk"]
+    shard = [d for d in dk.get("drives") or [] if d.get("share") is not None or "model" in d["roles"]
+             or "mirror" in d["roles"]]
+    n = len(shard)
+    ln = L(f"{n} SSD{'s' if n != 1 else ''} " if n else "disk ", "info b",
+           rate(dk.get("shard_mb") if dk.get("shard_mb") is not None else dk.get("read_mb")), "ink b")
+    if n > 1:
+        ln.add("  ", "")
+        for i, d in enumerate(shard):
+            ln.add(f"SSD{i + 1} ", "violet" if "mirror" in d["roles"] else "accent2").add(f"{pct(d.get('share'))}  ",
+                                                                                            "ink")
+    return fit(ln, w)
+
+
+def gpu_panel(c: dict, v: dict, w: int, h: int) -> list:
+    inner = w - 4
+    role = c.get("role") or "main"
+    bad = c.get("drop") or c.get("weak")
+    title = f"GPU{c.get('index')} {short(c.get('name') or '')}"
+    tag = L(("★ " if c.get("busiest") else "") + ROLE.get(role, role.upper()),
+            "alert b" if bad else "accent b r" if c.get("busiest") else "violet b" if role in ("helper", "igpu")
+            else "accent b")
+    vw = 14
+    rows = [L("load".ljust(6), "muted").cat(bar((c.get("util") or 0) / 100 if c.get("util") is not None else None,
+                                                max(3, inner - 6 - 6), "accent")).add(f"{f(c.get('util'), 0, '%'):>6}",
+                                                                                    "accent b")]
+    if c.get("mem_total"):
+        fr = (c.get("mem_used") or 0) / c["mem_total"]
+        rows.append(L("vram".ljust(6), "muted").cat(bar(fr, max(3, inner - 6 - vw), "info"))
+                    .add(f"{gib(c.get('mem_used')):>6}/{gib(c['mem_total'], 0)} GB".rjust(vw), "ink"))
+    else:
+        rows.append(L("vram  ", "muted", "shared with the CPU" if c.get("shared_memory") else DASH, "muted"))
+    if role == "igpu":
+        rows.append(L("RAM read ", "muted", rate(c.get("dram_read_mb")), "ink b", "  lane ", "muted",
+                      (v.get("lane") or {}).get("name") or DASH, "violet"))
+    else:
+        rows.append(L("layers ", "muted", layers_text(c), "ink b" if c.get("layers") else "muted", "  pool ", "muted",
+                      f(c.get("pool_gb"), 1, " GB") if c.get("pool_gb") is not None else DASH,
+                      "ink b" if c.get("pool_gb") is not None else "muted", "  tok ", "muted", pct(c.get("tt_share")),
+                      "muted" if c.get("tt_share") is None else "ink b"))
+    rows.append(L(f(c.get("temp"), 0, "°C"), tone_temp(c.get("temp")) + " b", " jct ", "muted",
+                  f(c.get("temp_junction"), 0), tone_temp(c.get("temp_junction"), True), " mem ", "muted",
+                  f(c.get("temp_mem"), 0), tone_temp(c.get("temp_mem")), f"  {f(c.get('clock_mhz'))} MHz", "muted"))
+    pw = L(f(c.get("power"), 0, " W"), "warn b", f"/{f(c.get('power_limit'), 0)}" if c.get("power_limit") else "",
+           "muted")
+    if role != "igpu":
+        pw.add("  PCIe ", "muted").add(link_text(c), link_tone(c))
+        if c.get("pcie_rx_mb") is not None:
+            pw.add(f" {rate(c['pcie_rx_mb'])}", "muted")
+    rows.append(pw)
+    fl = card_flags(c)
+    rows.append(fl if fl.width else L(" ".join(c["source"]) if isinstance(c.get("source"), list) else "", "faint"))
+    title = title[:max(4, w - tag.width - 9)]
+    return box(title, rows, w, tag=tag, h=h, tone="alert" if bad else "accent" if c.get("busiest") else "edge",
+               corner="alert" if bad else "accent")
+
+
+def cpu_panel(v: dict, w: int, h: int) -> list:
+    c = v["cpu"]
+    inner = w - 4
+    rows = [L("load".ljust(6), "muted").cat(bar((c.get("pct") or 0) / 100 if c.get("pct") is not None else None,
+                                                max(3, inner - 12), "violet")).add(f"{f(c.get('pct'), 0, '%'):>6}",
+                                                                                 "violet b"),
+            L(f(c.get("temp"), 0, "°C"), tone_temp(c.get("temp")) + " b", f"  {f(c.get('mhz'), 0)}", "ink",
+              f"/{f(c.get('mhz_max'), 0)} MHz", "muted", f"  {f(c.get('power'), 0)} W", "warn" if c.get("power")
+              is not None else "muted"),
+            L(f"{c.get('cores') or '?'}c/{c.get('threads') or '?'}t", "ink", "  lane ", "muted",
+              f"{c['lane_threads']:.0f} threads" if c.get("lane_threads") else DASH, "ink"),
+            L("ISA ", "muted", "/".join((c.get("isa") or [])[:4]) or DASH, "violet"),
+            spark(c.get("per_core") or c.get("spark"), inner, "violet", top=100)]
+    return box("CPU " + short(c.get("name") or "")[:max(0, w - 10)], rows, w, h=h, tag=L("CPU", "violet b"))
+
+
+def ssd_panel(d: dict, i: int, v: dict, w: int, h: int) -> list:
+    inner = w - 4
+    dk = v["disk"]
+    top = max([x.get("read_mb") or 0 for x in dk.get("drives") or []] + [((v.get("bench") or {}).get("ssd") or 0) * 1024,
+                                                                        1.0])
+    roles = "/".join(d["roles"]) or "other"
+    rows = [L("read".ljust(6), "muted").cat(bar((d.get("read_mb") or 0) / top if d.get("read_mb") is not None else None,
+                                                max(3, inner - 6 - 11), "info"))
+            .add(f"{rate(d.get('read_mb')):>11}", "info b")]
+    if d.get("share") is not None:
+        rows.append(L("share".ljust(6), "muted").cat(bar(d["share"], max(3, inner - 6 - 11),
+                                                         "violet" if "mirror" in d["roles"] else "accent2"))
+                    .add(f"{pct(d['share']):>11}", "ink b"))
+        rows.append(L("of the expert reads from disk", "faint i"))
+    else:
+        rows.append(L("not a model drive", "faint i"))
+    rows.append(L("write ", "muted", rate(d.get("write_mb")), "ink"))
+    rows.append(L(", ".join(d.get("paths") or [])[:inner] or DASH, "faint"))
+    return box(f"SSD{i + 1} {d['name']}", rows, w, h=h,
+               tag=L(roles.upper(), "violet b" if "mirror" in d["roles"] else "accent2 b"))
+
+
+def device_panels(v: dict, w: int, h_panel: int = 8) -> list:
+    """Every device its own panel: each GPU (main / split / helper / iGPU), the CPU, each drive - in a grid that wraps
+    (as many columns as fit at >= 36 wide)."""
+    panels = [("gpu", c) for c in v["cards"]] + [("cpu", None)] + \
+        [("ssd", (i, d)) for i, d in enumerate(v["disk"].get("drives") or [])]
+    cols = max(1, min(len(panels), w // 36))
+    out = []
+    for k in range(0, len(panels), cols):
+        chunk = panels[k:k + cols]
+        ws = split(w, [1] * cols)[:len(chunk)]
+        blocks = []
+        for (kind, x), pw in zip(chunk, ws):
+            if kind == "gpu":
+                blocks.append(gpu_panel(x, v, pw, h_panel))
+            elif kind == "cpu":
+                blocks.append(cpu_panel(v, pw, h_panel))
+            else:
+                blocks.append(ssd_panel(x[1], x[0], v, pw, h_panel))
+        out += hjoin(blocks, ws)
+    return out
+
+
+def device_line(kind: str, x, v: dict, w: int) -> Line:
+    """One device in one line (the compact Devices layout)."""
+    if kind == "gpu":
+        c = x
+        bad = c.get("drop") or c.get("weak")
+        ln = L(("★" if c.get("busiest") else " ") + f"GPU{c.get('index')} ", "alert b" if bad else "accent b",
+               f"{ROLE.get(c.get('role'), '?'):<6}", "violet" if c.get("role") in ("helper", "igpu") else "muted",
+               f"{f(c.get('util'), 0, '%'):>4} ", "accent b r" if c.get("busiest") else "accent b",
+               (f"{gib(c.get('mem_used'), 0)}/{gib(c.get('mem_total'), 0)}G " if c.get("mem_total") else "shared "),
+               "ink", f"{f(c.get('temp'), 0, '°C')} ", tone_temp(c.get("temp")),
+               f"{layers_text(c)} " if c.get("layers") else "", "muted",
+               link_text(c, False) if c.get("role") != "igpu" else "", link_tone(c))
+        return fit(ln.add(" " + short(c.get("name") or ""), "faint"), w)
+    if kind == "cpu":
+        c = v["cpu"]
+        return fit(L(" CPU  ", "violet b", f"{f(c.get('pct'), 0, '%'):>10} ", "violet b",
+                     f"{f(c.get('temp'), 0, '°C')} ", tone_temp(c.get("temp")), f"{f(c.get('power'), 0)} W  ", "muted",
+                     short(c.get("name") or ""), "faint"), w)
+    i, d = x
+    return fit(L(f" SSD{i + 1} ", "info b", f"{('/'.join(d['roles']) or 'other'):<7}", "muted",
+                 f"{rate(d.get('read_mb')):>10} ", "info b", f"share {pct(d.get('share'))}  " if d.get("share")
+                 is not None else "", "ink", d["name"], "faint"), w)
+
+
+def speed_strip(v: dict, w: int) -> list:
+    """The Devices layout's header strip: decode and prompt tok/s, the token's time as one bar with the verdict."""
+    inner = w - 4
+    d, p = v["decode"], v["prompt"]
+    a = L("DECODE ", "muted b", f(d.get("value"), 1), "accent b", " tok/s ", "muted",
+          d.get("label") or "no answer yet", "good" if d.get("label") == "live" else "soft",
+          "    PROMPT ", "muted b", f(p.get("value"), 0), "info b", " tok/s ", "muted", p.get("label") or "", "soft")
+    ctx = v["context"]
+    if ctx.get("used") is not None and ctx.get("max"):
+        a.add("    ctx ", "muted").add(f"{toks(ctx['used'])}/{toks(ctx['max'])}", "ink")
+    if v["drafter"].get("total") is not None:
+        a.add("    drafts ", "muted").add(pct(v["drafter"]["total"]), "good b")
+    a.add("    ", "").cat(spark(d.get("spark"), max(0, inner - a.width - 4), "accent"))
+    rows = [a]
+    tt = v.get("tt")
+    if tt:
+        lw = 18
+        barw = max(8, inner - lw - 2)
+        rows += [tt_bar(tt, barw)[0].add("  ").cat(L(" ▶ " + VERDICT.get(tt["verdict"], "?") + " ", "alert b r"))]
+        rows.append(L(f"a token {tt['ms']:.1f} ms · SSD wait {tt['disk_ms']:.1f} · GPU {tt['ms'] - tt['disk_ms']:.1f} · "
+                      f"{tt['lane_name']} {tt['lane_ms']:.1f} (parallel) · ", "muted", tt["what"], "soft"))
+    else:
+        rows.append(L("token time ", "muted", DASH, "muted", "  " + (v.get("tt_why") or ""), "faint i"))
+    return box("SPEED", rows, w, tag=L("◆ live", "good b") if d.get("label") == "live" else None)
+
+
+def devices_overview(v: dict, w: int, h: int, ui: dict) -> list:
+    """Layout B "Devices": a small speed strip, then every device in its own panel (the multi-GPU view)."""
+    out = banner_lines(v, w)
+    if w >= 110 and h >= 30:
+        out += speed_strip(v, w)
+        out += device_panels(v, w)
+        if h - len(out) >= 16:                    # (room: the tiers too)
+            out += box("MEMORY · TIERS", memory_bars(v, w - 4), w)
+        room = h - len(out) - 3
+        if room >= 3:
+            out += box("RECENT REQUESTS", req_rows(v, w - 4, room), w,
+                       tag=L(f"{(v.get('totals') or {}).get('requests', 0)} since start", "muted"))
+        return out
+    inner = w - 4
+    rows = speed_tile(v, "decode", w, True) + speed_tile(v, "prompt", w, True)
+    tt = v.get("tt")
+    rows.append(L("token ", "muted").cat(tt_bar(tt, max(6, inner - 16))[0]).add(f" {VERDICT.get(tt['verdict'], '?')}",
+                                                                             "alert b")
+                if tt else L("token time ", "muted", DASH, "muted", "  " + (v.get("tt_why") or ""), "faint i"))
+    out += box("SPEED", rows, w)
+    devs = [("gpu", c) for c in v["cards"]] + [("cpu", None)] + \
+        [("ssd", (i, d)) for i, d in enumerate(v["disk"].get("drives") or [])]
+    room = max(1, h - len(out) - 4)
+    rows = [gpu_summary(v, inner), disk_summary(v, inner)]
+    if len(devs) <= room - 2:
+        rows += [device_line(k, x, v, inner) for k, x in devs]
+    else:                                      # (too many: the ones that matter - busiest, hottest, lowest link)
+        g = v["gpu"]
+        byi = {c.get("index"): c for c in v["cards"]}
+        keep = []
+        for i in (g.get("busiest_card"), g.get("hottest_card"), g.get("slowest_link_card"), *g.get("weak_cards", []),
+                  *g.get("dropped_cards", [])):
+            if i in byi and byi[i] not in keep:
+                keep.append(byi[i])
+        keep = keep[:max(0, room - 3)]
+        rest = [c for c in v["cards"] if c not in keep]
+        keep += rest[:max(0, room - 3 - len(keep))]
+        keep.sort(key=lambda c: v["cards"].index(c))
+        rows += [device_line("gpu", c, v, inner) for c in keep]
+        rows.append(L(f"+{len(devs) - len(keep)} more · ", "muted", "5", "accent b",
+                      " Hardware lists every device", "muted"))
+    out += box("DEVICES", rows, w, tag=L(f"{len(devs)} devices", "muted"))
     return out
 
 
 def short(name: str) -> str:
-    for a in ("NVIDIA ", "GeForce ", "AMD ", "Radeon ", "(TM)", " Graphics"):
+    for a in ("NVIDIA ", "GeForce ", "AMD ", "Radeon ", "(TM)", " Graphics", "Tesla ", "-PCIE", "-SXM2"):
         name = name.replace(a, "")
+    name = re.sub(r"\s+\d+-Core Processor|\s+w/ .*$|\s+Processor$", "", name)
     return " ".join(name.split())
 
 
@@ -780,6 +1075,8 @@ def overview(v: dict, w: int, h: int, ui: dict) -> list:
     out = banner_lines(v, w)
     if v["conn"] in ("loading", "stopped", "auth", "connecting", "disconnected", "error") and not v["has_metrics"]:
         return out + status_panel(v, w, h, ui)
+    if ui.get("layout") == "devices":
+        return devices_overview(v, w, h, ui)
     rich_ = w >= 110 and h >= 30
     if rich_:
         ws = split(w, [27, 27, 46])
@@ -964,8 +1261,20 @@ def memory_view(v: dict, w: int, h: int, ui: dict) -> list:
         rows.append(bar(None, inner))
         rows.append(L("where the experts live: the engine's STAT lines (fast path, while it writes); ", "faint i",
                       f"{f(total)} experts", "muted"))
-    rows.append(L("per-card pool GB ", "muted", DASH, "muted", "  engine counter (phase 2)", "faint i"))
     out += box("WHERE THE EXPERTS LIVE", rows, w)
+    gcards = [c for c in v["cards"] if c.get("mem_total")]
+    if gcards:
+        crow = []
+        for c in gcards:
+            val = L(f"{gib(c.get('mem_used'))}/{gib(c['mem_total'], 0)} GB", "ink b", "  pool ", "muted",
+                    f(c.get("pool_gb"), 1), "ink" if c.get("pool_gb") is not None else "muted", "  ", "",
+                    layers_text(c), "ink" if c.get("layers") else "muted")
+            crow.append(meter(f"{'★' if c.get('busiest') else ' '}GPU{c.get('index')} {short(c.get('name') or '')}"[:15],
+                              (c.get("mem_used") or 0) / c["mem_total"], inner, val, "accent", 16, 30))
+        if not any(c.get("pool_gb") is not None for c in gcards):
+            crow.append(L("pool GB / layers per card: ", "muted", DASH, "muted", "  from the engine log on this PC "
+                          "(a remote server: engine counter, phase 2)", "faint i"))
+        out += box("VRAM PER CARD", crow, w, tag=L(f"{len(gcards)} card{'s' if len(gcards) != 1 else ''}", "muted"))
     ctx = v["context"]
     kvr = [kv("KV cache ", f(ctx.get("kv_gb"), 2), " GB", kw=14), kv("KV context ", toks(ctx.get("kv_ctx")), kw=14),
            kv("max context ", toks(ctx.get("max")), kw=14)]
@@ -1063,14 +1372,25 @@ def hardware_view(v: dict, w: int, h: int, ui: dict) -> list:
                tag=L("edge/junction °C · core/mem MHz · W/limit", "faint"))
     p = v.get("pcie")
     rows = []
-    if p:
+    many = len([c for c in v["cards"] if c.get("pcie_gen") is not None]) > 1
+    if many:
+        for c in v["cards"]:
+            if c.get("pcie_gen") is None:
+                continue
+            rows.append(L(f"GPU{c.get('index')} ", "accent b", f"{short(c.get('name') or '')[:18]:<19}", "ink",
+                          f"{link_text(c, False):>7}", link_tone(c), "  max ", "muted",
+                          f"G{(c.get('pcie_gen_max') or 0):.0f}x{(c.get('pcie_width_max') or 0):.0f}" if
+                          c.get("pcie_gen_max") else DASH, "ink", f"  {f(c.get('link_gbs'), 1)} GB/s", "muted",
+                          f"  →GPU {rate(c.get('pcie_rx_mb'))}  ", "muted").cat(card_flags(c)))
+    if p and not many:
         rows.append(L("working link ", "muted", f"Gen{p['gen']:.0f} x{(p.get('width') or 0):.0f}",
                       "alert b" if p.get("dropped") else "accent b", "   card max ", "muted",
                       f"Gen{(p.get('gen_max') or 0):.0f} x{(p.get('width_max') or 0):.0f}", "ink",
                       "   →GPU ", "muted", rate(p.get("rx_mb")), "ink"))
+    if p:
         rows.append(L("judged only while reading / generating (an idle card drops to Gen1 by itself); "
                       "AMD: the narrowest link up to the root port; no MB/s counter on RDNA 3/4", "faint i"))
-    else:
+    if not p:
         rows.append(L("no PCIe reading (AMD on Windows, or no GPU found)", "faint i"))
     out += box("PCIe", rows, w)
     c = v["cpu"]
@@ -1091,9 +1411,10 @@ def hardware_view(v: dict, w: int, h: int, ui: dict) -> list:
               "ink", " write", "muted", "   model drive free ", "muted", gib(dk.get("free"), 0), "ink",
               f" / {gib(dk.get('total'), 0)} GB", "muted")]
     for d in dk.get("drives") or []:
-        rows.append(L(f"{'/'.join(d['roles']):<12}", "violet b", f"{d['name']:<16}", "ink",
+        rows.append(L(f"{('/'.join(d['roles']) or 'other'):<12}", "violet b", f"{d['name']:<16}", "ink",
                       f"{rate(d.get('read_mb')):>12}", "accent b", " read  ", "muted",
-                      ", ".join(d.get("paths") or [])[:max(0, inner - 50)], "faint"))
+                      f"share {pct(d.get('share')):>4}  " if d.get("share") is not None else " " * 12, "ink",
+                      ", ".join(d.get("paths") or [])[:max(0, inner - 62)], "faint"))
     b = v.get("bench")
     if b and b.get("ssd"):
         rows.append(L("--bench SSD read ", "muted", f"{b['ssd']:.1f} GB/s", "violet"))
@@ -1202,6 +1523,8 @@ def help_lines(w: int) -> list:
               "c", "accent b", "  copy the API address", "muted"),
             L("Enter / s / B", "accent b", "  (Models) start / stop / bench   ", "muted", "L", "accent b",
               "  temperature log", "muted"),
+            L("l", "accent b", "  Overview layout: Speed (big numbers) / Devices (every GPU, SSD and the CPU in its own "
+              "panel)", "muted"),
             L("/", "accent b", "  (Logs) filter   ", "muted", "t", "accent b", "  theme dark / light / mono   ", "muted",
               "q", "accent b", "  quit", "muted"), Line(),
             L("NUMBERS", "accent b"),
@@ -1227,7 +1550,8 @@ def screen(v: dict, w: int, h: int, ui: dict) -> list:
     body = help_lines(w) if ui.get("help") else DRAW[ui.get("view", 0)](v, w, body_h, ui)
     body = [fit(x, w) for x in body[ui.get("scroll_body", 0):]][:body_h]
     body += [fit(Line(), w)] * (body_h - len(body))
-    return top + body + [footer(v, w, ui.get("frozen"), ui.get("message", ""), bool(ui.get("thermal")))]
+    return top + body + [footer(v, w, ui.get("frozen"), ui.get("message", ""), bool(ui.get("thermal")),
+                                layout=ui.get("layout") if w >= 60 else None)]
 
 
 # ------------------------------------------------------------------------------------------------ plain output

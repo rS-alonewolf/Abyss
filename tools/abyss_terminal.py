@@ -40,13 +40,48 @@ import terminal_model as M  # noqa: E402
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
 
 
+def state_path() -> Path:
+    """The Terminal's small per-user state (the Overview layout chosen): ~/.config/abyss/terminal.json, on Windows
+    %APPDATA%\\abyss\\terminal.json; ABYSS_TERMINAL_STATE overrides it.  Never required."""
+    if os.environ.get("ABYSS_TERMINAL_STATE"):
+        return Path(os.environ["ABYSS_TERMINAL_STATE"])
+    base = os.environ.get("APPDATA") if os.name == "nt" else os.environ.get("XDG_CONFIG_HOME")
+    return Path(base or Path.home() / ".config") / "abyss" / "terminal.json"
+
+
+def load_state() -> dict:
+    try:
+        d = json.loads(state_path().read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(**kw) -> None:
+    try:
+        d = load_state()
+        d.update(kw)
+        path = state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(d, indent=1))
+    except OSError:
+        pass
+
+
 class Session:
     """What the Terminal is attached to and what it shows: the server (Link + Poller), this PC's config, PID file and
     engine log, and the screen's state (view, selection, freeze ...).  Both the Textual screen and --plain drive it."""
 
     def __init__(self, url: str | None = None, key_env: str | None = None, config: Path | None = None,
-                 interval: float = 1.0, demo: str | None = None, root: Path = T.ROOT, poll: bool = True):
+                 interval: float = 1.0, demo: str | None = None, root: Path = T.ROOT, poll: bool = True,
+                 layout: str | None = None):
         self.root = Path(root)
+        # the Overview's layout: --layout, else the one last chosen (l), else Devices for 3+ cards (decided once the
+        # config or the first reading says how many), else Speed
+        self.layout = layout if layout in D.LAYOUTS else None
+        self.layout_chosen = self.layout is not None
+        if self.layout is None and load_state().get("layout") in D.LAYOUTS:
+            self.layout, self.layout_chosen = load_state()["layout"], True
         self.interval = max(0.5, min(10.0, interval))
         self.demo = demo
         self.remote = bool(url) and not demo
@@ -90,7 +125,7 @@ class Session:
                 self.log = M.EngineLog(None)
                 for x in F.LOGS[demo]:
                     self.log.feed(x, None)
-            self.remote = demo == "split"
+            self.remote = demo in ("split", "multi8")
             if self.remote:
                 self.configs = None
         elif url:
@@ -191,10 +226,28 @@ class Session:
             for c in self.configs:
                 c["serving"] = self.cfg is not None and c["path"] == self.cfg.get("path") and v["conn"] == "live"
         self.thermal.row(v)
+        self.pick_layout(v)
         return v
 
+    def pick_layout(self, v: dict | None = None) -> str:
+        """Speed, unless nobody chose one and the model runs on 3+ cards (the config's list, else the server's)."""
+        if self.layout_chosen:
+            return self.layout
+        cfg = self.demo_local.get("config") if self.demo else self.cfg
+        n = len((cfg or {}).get("gpus") or [])
+        if v is not None and v.get("has_metrics"):
+            n = max(n, len([c for c in v["cards"] if c.get("role") in ("main", "split", "helper")]))
+        self.layout = "devices" if n >= 3 else "speed"
+        return self.layout
+
+    def cycle_layout(self) -> str:
+        self.layout = D.LAYOUTS[(D.LAYOUTS.index(self.pick_layout()) + 1) % len(D.LAYOUTS)]
+        self.layout_chosen = True
+        save_state(layout=self.layout)
+        return self.layout
+
     def ui(self) -> dict:
-        return {"view": self.view, "sel": self.sel.get(self.view, 0), "log": self.bench_log or self.log,
+        return {"view": self.view, "layout": self.layout or "speed", "sel": self.sel.get(self.view, 0), "log": self.bench_log or self.log,
                 "configs": self.configs, "help": self.help, "frozen": self.frozen, "message": self.message,
                 "thermal": self.thermal.path.name if self.thermal.on else None, "tick": self.tick_n,
                 "filter": self.filter, "scroll": self.log_scroll, "check": self.check,
@@ -403,7 +456,7 @@ def _keys_windows():
 
 def run_plain(s: Session) -> int:
     """No Textual: the same screen as text, drawn again every interval (ANSI; colour unless NO_COLOR or not a TTY).
-    Keys: 1-8 / ← → views, ↑↓ rows, r poll now, space freeze, t theme, L temperature log, ? help, q quit."""
+    Keys: 1-8 / ← → views, ↑↓ rows, r poll now, space freeze, l layout, t theme, L temperature log, ? help, q quit."""
     if os.name == "nt":
         os.system("")                              # (turns on the console's VT sequences)
     tty_ = sys.stdout.isatty()
@@ -438,6 +491,8 @@ def run_plain(s: Session) -> int:
                 s.freeze()
             elif k == "t":
                 s.cycle_theme()
+            elif k == "l":
+                s.cycle_layout()
             elif k == "L":
                 s.toggle_thermal()
             elif k == "?":
@@ -497,11 +552,15 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--config", type=Path, help="this PC's run config to attach to (default: the running one, else "
                                                 "the most recently used)")
     ap.add_argument("--interval", type=float, default=1.0, help="seconds between readings (0.5-10, default 1)")
+    ap.add_argument("--layout", choices=D.LAYOUTS, help="the Overview: speed (big numbers, the token's time, tiles) or "
+                                                        "devices (every GPU, SSD and the CPU in its own panel); "
+                                                        "default: the last one chosen with l, else devices for 3+ "
+                                                        "cards")
     ap.add_argument("--plain", action="store_true", help="no Textual: plain text, redrawn every interval")
     ap.add_argument("--once", action="store_true", help="print one reading and exit")
     ap.add_argument("--json", action="store_true", help="print one reading as JSON and exit")
     ap.add_argument("--demo", metavar="SCENARIO", help="recorded readings, no server: r9700, lowspec, split, "
-                                                       "loading, down")
+                                                       "multi4, multi8, multi10, loading, down")
     return ap
 
 
@@ -510,7 +569,7 @@ def main(argv=None, textual: bool | None = None) -> int:
     warn = remote_warning(a.url, a.key_env)
     if warn:
         print(warn, file=sys.stderr)
-    s = Session(a.url, a.key_env, a.config, a.interval, a.demo)
+    s = Session(a.url, a.key_env, a.config, a.interval, a.demo, layout=a.layout)
     if a.once or a.json:
         return once(s, a.json)
     if textual is None:

@@ -127,7 +127,7 @@ class TerminalApp(App):
         Binding("enter", "enter", show=False), Binding("s", "stop", show=False), Binding("B", "bench", show=False),
         Binding("y", "copy_bench", show=False), Binding("c", "copy_api", show=False),
         Binding("h", "check", show=False), Binding("b", "browser", show=False), Binding("r", "refresh", show=False),
-        Binding("space", "freeze", show=False), Binding("t", "theme", show=False), Binding("L", "thermal", show=False),
+        Binding("space", "freeze", show=False), Binding("t", "theme", show=False), Binding("l", "layout", show=False), Binding("L", "thermal", show=False),
         Binding("slash", "filter", show=False), Binding("escape", "escape", show=False),
         Binding("question_mark", "help", show=False), Binding("f1", "help", show=False),
         Binding("q", "quit_ask", show=False), Binding("ctrl+c", "quit_ask", show=False, priority=True),
@@ -190,7 +190,7 @@ class TerminalApp(App):
         else:
             bw = w
         body = [D.fit(x, bw) for x in body]
-        foot = [D.footer(v, w, s.frozen, s.message, s.thermal.on)]
+        foot = [D.footer(v, w, s.frozen, s.message, s.thermal.on, layout=ui["layout"] if w >= 60 else None)]
         for wid, lines, k in (("#head", head, 0), ("#view", body, 1), ("#foot", foot, 2)):
             key = (s.theme, tuple(tuple(x) for x in lines))
             if self.shown[k] != key:
@@ -246,6 +246,13 @@ class TerminalApp(App):
 
     def action_freeze(self) -> None:
         self.s.freeze(self.v)
+        self.redraw(poll=False)
+
+    def action_layout(self) -> None:
+        self.s.say(f"Overview layout: {self.s.cycle_layout()}", 3)
+        if self.s.view != 0:
+            self.s.go(0)
+        self.query_one("#body").scroll_home(animate=False)
         self.redraw(poll=False)
 
     def action_theme(self) -> None:

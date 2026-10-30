@@ -2964,7 +2964,8 @@ def terminal(a) -> int:
     third_party/wheels the first time, as the setup's), else in plain text."""
     import abyss_terminal
     argv = []
-    for flag, val in (("--url", a.url), ("--key-env", a.key_env), ("--config", a.config), ("--demo", a.demo)):
+    for flag, val in (("--url", a.url), ("--key-env", a.key_env), ("--config", a.config), ("--demo", a.demo),
+                      ("--layout", a.layout)):
         if val is not None:
             argv += [flag, str(val)]
     argv += ["--interval", str(a.interval)]
@@ -3100,10 +3101,12 @@ def main() -> int:
     ap.add_argument("--key-env", metavar="NAME",
                     help="with --terminal --url: the environment variable that holds the server's API key")
     ap.add_argument("--interval", type=float, default=1.0, help="with --terminal: seconds between readings (0.5-10)")
+    ap.add_argument("--layout", choices=("speed", "devices"),
+                    help="with --terminal: the Overview - speed (big numbers) or devices (every GPU / SSD / CPU)")
     ap.add_argument("--once", action="store_true", help="with --terminal: print one reading and exit")
     ap.add_argument("--json", action="store_true", help="with --terminal: print one reading as JSON and exit")
     ap.add_argument("--demo", metavar="SCENARIO", help="with --terminal: recorded readings, no server (r9700, lowspec, "
-                                                       "split, loading, down)")
+                                                       "split, multi4, multi8, multi10, loading, down)")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
                                               "for --bench or --report (default: most recently used)")
     a = ap.parse_args()
