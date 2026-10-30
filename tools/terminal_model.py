@@ -33,6 +33,7 @@ QUANT_RE = re.compile(r"(?:UD-)?(?:IQ\d_[A-Z]+|Q\d_K(?:_[A-Z]+)?|Q\d_\d|MXFP4|BF
 # the engine log's lines the Terminal reads besides --bench's (bench_rules): a start, the lane, the mirror, trouble
 START_LINE = re.compile(r"VRAM before the expert pool")
 LANE_LINE = re.compile(r"iGPU lane (on|off|failed|stall)|CPU lane off|CPU lane: (\d+) threads")
+CARD_LINE = re.compile(r"glm fast: CUDA(\d+) layers \[(\d+),(\d+)\) expert pool ([\d.]+) GB")
 MIRROR_LINE = re.compile(r"glm fast mirror \S+: ([\d.]+) GB from the shards' drive, ([\d.]+) GB from the mirror")
 KIND = (("stat", re.compile(r"glm stat:")), ("spec", re.compile(r"glm spec:")),
         ("watchdog", re.compile(r"watchdog", re.I)), ("error", re.compile(r"\bERR\b|error|failed|out of memory|"
@@ -260,6 +261,7 @@ class EngineLog:
         self.lane: str | None = None               # "iGPU lane" / "CPU lane" / None (not seen)
         self.lane_state: str | None = None         # on / off / failed / stall
         self.lane_threads: int | None = None
+        self.cards: dict = {}                      # device -> (first layer, end layer, expert pool GB) (a layer split)
         self.mirror: tuple | None = None           # (GB from the shards' drive, GB from the mirror) at the engine's end
         self.last_error: tuple | None = None       # (time read, text)
         self.last_warning: str | None = None
@@ -336,6 +338,9 @@ class EngineLog:
             self.lane = self.lane_state = self.lane_threads = None
             self.mirror = None
             self.load.reset()
+            dev = re.search(r"CUDA(\d+) VRAM before", x)  # (each card prints one: a card seen again = a new start)
+            if dev is None or int(dev.group(1)) in self.cards:
+                self.cards = {}
         self._stat(x, stamp)
         if R.IGPU_LANE in x:
             self.lane = "iGPU lane"
@@ -351,6 +356,8 @@ class EngineLog:
                 self.lane_state = self.lane_state or "on"
             else:
                 self.lane, self.lane_state = "CPU lane", "off"
+        if m := CARD_LINE.search(x):
+            self.cards[int(m.group(1))] = (int(m.group(2)), int(m.group(3)), float(m.group(4)))
         if m := MIRROR_LINE.search(x):
             self.mirror = (float(m.group(1)), float(m.group(2)))
         if m := WARMING.search(x):
@@ -431,6 +438,72 @@ def cards(m: dict) -> list:
         c.update(index=0, role="main", name=clean(st.get("gpu_name") or "", 60))
         out.append(c)
     return out
+
+
+LINK_GBS = {1: 0.25, 2: 0.5, 3: 0.985, 4: 1.97, 5: 3.94, 6: 7.56}   # PCIe GB/s a lane, by generation
+
+
+def link_gbs(gen, width):
+    return LINK_GBS.get(int(gen), 0.25) * (width or 1) if gen else None
+
+
+def card_facts(cs: list, model_cards: list, working: bool, seen: dict | None, log) -> dict:
+    """Per card (in place): its layers and expert pool in a layer split (the engine log; the server does not send them
+    yet), its PCIe link against the best it showed while working (`drop`), against its twins' usual link (`behind`:
+    the same card on a worse slot or riser), and whether its link is the split's weak one (`weak`: under half the
+    model cards' median - an x1 riser, Gen2/Gen3 x4); the busiest, hottest and slowest-linked of the model's cards."""
+    best = seen.setdefault("pcie_card", {}) if seen is not None else {}
+    layers = (log.cards if log is not None else {}) or {}
+    bws = []
+    for c in cs:
+        i = c.get("index")
+        lay = c.get("layers") or (layers.get(i)[:2] if i in layers else None)   # (a server field later, phase 2)
+        c["layers"] = tuple(lay) if lay else None
+        c["pool_gb"] = num(c.get("pool_gb")) if c.get("pool_gb") is not None else (layers[i][2] if i in layers else None)
+        c["tt_share"] = num(c.get("tt_share"))                                  # (phase 2: no counter yet)
+        gen, wid = num(c.get("pcie_gen")), num(c.get("pcie_width"))
+        c["link_gbs"] = link_gbs(gen, wid)
+        c["drop"] = c["behind"] = c["weak"] = False
+        if c["link_gbs"] is None or c.get("role") == "igpu":
+            continue
+        if working:
+            b = best.get(i)
+            if b is None or c["link_gbs"] > b[0]:
+                best[i] = (c["link_gbs"], gen, wid)
+            elif c["link_gbs"] < b[0]:
+                c["drop"] = True
+                c["drop_from"] = b[1:]
+        if c in model_cards:
+            bws.append(c["link_gbs"])
+    twins: dict = {}
+    for c in model_cards:
+        if c.get("link_gbs") is not None:
+            twins.setdefault(c.get("name"), []).append(c["link_gbs"])
+    med = sorted(bws)[len(bws) // 2] if bws else None
+    for c in model_cards:
+        if c.get("link_gbs") is None:
+            continue
+        same = twins.get(c.get("name")) or []
+        if len(same) >= 2:                     # (two: the better one's; more: the usual one's)
+            usual = max(same) if len(same) == 2 else max(set(same), key=same.count)
+            c["behind"] = c["link_gbs"] < usual
+        c["weak"] = len(bws) >= 2 and med is not None and c["link_gbs"] < 0.5 * med
+    pick = lambda key: max((c for c in model_cards if num(c.get(key)) is not None),   # noqa: E731
+                           key=lambda c: num(c.get(key)), default=None)
+    busy, hot = pick("util"), pick("temp")
+    slow = min((c for c in model_cards if c.get("link_gbs") is not None), key=lambda c: c["link_gbs"], default=None)
+    for c in cs:
+        c["busiest"] = c is busy and len(model_cards) > 1
+    used = [num(c.get("mem_used")) for c in model_cards if num(c.get("mem_used")) is not None]
+    total = [num(c.get("mem_total")) for c in model_cards if num(c.get("mem_total")) is not None]
+    return {"busiest_card": busy.get("index") if busy else None, "hottest_card": hot.get("index") if hot else None,
+            "hottest_temp": num(hot.get("temp")) if hot else None,
+            "slowest_link_card": slow.get("index") if slow else None,
+            "slowest_link": (num(slow.get("pcie_gen")), num(slow.get("pcie_width"))) if slow else None,
+            "cards_mem_used": sum(used) if used else None, "cards_mem_total": sum(total) if total else None,
+            "weak_cards": [c.get("index") for c in model_cards if c.get("weak")],
+            "dropped_cards": [c.get("index") for c in cs if c.get("drop")],
+            "behind_cards": [c.get("index") for c in model_cards if c.get("behind")]}
 
 
 def short_gpu(name: str) -> str:
@@ -558,7 +631,8 @@ def derive(link: Link | None, local: dict | None = None, log: EngineLog | None =
     temps = [(num(c.get("temp")), num(c.get("temp_junction"))) for c in model_cards if num(c.get("temp")) is not None]
     hot = max(temps, default=(None, None), key=lambda t: t[0])
     v["cards"] = cs
-    v["gpu"] = {"busiest": max(loads) if loads else num(hw.get("gpu_util")), "n": len(model_cards),
+    summary = card_facts(cs, model_cards, state in ("reading", "generating"), seen, log)
+    v["gpu"] = {**summary, "busiest": max(loads) if loads else num(hw.get("gpu_util")), "n": len(model_cards),
                 "mem_used": num(hw.get("gpu_mem_used")), "mem_total": num(hw.get("gpu_mem_total")),
                 "temp": hot[0] if hot[0] is not None else num(hw.get("gpu_temp")),
                 "junction": hot[1] if hot[0] is not None else num(hw.get("gpu_temp_junction")),
@@ -585,7 +659,7 @@ def derive(link: Link | None, local: dict | None = None, log: EngineLog | None =
         if working and seen is not None and (best is None or here > best[0]):
             seen["pcie_best"] = best = (here, worst[0], worst[1])
         v["pcie"]["working"] = working
-        v["pcie"]["dropped"] = bool(working and best and here < best[0])
+        v["pcie"]["dropped"] = bool(working and best and here < best[0]) or bool(v["gpu"]["dropped_cards"])
         v["pcie"]["best"] = best[1:] if best else None
         v["pcie"]["below_max"] = bool((worst[2] and worst[0] < worst[2]) or
                                       (worst[3] and worst[1] and worst[1] < worst[3]))
@@ -613,9 +687,14 @@ def derive(link: Link | None, local: dict | None = None, log: EngineLog | None =
         drives.append({"name": clean(dv.get("name") or "?", 30), "roles": list(dv.get("roles") or []),
                        "read_mb": num(dv.get("read_mb")), "write_mb": num(dv.get("write_mb")),
                        "paths": (sdrives.get(dv.get("name")) or {}).get("paths") or []})
+    shard = [d for d in drives if "model" in d["roles"] or "mirror" in d["roles"]]
+    shard_mb = sum(d["read_mb"] or 0 for d in shard)
+    for d in drives:
+        d["share"] = (d["read_mb"] or 0) / shard_mb if d in shard and shard_mb > 1.0 else None
     model_mb = sum(d["read_mb"] or 0 for d in drives if "model" in d["roles"])
     mirror_mb = sum(d["read_mb"] or 0 for d in drives if "mirror" in d["roles"] and "model" not in d["roles"])
     v["disk"] = {"read_mb": num(hw.get("disk_read_mb")), "write_mb": num(hw.get("disk_write_mb")),
+                 "shard_mb": shard_mb if shard else None, "shard_n": len(shard),
                  "drives": drives, "spark": list(hist.get("disk_read_mb") or []),
                  "mirror_share": mirror_mb / (model_mb + mirror_mb) if mirror_mb + model_mb > 1.0 and
                  any("mirror" in d["roles"] for d in drives) else None,
@@ -660,7 +739,18 @@ def banners(v: dict, log: EngineLog | None, now: float) -> list:
     elif throttle and v.get("state") in ("generating", "reading"):
         out.append((f"GPU throttling: {', '.join(throttle)}", "warn"))
     p = v.get("pcie")
-    if p and p.get("dropped"):
+    byi = {c.get("index"): c for c in v["cards"]}
+    if g.get("dropped_cards"):
+        for i in g["dropped_cards"][:3]:
+            c = byi[i]
+            fg, fw = c.get("drop_from") or (None, None)
+            out.append((f"GPU{i} PCIe fell to Gen{c['pcie_gen']:.0f} x{(c.get('pcie_width') or 0):.0f} while working "
+                        f"(it ran Gen{(fg or 0):.0f} x{(fw or 0):.0f}) - check its cable / riser / slot", "alert"))
+    elif g.get("weak_cards") and v.get("state") in ("reading", "generating"):
+        c = byi[g["weak_cards"][0]]
+        out.append((f"GPU{c.get('index')} on Gen{c['pcie_gen']:.0f} x{(c.get('pcie_width') or 0):.0f} - the slowest link "
+                    "in the split, it holds every token back (an x1 riser / x4 slot)", "alert"))
+    elif p and p.get("dropped"):
         b = p.get("best") or (p["gen"], p["width"])
         out.append((f"PCIe link fell to Gen{p['gen']:.0f} x{(p['width'] or 0):.0f} while working (it ran Gen{b[0]:.0f} "
                     f"x{(b[1] or 0):.0f} earlier) - check the cable / USB4 / OCuLink", "alert"))

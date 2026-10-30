@@ -2,7 +2,8 @@
 with the phase-1.5 fields), engine logs, and a fake server that serves them - for the tests (test_abyss_terminal.py)
 and the screenshots (abyss_terminal.py --demo).  Numbers from real runs: DeepSeek V4.1 Flash 1017 UD-IQ2_XXS on an
 AI PRO R9700 with the Ryzen AI Max's iGPU lane and two SSDs (abyss-dsv41-iq2xxs-r9700l.log, 2026-10-29), a
-16 GB + 64 GB PC, an RTX 5090 + RTX 3090 layer split, a server that is loading, one that is down.
+16 GB + 64 GB PC, an RTX 5090 + RTX 3090 layer split, four mixed NVIDIA cards (5090 + 3090 + 2x V100) with two
+SSDs, eight / ten RTX 3090s on risers (three drives with eight), a server that is loading, one that is down.
 """
 from __future__ import annotations
 
@@ -12,7 +13,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 GIB = 2**30
-SCENARIOS = ("r9700", "lowspec", "split", "loading", "down")
+SCENARIOS = ("r9700", "lowspec", "split", "multi4", "multi8", "multi10", "loading", "down")
 
 
 def _wave(n, lo, hi, phase=0.0):
@@ -174,8 +175,112 @@ def metrics(name: str, now: float | None = None) -> dict | None:
                 "gpu_util": _wave(60, 70, 99), "cpu": _wave(60, 40, 70), "ram_used": [101 * GIB] * 60,
                 "disk_read_mb": _wave(60, 0, 20)}
         storage = {"path": "/models/Maya-S-v2-IQ2_XXS", "free": int(2.0e12), "total": int(4.0e12)}
+    elif name in ("multi4", "multi8", "multi10"):
+        return _multi(name, now)
     else:
         raise KeyError(name)
+    return {"engine": engine, "live": live, "tiers": {"now": tn, "history": {k: [tn.get(k)] * 20 for k in
+                                                                            ("tok_s", "ms_tok", "vram_hit",
+                                                                             "ram_fetch", "disk", "promo")}},
+            "requests": reqs, "requests_kept": len(reqs), "totals": totals, "hardware": hw, "hardware_static": static,
+            "history": hist, "time": now, "reload": None, "storage": storage}
+
+
+def _gpu(i, role, name, util, used, total, temp, power, plim, clk, mclk, link, link_max, rx, tmem=None, throttle=()):
+    return {"index": i, "role": role, "name": name, "util": util, "mem_used": int(used * GIB),
+            "mem_total": int(total * GIB), "temp": temp, "temp_junction": None, "temp_mem": tmem, "power": power,
+            "power_limit": plim, "clock_mhz": clk, "mem_clock_mhz": mclk, "throttle": list(throttle),
+            "pcie_gen": link[0], "pcie_width": link[1], "pcie_gen_max": link_max[0], "pcie_width_max": link_max[1],
+            "pcie_rx_mb": rx, "pcie_tx_mb": round(rx * 0.03, 1) if rx is not None else None, "source": ["nvml"]}
+
+
+def _multi(name: str, now: float) -> dict:
+    """Many cards: four mixed NVIDIA (a 5090 on OCuLink, a 3090, two V100s - one on an x8 slot) with the shards on
+    two SSDs, or eight RTX 3090s on risers (one fell to Gen1 x1) with a third, unrelated drive."""
+    if name == "multi4":
+        engine = {"model": "deepseek-v4-flash-0731-q2kxl", "max_context": 65536, "experts": 11008, "vram_slots": 8650,
+                  "vram_gb": 98.4, "ram_slots": 2358, "ram_gb": 24.7, "mtp": 1, "cpu_threads": 16,
+                  "pcie_share": "1.00", "uncensor": 0, "version": "1.3.77", "kv_ctx": 65536, "kv_gb": 1.2,
+                  "maya_version": "1.3.77", "display_name": "DeepSeek-V4-Flash-0731-UD-Q2_K_XL", "quant": "UD-Q2_K_XL",
+                  "config": "abyss-dsv4-q2kxl-4gpu.json", "backend": "cuda", "engine_kind": "glm-fast"}
+        gpus = [_gpu(0, "main", "NVIDIA GeForce RTX 5090", 91, 30.8, 31.8, 66, 430.0, 575.0, 2700, 14001, (4, 4),
+                     (5, 16), 4100.0, 78),
+                _gpu(1, "split", "NVIDIA GeForce RTX 3090", 78, 23.0, 24.0, 79, 330.0, 350.0, 1740, 9751, (4, 16),
+                     (4, 16), 2100.0, 94),
+                _gpu(2, "split", "Tesla V100-PCIE-32GB", 97, 31.2, 32.0, 74, 240.0, 250.0, 1380, 877, (3, 16),
+                     (3, 16), 1500.0, 70, ["sw_power_cap"]),
+                _gpu(3, "split", "Tesla V100-PCIE-32GB", 88, 30.1, 32.0, 71, 221.0, 250.0, 1380, 877, (3, 8),
+                     (3, 16), 900.0, 68)]
+        drives = [{"name": "nvme0n1", "roles": ["model"], "read_mb": 3120.0, "write_mb": 0.8},
+                  {"name": "nvme1n1", "roles": ["mirror"], "read_mb": 2710.0, "write_mb": 0.0}]
+        paths = {"nvme0n1": ["/models/DeepSeek-V4-Flash-0731-GGUF/UD-Q2_K_XL"], "nvme1n1": ["/mnt/ssd2/V4-Q2_K_XL"]}
+        live = {"state": "generating", "queued": 0, "phase": "answering", "prompt_tokens": 8120, "generated": 913,
+                "max_tokens": 4096, "elapsed_s": 41.0, "tok_s": 31.4, "tok_s_mean": 30.2, "prefill_tok_s_mean": 655.0}
+        tn = {"tok_s": 31.0, "ms_tok": 32.3, "vram_hit": 0.86, "ram_fetch": 1.9, "disk": 2.1, "promo": 1.4,
+              "vram_used": 8650, "vram_slots": 8650, "ram_used": 2358, "ram_slots": 2358, "ram_gb": 24.7,
+              "vram_gb": 98.4, "time": now - 1.0}
+        c_hw, c_st = _cpu(32, 34.0, 69.0, 121.0, ["avx2", "avx512f", "avx512vbmi"], "AMD Ryzen 9 7950X 16-Core Processor",
+                          16, 32, 5100, 5881)
+        ram = (61.0, 128.0, 22.1, 0.0, 0.4, 0.0)
+        reqs = [_req(now - 60, 28.0, "stop", "openai", 8120, 7900, 840, 30.8, 655.0, 0.86, 410, 590),
+                _req(now - 180, 44.1, "stop", "anthropic", 21000, 0, 1210, 29.9, 702.0, 0.85, 600, 880),
+                _req(now - 400, 12.3, "length", "web", 900, 0, 256, 32.0, 512.0, 0.87, 130, 180)]
+        totals = {"since": now - 5400, "requests": 17, "prompt_tokens": 140200, "reused": 81000, "output_tokens": 14100,
+                  "prompt_ms": 92000.0, "decode_ms": 470000.0, "drafts_accepted": 7000, "drafts_offered": 10100}
+        hist = {"tok_s": [None] * 4 + _wave(56, 26, 33), "gpu_util": _wave(60, 70, 98, 2), "cpu": _wave(60, 25, 45),
+                "ram_used": [61 * GIB] * 60, "disk_read_mb": _wave(60, 3000, 6200, 1)}
+        storage = {"path": paths["nvme0n1"][0], "free": int(0.9e12), "total": int(2.0e12)}
+    else:
+        engine = {"model": "glm-5.3-flash-q4kxl", "max_context": 131072, "experts": 19456, "vram_slots": 17800,
+                  "vram_gb": 168.0, "ram_slots": 1656, "ram_gb": 15.6, "mtp": 1, "cpu_threads": 24,
+                  "pcie_share": "1.00", "uncensor": 0, "version": "1.3.77", "kv_ctx": 131072, "kv_gb": 6.0,
+                  "maya_version": "1.3.77", "display_name": "GLM-5.3-Flash-UD-Q4_K_XL", "quant": "UD-Q4_K_XL",
+                  "config": "abyss-glm-q4kxl-8gpu.json", "backend": "cuda", "engine_kind": "glm-fast"}
+        n = 8 if name == "multi8" else 10
+        utils = (84, 77, 81, 95, 72, 79, 83, 41, 80, 76)[:n]
+        temps = (71, 74, 76, 84, 69, 73, 75, 58, 72, 70)[:n]
+        links = [(4, 16)] + [(3, 4)] * (n - 2) + [(1, 1) if n == 8 else (2, 1)]   # (risers; the last one x1)
+        gpus = [_gpu(i, "main" if i == 0 else "split", "NVIDIA GeForce RTX 3090", utils[i], 22.6 + (i % 3) * 0.3, 24.0,
+                     temps[i], 240.0 + utils[i], 350.0, 1695 + (i * 15) % 90, 9751, links[i], (4, 16),
+                     None if i == n - 1 else 1200.0 - i * 40, 88 + i % 4) for i in range(n)]
+        if n == 10:
+            engine.update(config="abyss-glm-q4kxl-10gpu.json", vram_gb=212.0, vram_slots=19456, ram_slots=0, ram_gb=0.0)
+        drives = [{"name": "nvme0n1", "roles": ["model"], "read_mb": 160.0, "write_mb": 0.4},
+                  {"name": "nvme1n1", "roles": ["mirror"], "read_mb": 120.0, "write_mb": 0.0},
+                  {"name": "sda", "roles": [], "read_mb": 0.6, "write_mb": 2.0}]
+        paths = {"nvme0n1": ["/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL"], "nvme1n1": ["/mnt/ssd2/GLM-Q4_K_XL"],
+                 "sda": ["/"]}
+        live = {"state": "generating", "queued": 2, "phase": "answering", "prompt_tokens": 3100, "generated": 220,
+                "max_tokens": 2048, "elapsed_s": 6.0, "tok_s": 38.5, "tok_s_mean": 37.9, "prefill_tok_s_mean": 910.0}
+        tn = {"tok_s": 38.2, "ms_tok": 26.2, "vram_hit": 0.97, "ram_fetch": 0.4, "disk": 0.05, "promo": 0.3,
+              "vram_used": 17800, "vram_slots": 17800, "ram_used": 1656, "ram_slots": 1656, "ram_gb": 15.6,
+              "vram_gb": 168.0, "time": now - 0.8}
+        c_hw, c_st = _cpu(48, 22.0, 58.0, 160.0, ["avx2", "avx512f"], "AMD EPYC 7413 24-Core Processor", 24, 48,
+                          3200, 3630)
+        ram = (180.0, 256.0, 40.0, 0.0, 0.0, 0.0)
+        reqs = [_req(now - 30, 18.0, "stop", "openai", 3100, 2800, 690, 38.0, 910.0, 0.97, 330, 420),
+                _req(now - 90, 25.0, "stop", "openai", 12000, 0, 900, 36.5, 1020.0, 0.96, 420, 560)]
+        totals = {"since": now - 86400, "requests": 1204, "prompt_tokens": 9.1e6, "reused": 6.0e6,
+                  "output_tokens": 8.0e5, "prompt_ms": 3.0e6, "decode_ms": 2.1e7, "drafts_accepted": 3.0e5,
+                  "drafts_offered": 4.0e5}
+        hist = {"tok_s": _wave(60, 33, 40), "gpu_util": _wave(60, 60, 96, 1), "cpu": _wave(60, 15, 30),
+                "ram_used": [180 * GIB] * 60, "disk_read_mb": _wave(60, 80, 320, 2)}
+        storage = {"path": paths["nvme0n1"][0], "free": int(3.0e12), "total": int(8.0e12)}
+    base = {"prompt_read": None, "prompt_total": None, "tok_s_window_s": 3}
+    live = {**base, **live}
+    used = sum(g["mem_used"] for g in gpus)
+    total = sum(g["mem_total"] for g in gpus)
+    hw = {"gpu_util": max(g["util"] for g in gpus), "gpu_mem_used": used, "gpu_mem_total": total,
+          "gpu_temp": max(g["temp"] for g in gpus), "gpu_power": sum(g["power"] for g in gpus),
+          "gpu_power_limit": sum(g["power_limit"] for g in gpus), "gpus": gpus,
+          "ram_used": int(ram[0] * GIB), "ram_total": int(ram[1] * GIB), "ram_cached": int(ram[2] * GIB),
+          "swap_used": int(ram[3] * GIB), "swap_total": 8 * GIB, "psi_mem_some": ram[4], "psi_mem_full": ram[5],
+          "disk_read_mb": sum(d["read_mb"] for d in drives), "disk_write_mb": sum(d["write_mb"] for d in drives),
+          "drives": drives}
+    hw.update(c_hw)
+    static = {"gpu_name": " + ".join(g["name"] for g in gpus), "gpu_count": len(gpus),
+              "gpus": [{"index": g["index"], "role": g["role"], "name": g["name"]} for g in gpus],
+              "drives": [{"name": d["name"], "roles": d["roles"], "paths": paths[d["name"]]} for d in drives], **c_st}
     return {"engine": engine, "live": live, "tiers": {"now": tn, "history": {k: [tn.get(k)] * 20 for k in
                                                                             ("tok_s", "ms_tok", "vram_hit",
                                                                              "ram_fetch", "disk", "promo")}},
@@ -196,7 +301,7 @@ def health(name: str) -> dict | None:
     if m is None:
         return None
     return {"status": "ok", "max_context": m["engine"]["max_context"], "model": m["engine"]["model"], "images": False,
-            "api_key": name == "split", "defaults": {}, "version": "1.3.77", "mcp_tools": False, "service": "abyss"}
+            "api_key": name in ("split", "multi8"), "defaults": {}, "version": "1.3.77", "mcp_tools": False, "service": "abyss"}
 
 
 def _stat(ms, hit, fetch, reads, waits, disk_ms, lane, lane_ms, skip=0.0, prompt_ms=45.0):
@@ -237,19 +342,44 @@ LOG_LOADING = [
     "glm fast: CUDA0 RAM tier 66.10 GB pinned, 6301 slots",
     "glm fast: CUDA0 warming the expert tiers 42% (37.0 of 88.0 GB, 7 s)",
 ]
-LOGS = {"r9700": LOG_R9700, "lowspec": LOG_LOWSPEC, "loading": LOG_LOADING}
+LOG_MULTI4 = [
+    "glm fast: CUDA0 VRAM before the expert pool: 6.10 of 31.8 GB in use - dense weights 4.2",
+    "glm fast: CUDA1 VRAM before the expert pool: 3.90 of 24.0 GB in use - dense weights 2.9",
+    "glm fast: CUDA0 RAM tier 24.70 GB pinned, 2358 slots",
+    "glm fast: CUDA0 CPU lane: 16 threads, an expert 0.09 ms on the CPU vs 0.5 ms over PCIe -> of 0..8 RAM-tier "
+    "experts the CPU takes 0 1 2 2 3 4 5 5 6",
+    "glm fast: mirror on: /mnt/ssd2/V4-Q2_K_XL (reads split between the two drives)",
+    "glm fast: CUDA0 layers [0,14) expert pool 24.60 GB, 190-201 slots/layer (2740 total)",
+    "glm fast: CUDA1 layers [14,25) expert pool 18.90 GB, 191-196 slots/layer (2110 total)",
+    "glm fast: CUDA2 layers [25,36) expert pool 27.40 GB, 270-281 slots/layer (3050 total)",
+    "glm fast: CUDA3 layers [36,43) expert pool 27.50 GB, 390-400 slots/layer (2750 total)",
+    _stat(32.6, 86.1, 1.9, 2.2, 2.0, 4.9, 22.0, 3.1), "glm spec: 3 of 4 drafts accepted (75.0%)",
+    _stat(32.0, 85.8, 1.8, 2.0, 1.9, 4.6, 21.0, 3.0),
+]
+LOG_MULTI10 = ["glm fast: CUDA0 VRAM before the expert pool: 4.2 of 24.0 GB in use - dense weights 3.1"] + [
+    f"glm fast: CUDA{i} layers [{i * 9 // 2},{(i + 1) * 9 // 2}) expert pool 19.{i} GB, 420-460 slots/layer "
+    f"(1946 total)" for i in range(10)] + [
+    "glm fast: CUDA0 CPU lane off: every expert fits in VRAM",
+    _stat(26.4, 99.6, 0.1, 0.02, 0.02, 0.05, 0.0, 0.0), "glm spec: 3 of 4 drafts accepted (75.0%)",
+    _stat(26.1, 99.7, 0.1, 0.01, 0.01, 0.03, 0.0, 0.0)]
+LOGS = {"r9700": LOG_R9700, "lowspec": LOG_LOWSPEC, "loading": LOG_LOADING, "multi4": LOG_MULTI4,
+        "multi10": LOG_MULTI10}
 
 
 def local(name: str, log_path=None, now: float | None = None) -> dict:
     """terminal_local's facts of a scenario: the config (its display name, quant, env), the PID file, the bench line."""
     now = time.time() if now is None else now
-    if name == "split":
+    if name in ("split", "multi8"):
         return {"remote": True, "is_local": False, "pid_alive": None}
     cfg = {"r9700": ("abyss-dsv41-iq2xxs-r9700l", "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS", "UD-IQ2_XXS", 65536, "hip",
                      {"STRATA_GLM_MIRROR": "/mnt/ssd2/V4.1-UD-IQ2_XXS", "GPU_MAX_HW_QUEUES": "2"}, 8082),
            "lowspec": ("abyss-dsv41-iq1m-16g", "DeepSeek-V4.1-Flash-1017-UD-IQ1_M", "UD-IQ1_M", 32768, "cuda", {}, 8080),
            "loading": ("abyss-dsv41-iq2xxs-r9700l", "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS", "UD-IQ2_XXS", 65536, "hip",
                        {"STRATA_GLM_MIRROR": "/mnt/ssd2/V4.1-UD-IQ2_XXS"}, 8082),
+           "multi4": ("abyss-dsv4-q2kxl-4gpu", "DeepSeek-V4-Flash-0731-UD-Q2_K_XL", "UD-Q2_K_XL", 65536, "cuda",
+                      {"STRATA_GLM_MIRROR": "/mnt/ssd2/V4-Q2_K_XL"}, 8082),
+           "multi10": ("abyss-glm-q4kxl-10gpu", "GLM-5.3-Flash-UD-Q4_K_XL", "UD-Q4_K_XL", 131072, "cuda", {},
+                       8082),
            "down": ("abyss-ornith-r9700l", "Ornith-1.5-122B-IQ3_XXS-B", "IQ3_XXS", 131072, "hip", {}, 8082)}[name]
     stem, disp, quant, ctx, back, env, port = cfg
     bench = {"line": "Abyss v1.3.77 | DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS | AMD Radeon AI PRO R9700 (gfx1201) 32 GB | "
@@ -260,7 +390,8 @@ def local(name: str, log_path=None, now: float | None = None) -> dict:
     return {"remote": False, "is_local": True, "pid_alive": name == "loading" or (None if name != "down" else False),
             "started": now - 23 if name == "loading" else None, "bench": bench, "version": "1.3.77",
             "config": {"file": stem + ".json", "stem": stem, "display": disp, "quant": quant, "ctx": ctx,
-                       "backend": back, "env": env, "model_name": stem, "port": port}}
+                       "backend": back, "env": env, "model_name": stem, "port": port,
+                       "gpus": list(range({"multi4": 4, "multi10": 10}.get(name, 1)))}}
 
 
 CONFIGS = [  # the Models view's list (terminal_local.config_info's fields)
