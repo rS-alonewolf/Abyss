@@ -7,6 +7,25 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased
+
+**Two items of the 2026-10-30 Strata/Maya review (no GPU needed; the ideas are Maya #626 and #419, the code is
+Abyss's own).**
+
+- Streamed tool calls: a call's body was one growing string and every new piece searched it from the start for the
+  end tag (and the streamed value's end), so an agent's Write of a 200 KB file cost about a second of CPU at 8
+  characters a piece, growing with the square of the length. The body is kept as pieces, the end tag is looked for
+  in the new piece plus the tail a tag split across pieces needs, and the streaming scanner consumes what it has
+  reported: 20-100x faster on the 200 KB case, the events byte for byte the same (checked against the old parser on
+  7,680 chunkings of 24 texts in every form - GLM, Qwen, DSML V4 and V4.1, quoted and unterminated calls).
+- The server's connections set `TCP_NODELAY`: a stream's one-token SSE pieces no longer wait for the delayed ACK of the
+  piece before (up to 40 ms each on a slow link).
+- `--calibrate`'s store (`~/.config/project-maya/calibration.json`) keys its results by the GPU's PCIe link (what the
+  card and its slot can do together) and the driver version too: a card moved between an x16 slot and an OCuLink x4,
+  or a driver update, used to reuse the tuning measured on the other. An older store is read and its entries are
+  stale: not used, and the setup says once, in one line, what the saved tuning was measured on, what it is now, and
+  that `./abyss.sh --calibrate` measures again. The nearest-context lookup still works on the same slot and driver.
+
 ## v1.3.78 - 2026-10-30
 
 **Bug-fix pack (the 2026-10-30 review's week-1 items, no GPU needed): a prompt-path out-of-range read, the server's
