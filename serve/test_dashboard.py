@@ -129,6 +129,23 @@ class Dashboard(unittest.TestCase):
             {"type": "text", "text": "and this"}, {"type": "image_url", "image_url": {"url": "data:,"}}]}]})
         self.assertTrue(json.loads(b)["approximate"])
 
+    def test_abyss_terminal_reads_this_metrics(self):
+        """Abyss Terminal (tools/terminal_model.py) against this server's own /metrics: attached, the model named,
+        every view drawn to its size - the server and the Terminal agree on the fields."""
+        sys.path.insert(0, str(ROOT / "tools"))
+        import terminal_draw as D
+        import terminal_model as M
+        self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+        link = M.Link(self.base)
+        self.assertEqual(link.poll(), "live")
+        v = M.derive(link, {"remote": True}, None, seen={})
+        self.assertEqual((v["conn"], v["state"]), ("live", "idle"))
+        self.assertEqual(v["ctx"], 32768)
+        self.assertEqual(v["requests"][0]["api"], "openai")
+        for i in range(len(D.VIEWS)):
+            lines = D.screen(v, 80, 24, {"view": i})
+            self.assertEqual({ln.width for ln in lines}, {80})
+
     def test_requests_record_their_api(self):
         self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
         s, _, b = self.req("GET", "/metrics")
