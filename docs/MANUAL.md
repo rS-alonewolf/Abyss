@@ -307,7 +307,9 @@ A terminal UI for the server - this PC's or another's - that you open and close 
 ABYSS_API_KEY=... ./abyss.sh --terminal --url http://192.168.1.20:8082 --key-env ABYSS_API_KEY   # another PC
 ./abyss.sh --terminal --plain               # no Textual: plain text redrawn every second (an old Windows console)
 ./abyss.sh --terminal --once                # one reading printed; --json the same as JSON (issue reports)
-./abyss.sh --terminal --demo r9700          # recorded readings, no server (r9700, lowspec, split, loading, down)
+./abyss.sh --terminal --demo r9700          # recorded readings, no server (r9700, lowspec, split, multi4, multi8,
+                                            #   multi10, loading, down)
+./abyss.sh --terminal --layout devices      # the Overview as one panel a device (default for 3+ cards)
 ```
 
 Windows: `START-ABYSS.bat --terminal` with the same options; without abyss.sh: `python tools/abyss_terminal.py ...`.
@@ -326,6 +328,17 @@ The screen is Textual, installed into `.venv` from `third_party/wheels` the firs
   cluster, the drives; **Logs** - the engine log coloured (`/` filters); **Connect** - the API addresses and a check
   (`h`); **Models** - the installed configs: `Enter` starts one (the running server stops first), `s` stops, `B` runs
   `--bench` (its output in Logs), `y` copies the bench line.
+- **Two Overview layouts** (`l` switches, `--layout speed|devices`; the choice is remembered in
+  `~/.config/abyss/terminal.json`, on Windows `%APPDATA%\abyss\terminal.json`): **Speed** - the big numbers, the
+  token's time and the tiles above; **Devices** - a small speed strip, then every GPU (main / split / helper / iGPU
+  lane), the CPU and every drive in a panel of its own, in a grid that wraps (10 cards fit). Until you choose, a config
+  with 3+ cards opens on Devices. The footer names the layout.
+- **Several GPUs** (2-10 cards, mixed generations): each card shows its role, load, VRAM, the layers and expert pool
+  it holds in a layer split (`L0-13`, from the engine log on this PC), temperatures, power against its own limit, its
+  PCIe link against its own max, and its share of the token time (`--` until phase 2). The busiest card is starred;
+  a card whose link fell while working, or that sits on a link under half the others' (an x1 riser, Gen2/Gen3 x4), is
+  pink and named in a banner. Every drive shows its MB/s and its share of the expert reads (any number of drives). At
+  80x24 the cards are summed up in one line (busiest / VRAM / hottest / lowest link) with the cards that matter.
 - **Detached:** a server the Terminal starts runs in a session of its own (`abyss.py --config <config> --plain`,
   output in `<config>.server.log`, PID in `<config>.pid`) - quitting asks *keep serving* or *stop it*; a server that
   was already running is left alone. A stop is `POST /api/shutdown`, else Ctrl+C to the server's process group; after
@@ -341,7 +354,7 @@ The screen is Textual, installed into `.venv` from `third_party/wheels` the firs
 - **Remote:** read-only (no Models / Logs / per-token breakdown, which read this PC's files). The key is read from the
   environment variable `--key-env` names and never stored; over plain `http://` to another PC it travels readable - use
   Tailscale or an SSH tunnel (`ssh -L 8082:127.0.0.1:8082 host`, then `--url http://127.0.0.1:8082`).
-- **Keys:** `r` poll now, `space` freeze, `t` theme (dark / light / mono; `NO_COLOR` starts in mono), `L` records a
+- **Keys:** `l` Overview layout, `r` poll now, `space` freeze, `t` theme (dark / light / mono; `NO_COLOR` starts in mono), `L` records a
   temperature CSV to `bench/thermal/` every 2 s, `b` opens the web app, `c` copies the API address (OSC 52), `?` help,
   `q` / Ctrl+C quit. It fits 80x24 (compact boxes, the view scrolls) and shows more from 110 columns.
 

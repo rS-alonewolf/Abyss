@@ -300,7 +300,9 @@ GGUF_PY=~/llm/apps/llama.cpp/gguf-py LIBGGML=~/llm/apps/llama.cpp/build-cuda/bin
 ABYSS_API_KEY=... ./abyss.sh --terminal --url http://192.168.1.20:8082 --key-env ABYSS_API_KEY   # 別の PC
 ./abyss.sh --terminal --plain               # Textual 無し: 1 秒毎に書き直すプレーン表示（古い Windows のコンソール）
 ./abyss.sh --terminal --once                # 1 回読んで表示、--json は JSON で（issue 報告用）
-./abyss.sh --terminal --demo r9700          # 記録した値でサーバー無しに表示（r9700, lowspec, split, loading, down）
+./abyss.sh --terminal --demo r9700          # 記録した値でサーバー無しに表示（r9700, lowspec, split, multi4, multi8,
+                                            #   multi10, loading, down）
+./abyss.sh --terminal --layout devices      # Overview をデバイス毎のパネルで（3 枚以上のカードでは既定）
 ```
 
 Windows は `START-ABYSS.bat --terminal`（オプションは同じ）。abyss.sh を使わない場合は `python tools/abyss_terminal.py ...`。
@@ -318,6 +320,17 @@ Windows は `START-ABYSS.bat --terminal`（オプションは同じ）。abyss.s
   PCIe、CPU のコア・クラスタ毎、ドライブ。**Logs** - 色分けしたエンジンログ（`/` で絞り込み）。**Connect** - API の
   アドレスと疎通確認（`h`）。**Models** - インストール済みの設定: `Enter` で起動（動いているサーバーは先に止める）、
   `s` で停止、`B` で `--bench`（出力は Logs）、`y` でベンチ要約行をコピー。
+- **Overview の 2 つのレイアウト**（`l` で切替、`--layout speed|devices`。選んだものは `~/.config/abyss/terminal.json`、
+  Windows は `%APPDATA%\abyss\terminal.json` に覚える）: **Speed** - 上の大きな数字、1 トークンの時間、タイル。
+  **Devices** - 小さな速度の帯の下に、GPU（main / split / helper / iGPU レーン）、CPU、ドライブを 1 台ずつのパネルで
+  折り返して並べる（10 枚まで収まる）。まだ選んでいなければ、カード 3 枚以上の設定は Devices で開く。フッタに今の
+  レイアウト名が出る。
+- **複数の GPU**（2-10 枚、世代の混在も）: カード毎に役割、負荷、VRAM、レイヤ分割で受け持つレイヤとエキスパート
+  プール（`L0-13`、この PC のエンジンログから）、温度、そのカード自身の上限に対する電力、そのカード自身の最大に対する
+  PCIe リンク、1 トークンの時間の分担（phase 2 までは `--`）。一番忙しいカードに ★、作業中にリンクが落ちたカードや
+  他の半分未満のリンク（x1 ライザー、Gen2/Gen3 x4）のカードはピンクでバナーにも出る。ドライブは何台でも MB/s と
+  エキスパート読み出しの分担を出す。80x24 ではカードを 1 行に要約（一番忙しい / VRAM / 一番熱い / 一番遅いリンク）し、
+  要るカードだけ並べる。
 - **デタッチ:** Terminal が起動したサーバーは別セッションで動く（`abyss.py --config <設定> --plain`、出力は
   `<設定>.server.log`、PID は `<設定>.pid`）。終了時に「提供を続ける / 止める」を聞く。既に動いていたサーバーには
   触らない。停止は `POST /api/shutdown`、使えなければサーバーのプロセスグループへ Ctrl+C、60 秒で強制終了。次の
@@ -332,7 +345,7 @@ Windows は `START-ABYSS.bat --terminal`（オプションは同じ）。abyss.s
 - **リモート:** 読み取りのみ（この PC のファイルを読む Models / Logs / 1 トークン内訳は出ない）。キーは `--key-env`
   で指定した環境変数から読み、保存しない。別の PC へ平文の `http://` で送ると読まれうる - Tailscale か SSH トンネル
   （`ssh -L 8082:127.0.0.1:8082 host` の後 `--url http://127.0.0.1:8082`）を使う。
-- **キー:** `r` すぐ再取得、`space` 表示を止める、`t` テーマ（dark / light / mono。`NO_COLOR` なら mono で始まる）、
+- **キー:** `l` Overview のレイアウト、`r` すぐ再取得、`space` 表示を止める、`t` テーマ（dark / light / mono。`NO_COLOR` なら mono で始まる）、
   `L` 温度の CSV を 2 秒毎に `bench/thermal/` へ記録、`b` web アプリを開く、`c` API アドレスをコピー（OSC 52）、
   `?` ヘルプ、`q` / Ctrl+C で終了。80x24 で崩れず（箱を詰め、ビューはスクロール）、110 桁以上で表示が増える。
 

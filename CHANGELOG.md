@@ -16,6 +16,13 @@ another's - and closing it leaves the model serving ([MANUAL](docs/MANUAL.md#aby
   and advice, GPU / VRAM / temperature / power / PCIe while working / CPU / each SSD of a mirror, context, experts in
   VRAM, the RAM tier, RAM with swap and memory pressure, the drafter, every card with its role, the last requests),
   Speed, Memory, Requests, Hardware, Logs, Connect, Models (start / stop / switch a config, run `--bench`).
+- Two Overview layouts, `l` or `--layout speed|devices`, remembered per user: Speed (the big numbers and tiles) and
+  Devices (every GPU, the CPU and every drive in a panel of its own, a grid that wraps to 10 cards; the default for a
+  config with 3+ cards until one is chosen).
+- Several GPUs as the usual case: per card the layers and expert pool of a layer split (from the engine log), power
+  and PCIe against the card's own limit and max (a 5090 + 3090 + V100 box shows each), the busiest starred, a card
+  whose link dropped or sits under half the others' (an x1 riser) in pink with a banner; any number of drives with
+  their share of the expert reads; at 80x24 one summary line plus the cards that matter.
 - The server it starts runs detached (PID file, output beside the config); quit asks keep serving or stop. A stop is
   `POST /api/shutdown`, else Ctrl+C to its process group.
 - Remote: `--url` with `--key-env NAME` (the key read from that variable, never stored), read-only, a warning for a key
