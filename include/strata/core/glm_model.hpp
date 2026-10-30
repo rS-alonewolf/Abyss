@@ -165,8 +165,18 @@ public:
         double ms = 0, miss_ms = 0, disk_ms = 0, cpu_ms = 0;
         int64_t pool_slots = 0, pool_used = 0, ram_slots = 0, ram_used = 0;
         double pool_gb = 0, ram_gb = 0;
+        uint64_t mirror_b0 = 0, mirror_b1 = 0;   // expert bytes read from the shards' drive / the mirror (STRATA_GLM_MIRROR)
     };
     FastStats fast_stats() const;
+    /// The run's facts for the server's INFO line (Abyss Terminal): the lane that computes the RAM tier's experts
+    /// ("cpu" / "igpu" / "exl3" / "off"), the drafter ("mtp" GLM's NextN block, "nextn" qwen35moe's, "dspark",
+    /// "none"), the disk tail skip's rank (0 = off), expert deferral, a shard mirror, an expert helper card.
+    const char* lane_kind() const;
+    const char* drafter_kind() const;
+    int tail_skip_rank() const;
+    bool defer_on() const;
+    bool mirror_configured() const;
+    bool helper_configured() const;
     void gap_report();   // STRATA_GLM_GAP_PROF=1: prints and resets the between-tokens profile (nothing otherwise)
     /// The CPU LANE (a decode's RAM-tier experts): the share of them copied over PCIe to the GPU instead of computed
     /// on the CPU - 0: the CPU takes every one, 1: none (of f such experts in a route, f - round(share f) go to the

@@ -3511,6 +3511,8 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
         s.tokens = fast_->tokens;
         s.ms = fast_->ms;
     }
+    s.mirror_b0 = strata::core::shard_io::mirror_bytes[0].load(std::memory_order_relaxed);
+    s.mirror_b1 = strata::core::shard_io::mirror_bytes[1].load(std::memory_order_relaxed);
     return s;
 }
 
@@ -5949,6 +5951,40 @@ size_t Glm5Model::pool_avail(size_t free_b, size_t total_b) {
         avail = std::min(avail, cap > used + reserve ? cap - used - reserve : (size_t) 0);
     }
     return avail;
+}
+
+// ---- the run's facts for the server's INFO line (Abyss Terminal): read once at the start, nothing on the token path
+const char* Glm5Model::lane_kind() const {
+    const FastState* F = fast_;
+    if (F == nullptr || F->cpu_pool == nullptr) return "off";
+    if (F->igpu_experts != nullptr) return "igpu";
+    for (const auto& Ly : F->L)
+        if (Ly.exl3) return "exl3";
+    return "cpu";
+}
+
+const char* Glm5Model::drafter_kind() const {
+    if (dsp_ != nullptr) return "dspark";
+    if (q35_mtp_on()) return g_.q4x ? "mtp" : "nextn";
+    return has_mtp() ? "mtp" : "none";
+}
+
+int Glm5Model::tail_skip_rank() const {
+    return fast_ != nullptr && fast_->tail_skip < gf::kMaxK ? fast_->tail_skip : 0;
+}
+
+bool Glm5Model::defer_on() const { return fast_ != nullptr && fast_->defer; }
+
+bool Glm5Model::mirror_configured() const {
+    for (const auto& s : pack_shards_)
+        if (s.fd_mirror >= 0) return true;
+    return false;
+}
+
+bool Glm5Model::helper_configured() const {
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        if (m->fast_ != nullptr && m->fast_->expert_helper != nullptr) return true;
+    return false;
 }
 
 bool Glm5Model::has_mtp() const {

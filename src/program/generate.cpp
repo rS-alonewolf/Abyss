@@ -1389,11 +1389,17 @@ static int glm_pack_generate(const Options& o) {
         // (+ the CPU lane setup's calibration reads: its threads and its PCIe share, as the engine started)
         std::printf("INFO context=%lld kv=%s expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast experts=%d "
                     "vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d vision_lend=%zu cpu_threads=%d "
-                    "pcie_share=%.2f uncensor=%d\n",
+                    "pcie_share=%.2f uncensor=%d"
+                    // (+ Abyss Terminal's: the lane's kind, the drafter, one expert's MiB - the pool's GB over its
+                    // slots - and the settings that change the run: the tail skip's rank, deferral, a mirror, a helper)
+                    " lane=%s drafter=%s expert_mib=%.3f tail_skip=%d defer=%d mirror=%d helper=%d\n",
                     (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
-                    model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share(), model.abl_loaded() ? 1 : 0);
+                    model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share(), model.abl_loaded() ? 1 : 0,
+                    model.lane_kind(), model.drafter_kind(),
+                    st.pool_slots > 0 ? st.pool_gb * 1024.0 / (double) st.pool_slots : 0.0, model.tail_skip_rank(),
+                    model.defer_on() ? 1 : 0, model.mirror_configured() ? 1 : 0, model.helper_configured() ? 1 : 0);
     }
 
     strata::kernels::SamplerParams sp;
@@ -1792,6 +1798,7 @@ static int glm_pack_generate(const Options& o) {
         snap_abl = abl_req;   // (the sequence in the model from here on)
         std::vector<float> lg;
         const auto t0 = std::chrono::steady_clock::now();
+        const auto st0 = model.fast_stats();   // (PP lines: the prompt's disk wait so far = disk_ms - st0's)
         const char* finish = "length";
         // the prompt one CHUNK at a time (PP reports per chunk: the server shows it and counts it as a heartbeat);
         // the state is saved before the LAST prompt token, so an identical or extending prompt can reuse it
@@ -1809,8 +1816,8 @@ static int glm_pack_generate(const Options& o) {
                 if (!o.serve) return;
                 std::lock_guard<std::mutex> lk(pp_mu);
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                std::printf("PP %zu %zu %.1f %.1f\n", reuse + done, prompt.size(), ms,
-                            (double) done / (ms / 1000.0 + 1e-9));
+                std::printf("PP %zu %zu %.1f %.1f %zu %.1f\n", reuse + done, prompt.size(), ms,
+                            (double) done / (ms / 1000.0 + 1e-9), reuse, model.fast_stats().disk_ms - st0.disk_ms);
                 std::fflush(stdout);
             };
             model.prefill_progress = [&](int64_t done, int64_t total) {
@@ -1859,14 +1866,21 @@ static int glm_pack_generate(const Options& o) {
             i += chunk;
             if (o.serve) {
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                std::printf("PP %zu %zu %.1f %.1f\n", i, prompt.size(), ms,
-                            (double) (i - reuse) / (ms / 1000.0 + 1e-9));
+                std::printf("PP %zu %zu %.1f %.1f %zu %.1f\n", i, prompt.size(), ms,
+                            (double) (i - reuse) / (ms / 1000.0 + 1e-9), reuse,
+                            model.fast() ? model.fast_stats().disk_ms - st0.disk_ms : 0.0);
             }
             if (stop_req.load()) { finish = "cancel"; break; }
         }
         if (stop_req.load()) finish = "cancel";
         const auto t1 = std::chrono::steady_clock::now();
         const auto st1 = model.fast_stats();
+        // STAT's window (Abyss Terminal): the last 8 STAT snapshots = the last ~64 tokens, so a long answer's live
+        // numbers follow the present instead of the request's mean; spec_rounds: the drafter's verify steps
+        struct StatSnap { double n, el; strata::core::Glm5Model::FastStats st; };
+        std::deque<StatSnap> stat_ring;
+        uint64_t spec_rounds = 0;
+        const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;
         if (!stop_req.load())
             model.expert_helper_decode_begin(model.spec_ready() || spec_k > 0 || o.spec > 0);
         // Covers cancellation and every early error as well as the normal end of the request.
@@ -1956,13 +1970,31 @@ static int glm_pack_generate(const Options& o) {
                 const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
                 const double n = (double) produced;
                 const uint64_t h = sn.hits - st1.hits, m = sn.misses - st1.misses;
+                // the window: against the snapshot ~64 tokens back (the request's start until there are 8)
+                const StatSnap& w0 = stat_ring.empty() ? StatSnap{0.0, 0.0, st1} : stat_ring.front();
+                const double wn = std::max(1.0, n - w0.n), wel = std::max(1e-9, el - w0.el);
                 std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=%.3f promo=%.3f "
-                            "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f\n",
+                            "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f"
+                            // (+ Abyss Terminal's live breakdown - the "glm stat" line's numbers, per token so far:
+                            // the SSD waits, the lane, the mirror's bytes, the last ~64 tokens' window, the drafter)
+                            " disk_ms=%.3f disk_waits=%.3f miss_ms=%.3f lane=%.3f lane_ms=%.3f tail_skip=%.3f"
+                            " mirror_mb0=%.1f mirror_mb1=%.1f w_ms_tok=%.2f w_disk_ms=%.3f w_lane_ms=%.3f"
+                            " spec_acc=%llu spec_offered=%llu spec_rounds=%llu\n",
                             n / std::max(1e-9, el), 1000.0 * el / n, (double) h / (double) std::max<uint64_t>(1, h + m),
                             (double) (sn.ram_hits - st1.ram_hits) / n, (double) (sn.disk_reads - st1.disk_reads) / n,
                             (double) (sn.promotions - st1.promotions) / n, (long long) sn.pool_used,
                             (long long) sn.pool_slots, (long long) sn.ram_used, (long long) sn.ram_slots, sn.ram_gb,
-                            sn.pool_gb);
+                            sn.pool_gb,
+                            (sn.disk_ms - st1.disk_ms) / n, (double) (sn.miss_layers - st1.miss_layers) / n,
+                            (sn.miss_ms - st1.miss_ms) / n, (double) (sn.cpu_experts - st1.cpu_experts) / n,
+                            (sn.cpu_ms - st1.cpu_ms) / n, (double) (sn.tail_skips - st1.tail_skips) / n,
+                            (double) (sn.mirror_b0 - st1.mirror_b0) / 1048576.0,
+                            (double) (sn.mirror_b1 - st1.mirror_b1) / 1048576.0,
+                            1000.0 * wel / wn, (sn.disk_ms - w0.st.disk_ms) / wn, (sn.cpu_ms - w0.st.cpu_ms) / wn,
+                            (unsigned long long) (model.spec_hits_ - hits0), (unsigned long long) (model.spec_steps_ - spec0),
+                            (unsigned long long) spec_rounds);
+                stat_ring.push_back(StatSnap{n, el, sn});
+                if (stat_ring.size() > 8) stat_ring.pop_front();
             }
             bool eos_hit = false;
             for (const int64_t e : eos)
@@ -1977,7 +2009,6 @@ static int glm_pack_generate(const Options& o) {
             }
             return produced < max_new;
         };
-        const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;
         if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
             // running the NextN block's draft (same tokens as the loop below)
@@ -2220,6 +2251,7 @@ static int glm_pack_generate(const Options& o) {
                 }
                 model.dspark_upload();   // (the expert cache's copies under the window)
                 model.spec_steps_ += (uint64_t) k;
+                ++spec_rounds;
                 ++n_win;
                 n_draft += k;
                 if (rep) {
@@ -2376,6 +2408,7 @@ static int glm_pack_generate(const Options& o) {
                     return 1;
                 }
                 model.spec_steps_ += draft.size();
+                ++spec_rounds;
                 ++n_win;
                 n_draft += (int64_t) draft.size();
                 int next = -1, kept = 1;   // kept: the window's tokens that stay in the sequence
@@ -2442,10 +2475,11 @@ static int glm_pack_generate(const Options& o) {
         // the decode phase's expert-tier counters (the fast path; zeros on the reference path)
         const auto st2 = model.fast_stats();
         const uint64_t d_hits = st2.hits - st1.hits, d_miss = st2.misses - st1.misses;
-        std::printf("DONE %lld %lld %.1f %.1f %s %llu %llu %zu %llu %llu\n", (long long) produced,
+        std::printf("DONE %lld %lld %.1f %.1f %s %llu %llu %zu %llu %llu %llu\n", (long long) produced,
                     (long long) prompt.size(), prompt_ms, decode_ms, finish,
                     (unsigned long long) (model.spec_hits_ - hits0), (unsigned long long) (model.spec_steps_ - spec0),
-                    reuse, (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
+                    reuse, (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss),
+                    (unsigned long long) spec_rounds);   // (11th: the drafter's verify steps, Abyss Terminal)
         std::fflush(stdout);
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)
         if (model.fast()) model.save_usage();
