@@ -332,22 +332,40 @@ def logo(row: int, tick: int = 0) -> Line:
     return out
 
 
+SHORT_STATE = {"GENERATING": "GEN", "READING PROMPT": "READING", "DISCONNECTED": "OFFLINE", "AUTH REQUIRED": "AUTH",
+               "CONNECTING": "CONN", "RELOADING": "RELOAD", "UPDATING": "UPDATE"}
+
+
 def header(v: dict, w: int, tick: int = 0, anim: bool = True) -> list:
     """Two lines: the logo, the model with its quant and the badges, the state; the config, context, backend, server,
-    versions and the connection."""
+    versions and the connection.  Narrow, the name gives way first - never the quant, the badges or the state."""
     small = w < 60
-    l1 = Line() if small else logo(0).add("  ")
-    l2 = Line() if small else logo(1).add("  ")
-    l1.add(v["name"], "ink b")
+    pill_ = state_pill(v)
+    if w < 80:                                 # (narrow: the state's short name)
+        k = state_key(v)
+        glyph, text, style = STATE[k]
+        pill_ = L(f" {glyph} {SHORT_STATE.get(text, text)} ", style + " b r")
+    logo_w = 0 if small else len(LOGO[0]) + 2
+    room = w - logo_w - pill_.width - 1
+    quant = Line()
     if v.get("quant"):
-        l1.add(" ").add(v["quant"], "accent b")
+        quant.add(" ").add(v["quant"], "accent b")
+    marks = Line()
     for text, tone in v.get("badges") or []:
-        l1.add(" ").cat(L(f"[{text}]", ("alert b" if tone == "alert" else "violet")))
+        marks.add(" ").cat(L(f"[{text}]", ("alert b" if tone == "alert" else "violet")))
+    name_w = max(4, room - quant.width - (marks.width if v["name"] and len(v["name"]) + quant.width + marks.width
+                                          <= room else 0))
+    l1 = Line() if small else logo(0).add("  ")
+    l1.cat(fit(L(v["name"], "ink b"), min(len(v["name"]), name_w))).cat(quant)
+    l2 = Line() if small else logo(1).add("  ")
+    if len(v["name"]) + quant.width + marks.width <= room:
+        l1.cat(marks)
+    elif marks.width:
+        l2.cat(Line(marks[1:]) if marks and marks[0][0] == " " else marks).add(" ")   # (the badges: line 2, first)
     meta = [x for x in (v.get("config"), f"ctx {toks(v['ctx'])}" if v.get("ctx") else None, v.get("backend"),
                         (v.get("url") or "").replace("http://", "").replace("https://", "https "),
                         f"Abyss v{v['version']}" if v.get("version") else None) if x]
     l2.add(" · ".join(meta), "muted")
-    pill_ = state_pill(v)
     live = v["conn"] == "live"
     dot = L("●", ("good b" if (tick % 2 == 0 or not anim) else "faint") if live else "faint")
     age = v.get("age")
@@ -355,7 +373,12 @@ def header(v: dict, w: int, tick: int = 0, anim: bool = True) -> list:
                                "good" if live else "muted")
     if age is not None:
         conn.add(f"{age:.1f}s" if age < 10 else dur(age), "muted")
-    return [spread(l1, pill_, w), spread(l2, conn, w)]
+
+    def pin(left, rt):                         # (the state is never dropped: the left side gives way)
+        if rt.width + 8 > w:
+            return fit(rt, w)
+        return fit(left, w - rt.width - 1).add(" ").cat(rt)
+    return [pin(l1, pill_), pin(l2, conn)]
 
 
 def tabs(view: int, w: int) -> Line:
@@ -978,8 +1001,10 @@ def diagnose(v: dict) -> list:
             v["tiers"]["ram_used"] >= 0.97 * v["tiers"]["ram_slots"]
         out.append((f"SSD-bound: {tt['disk_ms']:.1f} ms of every {tt['ms']:.1f} ms token waits for the SSD"
                     + (" and the RAM tier is full" if full else "") + ".", "alert b"))
-        out.append(("A second SSD (STRATA_GLM_MIRROR, docs/SSD2) cut the waits ~20%; a smaller quant "
-                    "(e.g. UD-IQ1_M) or more RAM; or the tail skip (lossy).", "soft"))
+        smallest = "IQ1" in (v.get("quant") or "")
+        out.append(("A second SSD (STRATA_GLM_MIRROR, docs/SSD2) cut the waits ~20%; "
+                    + ("more RAM for the RAM tier" if smallest else "a smaller quant (e.g. UD-IQ1_M) or more RAM")
+                    + "; or the tail skip (STRATA_GLM_TAIL_SKIP, lossy).", "soft"))
     else:
         out.append((f"{VERDICT.get(tt['verdict'], '?')}: {tt['what']}.", "warn b"))
         out.append((f"What moves it: {tt['moves']}", "soft"))
