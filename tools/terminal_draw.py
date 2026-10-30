@@ -1567,13 +1567,16 @@ def help_lines(w: int) -> list:
               "  temperature log", "muted"),
             L("l", "accent b", "  Overview layout: Speed (big numbers) / Devices (every GPU, SSD and the CPU in its own "
               "panel)", "muted"),
-            L("/", "accent b", "  (Logs) filter   ", "muted", "t", "accent b", "  theme dark / light / mono   ", "muted",
-              "q", "accent b", "  quit", "muted"), Line(),
+            L("/", "accent b", "  (Logs) filter   ", "muted", "h", "accent b", "  (Connect) check the API   ", "muted",
+              "t", "accent b", "  theme dark / light / mono   ", "muted", "q", "accent b", "  quit", "muted"), Line(),
             L("NUMBERS", "accent b"),
-            L("--", "ink b", "  not reported (missing is never shown as 0). Tiles marked 'engine counter (phase 2)' wait "
-              "for the engine's next STAT keys.", "soft"),
+            L("--", "ink b", "  not reported (missing is never shown as 0). A tile that names a 1.3.80+ engine or server "
+              "waits for a counter this one does not send.", "soft"),
             L("live", "good b", " = the last few seconds; ", "soft", "last request", "ink b", " = the previous answer; ",
               "soft", "mean", "ink b", " = since the request began.", "soft"),
+            L("TOKEN TIME's source", "ink b", ": 'live · last ~64 tokens' = the engine's STAT window while it writes; "
+              "'last answer · engine STAT' = its final numbers; 'engine log' = the per-answer line (older engines).",
+              "soft"),
             L("TOKEN TIME", "ink b", ": SSD waits stop the GPU (serial); the lane runs alongside (parallel) - never "
               "added. The verdict uses ./abyss.sh --bench's rules (tools/bench_rules.py).", "soft"),
             L("GPU LOAD", "ink b", " is the busiest model card; the iGPU lane and a helper card have their own rows.",

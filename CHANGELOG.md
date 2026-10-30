@@ -57,6 +57,28 @@ another's - and closing it leaves the model serving ([MANUAL](docs/MANUAL.md#aby
   `tiers.history` carries every numeric STAT key (keys a newer engine adds get their series).
 - A value that cannot be read is `null` (shown as `--`), never 0.
 
+**Abyss Terminal phase 2: the token's time live from the engine, a server that answers while it loads, the engine log
+over HTTP.** The engine change is printf of counters it already keeps (STAT every 8 tokens, INFO once, PP, DONE);
+not yet run on a GPU here (the R9700 was busy): the syntax is checked for HIP, the parsers against the lines.
+
+- Engine: `STAT` carries `disk_ms disk_waits miss_ms lane lane_ms tail_skip` (the "glm stat" line's per-token numbers
+  while the answer is written), `mirror_mb0 / mirror_mb1` (the mirror's bytes per drive), a window over the last ~64
+  tokens (`w_ms_tok w_disk_ms w_lane_ms`) and the drafter's `spec_acc spec_offered spec_rounds`; `INFO` adds
+  `lane=cpu|igpu|exl3|off drafter=mtp|nextn|dspark|none expert_mib tail_skip defer mirror helper`; `PP` the reused
+  tokens and the prompt's SSD wait so far; `DONE` an 11th column, the verify steps. Older engines' shorter lines are
+  read as before.
+- Server: the port is bound before the engine starts - `GET /health` answers `status: "loading"` with `load`
+  (stage, text, percent and GB of the warm-up, elapsed seconds; the same under `reloading` during a context change),
+  everything else 503 + `Retry-After: 15` until the model is ready; one listening socket for the whole life.
+  `GET /api/log?since=<offset>&max=<bytes>` (the key needed) sends the engine log's tail by byte offset, whole lines,
+  the API key's values masked. `/metrics`: `requests[].spec_rounds`, `live.prompt_reused / prompt_disk_ms`.
+- Terminal: the Token time tile and the Speed view show the live window while an answer is written (`live · last ~64
+  tokens`), the last answer's final STAT when idle, the engine log for older engines; the lane's kind from INFO and
+  its estimated GB/s; the mirror's split as the engine counts it; the drafter's live acceptance and tokens a verify
+  step; the prompt's reused tokens and SSD wait while reading; a remote server's loading progress; its engine log
+  over `/api/log` (Logs and the per-request breakdown work remotely). `--demo starting`. Tests for every new field
+  and for engines and servers without them (`serve/test_dashboard.py`, `tools/test_abyss_terminal.py`).
+
 ## v1.3.79 - 2026-10-30
 
 **Two items of the 2026-10-30 Strata/Maya review (no GPU needed; the ideas are Maya #626 and #419, the code is

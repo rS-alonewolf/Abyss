@@ -308,7 +308,7 @@ ABYSS_API_KEY=... ./abyss.sh --terminal --url http://192.168.1.20:8082 --key-env
 ./abyss.sh --terminal --plain               # no Textual: plain text redrawn every second (an old Windows console)
 ./abyss.sh --terminal --once                # one reading printed; --json the same as JSON (issue reports)
 ./abyss.sh --terminal --demo r9700          # recorded readings, no server (r9700, lowspec, split, multi4, multi8,
-                                            #   multi10, loading, down)
+                                            #   multi10, loading, starting, down)
 ./abyss.sh --terminal --layout devices      # the Overview as one panel a device (default for 3+ cards)
 ```
 
@@ -348,12 +348,26 @@ The screen is Textual, installed into `.venv` from `third_party/wheels` the firs
   States: connecting, loading (the warm-up's progress, from the engine log), idle, reading the prompt, generating,
   queued, reloading, error, stale (the last values kept), disconnected (it retries with back-off), auth required,
   not Abyss, stopped.
-- **`--` means not reported**, never 0. Two kinds wait for the engine's next counters (phase 2): the per-token SSD-wait
-  and lane ms live while it writes (until then they come from the engine log after each answer - on this PC only),
-  the lane's bandwidth, the drafter's tokens per step and the helper card's share.
-- **Remote:** read-only (no Models / Logs / per-token breakdown, which read this PC's files). The key is read from the
-  environment variable `--key-env` names and never stored; over plain `http://` to another PC it travels readable - use
-  Tailscale or an SSH tunnel (`ssh -L 8082:127.0.0.1:8082 host`, then `--url http://127.0.0.1:8082`).
+- **Live per-token time (a 1.3.80+ engine):** the engine's STAT line (every 8 tokens) carries the SSD wait, the
+  lane's experts and busy ms, misses, the tail skip, the mirror's MB per drive, the drafter's accepted / offered /
+  verify steps, and a window over the last ~64 tokens. While an answer is written the Token time tile and the Speed
+  view show that window (`live · last ~64 tokens`) and `--bench`'s verdict follows it; idle, the last answer's final
+  numbers (`last answer · engine STAT`); with an older engine the engine log after each answer (`engine log`). The
+  Speed view adds the lane's estimated bandwidth (experts a token x one expert's MiB / busy ms), the mirror's split as
+  the engine counts it, the drafter's live acceptance and tokens a verify step; the prompt tile shows the reused tokens
+  and the SSD wait so far while a prompt is read. The header's badges (`TAIL SKIP`, `DEFER`, `MIRROR`, `HELPER`, the
+  drafter) come from the engine's INFO line, so a remote server shows them too.
+- **A server still loading (1.3.80+):** the port is bound before the engine starts, so `/health` answers
+  `status: "loading"` with the stage, the warm-up's percent and GB and the seconds so far - the Terminal shows it on
+  another PC as on this one; every other request gets 503 + Retry-After until the model is ready. A context reload
+  shows the same under `reloading`.
+- **`--` means not reported**, never 0. Still waiting for an engine counter: the helper card's share of the token
+  time (E6, needs two CUDA cards).
+- **Remote:** read-only (no Models, which reads this PC's configs). The key is read from the environment variable
+  `--key-env` names and never stored; over plain `http://` to another PC it travels readable - use Tailscale or an SSH
+  tunnel (`ssh -L 8082:127.0.0.1:8082 host`, then `--url http://127.0.0.1:8082`). A 1.3.80+ server sends its engine
+  log's tail over `GET /api/log?since=<offset>&max=<bytes>` (the key is needed; the API key's values are masked), so
+  Logs and the per-request breakdown work remotely too; an older server leaves Logs with a hint.
 - **Keys:** `l` Overview layout, `r` poll now, `space` freeze, `t` theme (dark / light / mono; `NO_COLOR` starts in mono), `L` records a
   temperature CSV to `bench/thermal/` every 2 s, `b` opens the web app, `c` copies the API address (OSC 52), `?` help,
   `q` / Ctrl+C quit. It fits 80x24 (compact boxes, the view scrolls) and shows more from 110 columns.

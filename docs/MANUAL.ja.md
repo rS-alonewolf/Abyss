@@ -301,7 +301,7 @@ ABYSS_API_KEY=... ./abyss.sh --terminal --url http://192.168.1.20:8082 --key-env
 ./abyss.sh --terminal --plain               # Textual 無し: 1 秒毎に書き直すプレーン表示（古い Windows のコンソール）
 ./abyss.sh --terminal --once                # 1 回読んで表示、--json は JSON で（issue 報告用）
 ./abyss.sh --terminal --demo r9700          # 記録した値でサーバー無しに表示（r9700, lowspec, split, multi4, multi8,
-                                            #   multi10, loading, down）
+                                            #   multi10, loading, starting, down）
 ./abyss.sh --terminal --layout devices      # Overview をデバイス毎のパネルで（3 枚以上のカードでは既定）
 ```
 
@@ -339,12 +339,24 @@ Windows は `START-ABYSS.bat --terminal`（オプションは同じ）。abyss.s
   出す（`UNCENSOR`、`TAIL SKIP n`、`DEFER`、`ABL`。`MTP`、`MIRROR`、`HELPER`）。状態: 接続中、ロード中（エンジンログ
   からの warm-up 進捗）、待機、プロンプト読込、生成中、待ち行列、リロード、エラー、STALE（最後の値を保持）、切断
   （間隔を空けて再試行）、認証が必要、Abyss ではない、停止。
-- **`--` は「報告されていない」**で、0 ではない。エンジンの次のカウンタ（phase 2）待ちのもの: 生成中ライブの
-  SSD 待ち・レーンの ms（それまではこの PC のエンジンログから回答毎に出す）、レーンの帯域、ドラフタの 1 ステップ
-  当たりトークン数、ヘルパーカードの分担。
-- **リモート:** 読み取りのみ（この PC のファイルを読む Models / Logs / 1 トークン内訳は出ない）。キーは `--key-env`
-  で指定した環境変数から読み、保存しない。別の PC へ平文の `http://` で送ると読まれうる - Tailscale か SSH トンネル
-  （`ssh -L 8082:127.0.0.1:8082 host` の後 `--url http://127.0.0.1:8082`）を使う。
+- **1 トークンの時間をライブで（1.3.80 以降のエンジン）:** エンジンの STAT 行（8 トークン毎）に SSD 待ち、レーンの
+  エキスパート数と busy ms、ミス、tail skip、ミラーのドライブ毎 MB、ドラフタの受理 / 提示 / 検証ステップ数、直近
+  約 64 トークンの窓が乗る。回答を書いている間は Token time タイルと Speed ビューがその窓を出し（`live · last ~64
+  tokens`）、`--bench` と同じ判定がそれに追従する。待機中は最後の回答の最終値（`last answer · engine STAT`）、古い
+  エンジンでは回答毎のエンジンログ（`engine log`）。Speed ビューにはレーンの推定帯域（1 トークンのエキスパート数 ×
+  1 エキスパートの MiB ÷ busy ms）、エンジンが数えたミラーの分担、ドラフタのライブ受理率と 1 検証ステップ当たりの
+  トークン数が加わり、プロンプト読込中は prompt タイルに再利用トークン数とここまでの SSD 待ちが出る。ヘッダのバッジ
+  （`TAIL SKIP`、`DEFER`、`MIRROR`、`HELPER`、ドラフタ）はエンジンの INFO 行から取るので、リモートでも出る。
+- **起動中のサーバー（1.3.80 以降）:** エンジンを起動する前にポートを開くので、`/health` が `status: "loading"` と
+  段階・warm-up の % と GB・経過秒を返す。Terminal は別の PC からでもこの PC と同じように進捗を出す。他のリクエストは
+  準備できるまで 503 + Retry-After。コンテキスト変更のリロード中も同じ進捗が `reloading` の下に出る。
+- **`--` は「報告されていない」**で、0 ではない。まだエンジンのカウンタ待ちなのは、ヘルパーカードのトークン時間の
+  分担（E6、CUDA 2 枚が要る）。
+- **リモート:** 読み取りのみ（この PC の設定ファイルを読む Models は出ない）。キーは `--key-env` で指定した環境変数
+  から読み、保存しない。別の PC へ平文の `http://` で送ると読まれうる - Tailscale か SSH トンネル
+  （`ssh -L 8082:127.0.0.1:8082 host` の後 `--url http://127.0.0.1:8082`）を使う。1.3.80 以降のサーバーはエンジン
+  ログの末尾を `GET /api/log?since=<offset>&max=<bytes>` で送る（キーが要る。API キーの値は伏せる）ので、Logs と
+  リクエスト毎の内訳もリモートで出る。古いサーバーでは Logs にその旨のヒントが出る。
 - **キー:** `l` Overview のレイアウト、`r` すぐ再取得、`space` 表示を止める、`t` テーマ（dark / light / mono。`NO_COLOR` なら mono で始まる）、
   `L` 温度の CSV を 2 秒毎に `bench/thermal/` へ記録、`b` web アプリを開く、`c` API アドレスをコピー（OSC 52）、
   `?` ヘルプ、`q` / Ctrl+C で終了。80x24 で崩れず（箱を詰め、ビューはスクロール）、110 桁以上で表示が増える。
