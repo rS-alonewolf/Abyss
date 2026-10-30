@@ -1,6 +1,7 @@
 """tools/test_abyss_terminal.py - Abyss Terminal (abyss_terminal.py, terminal_model/draw/local/app.py) against a fake
 Abyss server (terminal_fixtures.FakeServer: the /metrics of DeepSeek V4.1 UD-IQ2_XXS on an R9700 + iGPU lane + two
-SSDs, a 16 GB + 64 GB PC, a 5090 + 3090 split, a server loading, one down) and fake engine logs: the connection's
+SSDs, a 16 GB + 64 GB PC, a 5090 + 3090 split, 5090 + 3090 + 2x V100, 8 and 10 RTX 3090s, a server loading, one
+down) and fake engine logs: the connection's
 states, the numbers (missing stays --, never 0), --bench's verdict from the log, every view drawn to the exact size at
 160x50, 80x24 and 40x12, the detached start / stop with its PID file, and the screen with Textual's pilot (skipped
 without Textual).  No GPU, no engine.
@@ -22,6 +23,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+_STATE = tempfile.TemporaryDirectory()                      # (never the user's own ~/.config/abyss/terminal.json)
+os.environ["ABYSS_TERMINAL_STATE"] = str(Path(_STATE.name) / "terminal.json")
 import abyss_terminal as A  # noqa: E402
 import bench_rules as R  # noqa: E402
 import terminal_draw as D  # noqa: E402
@@ -57,8 +60,9 @@ def log_of(sc):
 
 
 def view(sc, seen=None, **kw):
-    link = FakeLink(sc, key="k" if sc == "split" else None,
-                    base="http://192.168.1.20:8082" if sc == "split" else "http://127.0.0.1:8082")
+    remote = sc in ("split", "multi8")
+    link = FakeLink(sc, key="k" if remote else None,
+                    base="http://192.168.1.20:8082" if remote else "http://127.0.0.1:8082")
     return M.derive(link, F.local(sc), log_of(sc), seen=seen if seen is not None else {}, **kw)
 
 
@@ -216,7 +220,7 @@ class Numbers(unittest.TestCase):
             c.update(pcie_gen=1)
         v = M.derive(link, {"remote": True}, None, seen=seen)
         self.assertTrue(v["pcie"]["dropped"])
-        self.assertTrue(any("PCIe link fell to Gen1" in t for t, _ in v["banners"]))
+        self.assertTrue(any("PCIe fell to Gen1" in t for t, _ in v["banners"]))
         m["live"]["state"] = "idle"
         self.assertFalse(M.derive(link, {"remote": True}, None, seen=seen)["pcie"]["dropped"])
 
@@ -267,12 +271,12 @@ class Drawing(unittest.TestCase):
         for sc in F.SCENARIOS:
             v = view(sc)
             for w, h in ((160, 50), (80, 24), (40, 12), (110, 30)):
-                for i in range(len(D.VIEWS)):
-                    ui = {"view": i, "log": log_of(sc), "configs": F.CONFIGS, "sel": 1}
+                for i, layout in [(i, "speed") for i in range(len(D.VIEWS))] + [(0, "devices")]:
+                    ui = {"view": i, "log": log_of(sc), "configs": F.CONFIGS, "sel": 1, "layout": layout}
                     lines = D.screen(v, w, h, ui)
-                    self.assertEqual(len(lines), h, (sc, w, h, i))
+                    self.assertEqual(len(lines), h, (sc, w, h, i, layout))
                     bad = [n for n, ln in enumerate(lines) if ln.width != w]
-                    self.assertEqual(bad, [], (sc, w, h, i, [lines[n].plain for n in bad]))
+                    self.assertEqual(bad, [], (sc, w, h, i, layout, [lines[n].plain for n in bad]))
                 lines = D.screen(v, w, h, {"view": 0, "help": True})
                 self.assertEqual(len(lines), h)
 
@@ -408,14 +412,116 @@ class Cli(unittest.TestCase):
                 del os.environ["ABYSS_TEST_KEY"]
 
 
+class ManyDevices(unittest.TestCase):
+    """Several GPUs are the usual case (2-10 cards): per card its role, layers, pool, link against its own max; the
+    busiest starred, a weak / dropped link in pink; any number of drives with their share of the expert reads."""
+
+    def test_mixed_cards_each_with_its_own_max_and_limit(self):
+        v = view("multi4")
+        by = {c["index"]: c for c in v["cards"]}
+        self.assertEqual(v["gpu"]["busiest_card"], 2)
+        self.assertTrue(by[2]["busiest"])
+        self.assertEqual((by[0]["layers"], by[0]["pool_gb"]), ((0, 14), 24.6))
+        self.assertTrue(by[3]["behind"])           # (a V100 on x8, its twin on x16)
+        self.assertFalse(any(c["weak"] for c in v["cards"]))
+        text = "\n".join(x.plain for x in D.card_rows(v, 156, full=True))
+        for want in ("G4x4/5x16", "G4x16/4x16", "G3x8/3x16", "430/575", "330/350", "240/250", "L0-13", "L36-42",
+                     "V100-32GB"):
+            self.assertIn(want, text)
+        self.assertIsNone(by[0]["tt_share"])       # (phase 2: --, never 0)
+        self.assertIn("--", text)
+
+    def test_a_riser_at_x1_is_the_weak_link(self):
+        v = view("multi8")
+        self.assertEqual(v["gpu"]["weak_cards"], [7])
+        self.assertEqual(v["gpu"]["slowest_link_card"], 7)
+        self.assertTrue(any("GPU7 on Gen1 x1" in t for t, _ in v["banners"]))
+        self.assertIsNone(v["cards"][0]["layers"])     # (remote: no engine log)
+
+    def test_a_card_dropping_while_working_is_named(self):
+        seen = {}
+        view("multi4", seen=seen)
+        m = F.metrics("multi4")
+        m["hardware"]["gpus"][1]["pcie_gen"] = 1
+        link = FakeLink("multi4")
+        link.metrics = m
+        v = M.derive(link, F.local("multi4"), log_of("multi4"), seen=seen)
+        self.assertEqual(v["gpu"]["dropped_cards"], [1])
+        self.assertTrue(v["pcie"]["dropped"])
+        self.assertTrue(any(t.startswith("GPU1 PCIe fell to Gen1 x16") for t, _ in v["banners"]))
+
+    def test_drives_of_any_number_share_the_reads(self):
+        d = view("multi8")["disk"]
+        self.assertEqual([x["name"] for x in d["drives"]], ["nvme0n1", "nvme1n1", "sda"])
+        self.assertAlmostEqual(d["drives"][0]["share"] + d["drives"][1]["share"], 1.0)
+        self.assertIsNone(d["drives"][2]["share"])
+        self.assertEqual(d["shard_n"], 2)
+
+    def test_ten_cards_wrap_wide_and_summarise_narrow(self):
+        v = view("multi10")
+        wide = "\n".join(x.plain for x in D.screen(v, 160, 50, {"view": 0, "layout": "devices"}))
+        body = "\n".join(x.plain for x in D.devices_overview(v, 160, 200, {}))
+        for i in range(10):
+            self.assertIn(f"GPU{i} RTX 3090", body)
+        self.assertIn("SSD2 nvme1n1", body)
+        self.assertIn("CPU EPYC 7413", body)
+        self.assertIn("▣ DEVICES", wide)
+        narrow = "\n".join(x.plain for x in D.screen(v, 80, 24, {"view": 0, "layout": "devices"}))
+        self.assertIn("10 GPUs · busy GPU3 95%", narrow)
+        self.assertIn("link GPU9 G2x1", narrow)
+        self.assertIn("more · 5 Hardware", narrow)
+        speed = "\n".join(x.plain for x in D.screen(v, 80, 24, {"view": 0, "layout": "speed"}))
+        self.assertIn("10 GPUs", speed)
+        self.assertIn("2 SSDs", speed)
+
+    def test_memory_and_hardware_list_every_card(self):
+        v = view("multi10")
+        mem = "\n".join(x.plain for x in D.memory_view(v, 160, 80, {}))
+        hw = "\n".join(x.plain for x in D.hardware_view(v, 160, 80, {}))
+        for i in range(10):
+            self.assertIn(f"GPU{i} ", mem)
+            self.assertIn(f"GPU{i} ", hw)
+        self.assertIn("WEAK LINK", hw)
+
+
+class Layout(unittest.TestCase):
+    def setUp(self):
+        with contextlib.suppress(FileNotFoundError):
+            A.state_path().unlink()
+
+    def session(self, demo, **kw):
+        s = A.Session(demo=demo, poll=False, **kw)
+        self.addCleanup(s.close)
+        return s
+
+    def test_three_or_more_cards_start_on_devices(self):
+        self.assertEqual(self.session("multi4").pick_layout(), "devices")
+        self.assertEqual(self.session("multi10").pick_layout(), "devices")
+        self.assertEqual(self.session("r9700").pick_layout(), "speed")
+        self.assertEqual(self.session("multi8").pick_layout(view("multi8")), "devices")   # (remote: the server's)
+
+    def test_l_switches_and_is_remembered(self):
+        s = self.session("r9700")
+        self.assertEqual(s.cycle_layout(), "devices")
+        self.assertEqual(json.loads(A.state_path().read_text())["layout"], "devices")
+        self.assertEqual(self.session("r9700").pick_layout(), "devices")
+        self.assertEqual(self.session("multi4", layout="speed").pick_layout(), "speed")   # (--layout wins)
+
+    def test_a_broken_state_file_is_ignored(self):
+        A.state_path().parent.mkdir(parents=True, exist_ok=True)
+        A.state_path().write_text("{not json")
+        self.assertEqual(self.session("r9700").pick_layout(), "speed")
+
+
 SHOTS = [("r9700", 0), ("r9700", 1), ("r9700", 2), ("r9700", 3), ("r9700", 4), ("r9700", 5), ("r9700", 6),
-         ("r9700", 7), ("lowspec", 0), ("lowspec", 2), ("split", 0), ("split", 4), ("loading", 0), ("down", 0)]
+         ("r9700", 7), ("lowspec", 0), ("lowspec", 2), ("split", 0), ("split", 4), ("loading", 0), ("down", 0),
+         ("multi4", 4), ("multi10", 2), ("multi10", 4)]
 
 
 @needs_textual
 class Screen(unittest.TestCase):
-    def run_app(self, coro, sc="r9700", size=(160, 50)):
-        s = A.Session(demo=sc, interval=1.0)
+    def run_app(self, coro, sc="r9700", size=(160, 50), layout="speed"):
+        s = A.Session(demo=sc, interval=1.0, layout=layout)
 
         async def main():
             app = TA.TerminalApp(s, anim=False)
@@ -468,6 +574,15 @@ class Screen(unittest.TestCase):
             self.assertEqual(app.result, "stop")
         self.run_app(go)
 
+    def test_l_switches_the_overview_layout(self):
+        async def go(app, pilot):
+            self.assertIn("▣ SPEED", app.plain())
+            await pilot.press("l")
+            await pilot.pause(0.1)
+            self.assertIn("▣ DEVICES", app.plain())
+            self.assertIn("GPU0", app.plain())
+        self.run_app(go)
+
     def test_quit_without_asking_otherwise(self):
         async def go(app, pilot):
             await pilot.press("q")
@@ -490,6 +605,16 @@ class Screen(unittest.TestCase):
                     name = D.VIEWS[i][1].lower()
                     app.save_screenshot(f"{sc}-{name}-{size[0]}x{size[1]}.svg", str(out))
                 self.run_app(go, sc=sc, size=size)
+            for sc in ("r9700", "split", "multi4", "multi8", "multi10", "lowspec"):    # (both Overview layouts)
+                for layout in D.LAYOUTS:
+                    async def go(app, pilot, sc=sc, layout=layout):
+                        await pilot.pause(0.1)
+                        app.save_screenshot(f"{sc}-layout-{layout}-{size[0]}x{size[1]}.svg", str(out))
+                    self.run_app(go, sc=sc, size=size, layout=layout)
+
+
+def tearDownModule():
+    _STATE.cleanup()
 
 
 if __name__ == "__main__":
