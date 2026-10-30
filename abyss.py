@@ -76,7 +76,12 @@ VEXE = VBUILD / "bin" / ("strata-vision.exe" if WIN else "strata-vision")  # the
 VSTAMP = VBUILD / "MAYA-BUILD.json"
 MIN_CC = 70                                        # Volta (V100) and newer (the GLM path; see arch_setting)
 MAX_GPUS = 16                                      # the layer split's parts at most (glm_model.hpp, kMaxParts)
-HIP_ARCHS = ("gfx1100", "gfx1201", "gfx1151")        # Maya also supports Strix Halo (unified memory)
+# every HIP build targets the validated Radeons: RX 7900 (gfx1100), RX 9070 / AI PRO R9700 (gfx1201), Strix Halo (gfx1151)
+HIP_BUILD_ARCHS = ("gfx1100", "gfx1201", "gfx1151")
+# ... and setup accepts their siblings, which run the same kernels (cmake/hip_backend.cmake: community / unvalidated),
+# adding the one it finds to the build: RX 7800 XT / 7700 XT (gfx1101), RX 7600 (gfx1102), Radeon 890M (gfx1150),
+# RX 9060 (gfx1200)
+HIP_ARCHS = HIP_BUILD_ARCHS + ("gfx1101", "gfx1102", "gfx1150", "gfx1200")
 PY_PACKAGES = list(S.PY_PACKAGES)                  # (pillow: pictures in formats other than JPEG/PNG/BMP/GIF)
 CONTEXTS = [8192, 32768, 65536, 131072]
 DEFAULT_CONTEXT = 32768
@@ -611,7 +616,9 @@ def check_hip_pc(a, installed=False) -> dict:
         say(f"    {gpu_label(g)} - " + ("can be used" if g in usable else "not supported by Maya's HIP build"))
     if not usable:
         fail("no supported AMD GPU found", "this port targets RX 7900 XT / XTX (gfx1100), RX 9070 / AI PRO R9700 "
-             "(gfx1201), and Strix Halo / Gorgon Halo, Radeon 8050S / 8060S / 8065S (gfx1151)")
+             "(gfx1201), and Strix Halo / Gorgon Halo, Radeon 8050S / 8060S / 8065S (gfx1151); their siblings RX 7800 "
+             "XT / 7700 XT (gfx1101), RX 7600 (gfx1102), Radeon 890M (gfx1150) and RX 9060 (gfx1200) build too "
+             "(not validated here - please report)")
     if WIN and hipinfo and all(g.get("source") == "registry" for g in found):
         warn(f"ROCm's hipInfo sees no AMD GPU (the list above is Windows'): the engine cannot start until it does - "
              f"update AMD's driver (AMD Software: Adrenalin Edition, https://www.amd.com/en/support), restart, and "
@@ -694,7 +701,8 @@ def check_hip_pc(a, installed=False) -> dict:
     elif any(hip_unified_memory(g) for g in chosen):
         ok("APU / unified memory: the engine sizes the GPU expert pool from available system RAM")
     select_build_backend("hip")
-    return {"backend": "hip", "gpus": chosen, "archs": list(HIP_ARCHS), "rocm": str(root),
+    archs = list(HIP_BUILD_ARCHS) + sorted({g["arch"] for g in chosen} - set(HIP_BUILD_ARCHS))
+    return {"backend": "hip", "gpus": chosen, "archs": archs, "rocm": str(root),
             **({"rocm_bin": str(bindir)} if WIN else {})}
 
 
