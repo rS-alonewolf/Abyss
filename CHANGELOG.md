@@ -7,12 +7,16 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## Unreleased
+## v1.3.78 - 2026-10-30
 
 **Bug-fix pack (the 2026-10-30 review's week-1 items, no GPU needed): a prompt-path out-of-range read, the server's
 engine stop paths, waits with limits, the SSD mirror's copy check, bounds on the memory knobs, and the docs' stale
-"not yet" lines.** Not yet run on a GPU: the C++ changes pass the HIP compiler's syntax check and the host-side tests;
-the engine itself is to be checked on the R9700 and the RTX 5090 before the release.
+"not yet" lines.** Checked on the AI PRO R9700 (HIP): `./abyss.sh --bench` matches the known-good runs
+(DeepSeek V4.1 UD-IQ2_XXS KL 0.0036, Ornith-1.5-122B UD-Q4_K_XL 0.0058; GLM-5.3-Flash Maya-S-v2 0.0316, the same
+"slightly off" as v1.3.69's 0.0337) at the usual speeds; a 32,768-token V4.1 prompt (583 tok/s) with the mirror on a
+second SSD (43.7% of the reads from it, decode 22.3 tok/s); Qwen3.8 on the CLI with `--max-context 512` stops with
+"the sequence exceeds max_ctx" at the end, no out-of-range write. Not checked here: the RTX 5090 (CUDA) and the RDNA
+sibling chips (no card).
 
 - Prompt path: the MMQ row-id table (`iota`) is allocated and filled 512 entries past `T * n_exp_used`. `mul_mat_q`
   loads a whole tile of ids before it checks the row bounds, so the last tile read past the table - a long prompt's
