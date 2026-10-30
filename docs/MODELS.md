@@ -95,6 +95,9 @@ Download counts not surveyed. Every file holds all its experts in 32 GB of VRAM 
 
 Lossy settings (Maya-S-v2, 5090): `STRATA_GLM_DEFER=1` -19% a token, nll +0.063.
 
+8 GB cards (issue #23, an RTX A2000 Laptop): Maya-S-v2 starts with its dense pack re-quantized to IQ4_XS (5.6 -> 3.6
+GiB, the recipe in [Small VRAM](SMALL-VRAM.md)); 4-4.7 tok/s there, bound by a 512 GB SSD's reads.
+
 ### Ornith-1.5-122B (Qwen3.5-MoE)
 
 Download counts not surveyed. UD-Q4_K_XL holds all its experts in 32 GB of VRAM + a 60 GB RAM tier: no SSD reads.

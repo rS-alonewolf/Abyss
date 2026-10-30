@@ -7,6 +7,34 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased
+
+Small VRAM (issue #23: an RTX A2000 Laptop 8 GB + 64 GB RAM, PCIe Gen4 x8). Not yet run on a GPU: the engine
+changes pass the HIP compiler's syntax check and the host tests; the check on an RTX 5090 capped to 8 GB
+(`STRATA_GLM_VRAM_GB=8`) with the reporter's two models follows, then the numbers here. One page for all of it:
+[docs/SMALL-VRAM.md](docs/SMALL-VRAM.md) ([日本語](docs/SMALL-VRAM.ja.md)).
+
+- **The expert pool may hold fewer slots a layer than a route** (GLM-5.3-Flash / Ornith: 8). The floor is now the
+  spares and one resident (4; `STRATA_GLM_POOL_FLOOR`): a miss lands in a spare or its own scratch slot and the CPU
+  lane computes its share from RAM, none of which needs the route to fit - the reporter ran 6 of 8 that way, KL 0
+  against the engine's own reference. The refusal below the floor says how many MB are short for the floor and for
+  a whole route, and what frees them (`--max-context`, `--kv q4_0`, the IQ4_XS dense pack); a pool between the two
+  says so once at start. The expert-count slot split no longer asks a layer for more slots than the pool has.
+- **Prompts in chunks on a pool that could lend none**: the prompt path used to leave every layer a route, the
+  spares and 2 (13 slots), so a pool of 9 (Ornith-1.5-122B IQ3_XXS-B on 8 GB) read the prompt token by token at
+  16 tok/s. Such a pool now keeps 4 slots a layer while a prompt runs (`STRATA_GLM_PREFILL_KEEP`) and lends the
+  rest - ~800 MB on Ornith, chunks of ~2,000 tokens; the decode's misses refill the tail after the prompt. The
+  "can lend no prompt chunk" line now says what the smallest chunk needs and what the pool can lend. Estimated for
+  the reporter's 2,048-token prompt: 150-400 tok/s (the experts stream once a chunk a layer over the x8 link).
+- **The CPU lane takes every RAM-tier expert when it is much faster than the link** (`STRATA_GLM_LANE_LEAN`, 4x):
+  the measured split kept 1 of 8 on the link at 16.8 tok/s where the `--deep` sweep's share 0 ran 18.5 (both lanes
+  read the same DRAM; the link copy sits on the GPU's stream). The lean takes effect once the pool has settled (the
+  `:settle` switch of v1.3.70, automatically) and steps back when the VRAM hits fall, so a prompt's misses still
+  refill the pool first (issue #14). Cards whose split already sends every expert to the CPU (Gen4 x4 / OCuLink)
+  and cards whose link is close to the CPU (an R9700 on Gen5 x16, 0.311 vs 0.499 ms) are unchanged.
+- **Docs**: GLM-5.3-Flash Maya-S-v2 on an 8 GB card with its dense tensors at IQ4_XS (`tools/requant_dense.py
+  --from=q6_k`: which tensors, 5.6 -> 3.6 GiB, the pack and config lines), in docs/SMALL-VRAM.md (EN + JA).
+
 ## v1.3.81 - 2026-10-30
 
 - `/health` answers **503** (with `Retry-After: 5`) while the model loads, the body still `"status": "loading"` and how

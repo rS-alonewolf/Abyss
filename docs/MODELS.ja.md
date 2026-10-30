@@ -92,6 +92,9 @@ V4.1 の DSpark ドラフトモデル（Lucebox の `deepseek41-dflash-draft`、
 
 lossy な設定（Maya-S-v2、5090）: `STRATA_GLM_DEFER=1` は -19% / トークン、nll +0.063。
 
+8 GB のカード（issue #23、RTX A2000 Laptop）: Maya-S-v2 は dense pack を IQ4_XS に再量子化すると起動します（5.6 → 3.6
+GiB、手順は[VRAM の小さいカード](SMALL-VRAM.ja.md)）。そこでは 4〜4.7 tok/s で、512 GB SSD の読みが上限でした。
+
 ### Ornith-1.5-122B（Qwen3.5-MoE）
 
 ダウンロード数は未調査。UD-Q4_K_XL は VRAM 32 GB + RAM 層 60 GB で全エキスパートが載り、SSD を読まない。
