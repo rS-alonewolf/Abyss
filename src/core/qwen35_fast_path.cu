@@ -7,6 +7,7 @@
 // llama.cpp's src/models/qwen35moe.cpp and delta-net-base.cpp.
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/knobs.hpp"
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
@@ -602,10 +603,17 @@ bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::stri
     }
     if (q35_pend_pos_ < 0) return true;   // (no position to draft from)
     // (qwen4exp's draft layer: 4 and 0.75 - prose 59.1 -> 60.5-64.1 tok/s against 3 and 0.5, code the same 81)
-    const int kmax = [this] {
+    const int kmax0 = [this] {
         const char* v = getenv("STRATA_Q35_MTP_K");
         return v != nullptr ? std::max(1, std::min(5, std::atoi(v))) : g_.q4x ? 4 : 3;
     }();
+    // every step writes the KV row at its position: the chain stops where the context ends (the caller's `room` bounds
+    // the accepted drafts, not the rows tried; the server's CTX_SLACK of 8 hid the overrun, the CLI had none)
+    const int kmax = strata::core::draft_kmax(kmax0, q35_pend_pos_, max_ctx_);
+    if (kmax <= 0) {
+        q35_pend_pos_ = -1;   // (at the context's end: no draft, and no row for the pending position either)
+        return true;
+    }
     const float stop_below = [this] {
         const char* v = getenv("STRATA_Q35_MTP_MIN");
         if (v == nullptr) v = getenv("STRATA_DS4_DSPARK_THR");
