@@ -458,6 +458,10 @@ def speed_tile(v: dict, which: str, w: int, compact: bool = False, h: int | None
         sub = L(d["label"] or "no prompt yet", "info b" if d["label"] == "live" else "soft")
         if d.get("total") and v.get("state") == "reading":
             sub.add(f"  {toks(d.get('read'))} / {toks(d['total'])}", "ink")
+            if d.get("reused"):
+                sub.add(f"  reused {toks(d['reused'])}", "good")
+            if d.get("disk_ms") is not None:
+                sub.add(f"  SSD {d['disk_ms'] / 1000:.1f} s", "warn")
         extra = Line()
         if v.get("state") == "reading" and d.get("total"):
             frac = (d.get("read") or 0) / max(1, d["total"])
@@ -481,6 +485,15 @@ def speed_tile(v: dict, which: str, w: int, compact: bool = False, h: int | None
     rows.append(extra)
     tag = L("◆ live", "good b") if d["label"] == "live" else None
     return box(title, rows, w, tag=tag, h=h)
+
+
+def tt_source(tt: dict) -> str:
+    """What the token's time was measured on: the live window, this answer, the last answer's STAT, the log."""
+    if tt["source"] == "live":
+        return "live · last ~64 tokens" if tt.get("window") else "live · this answer"
+    if tt["source"] == "stat":
+        return "last answer · engine STAT"
+    return f"last {tt['n']} answers · engine log"
 
 
 def tt_bar(tt: dict, w: int) -> list:
@@ -523,7 +536,7 @@ def tt_tile(v: dict, w: int, compact: bool = False) -> list:
                           "ink b", "/tok", "muted"))
         return rows if compact else box("TOKEN TIME", rows, w, tag=L("--", "muted"))
     ms = tt["ms"]
-    src = {"live": "live", "log": f"last {tt['n']} answers · engine log"}[tt["source"]]
+    src = tt_source(tt)
     head = L("a token ", "muted", f"{ms:.1f} ms", "ink b", f"  ({1000 / ms:.1f} tok/s)", "muted")
     rows = [spread(head, L(src, "faint i"), inner)]
     b = tt_bar(tt, inner)
@@ -591,6 +604,9 @@ def tiles(v: dict, w: int) -> list:
         for i, d in enumerate(mir):
             ds.add(f"SSD{i + 1} ", "violet" if "mirror" in d["roles"] else "accent2")
             ds.add(f"{pct(d.get('share'))} ", "ink")
+    elif dk.get("mirror_stat") is not None:
+        ds.add("SSD1 ", "accent2").add(f"{pct(1 - dk['mirror_stat'])} ", "ink").add("SSD2 ", "violet") \
+            .add(f"{pct(dk['mirror_stat'])} ", "ink").add("engine", "muted")
     elif mir:
         ds.add(f"{mir[0]['name']} ", "muted").add(rate(mir[0].get("read_mb")), "ink")
     else:
@@ -675,8 +691,11 @@ def memory_bars(v: dict, w: int) -> list:
                                       "warn" if r["psi_some"] >= 10 else "ink")
     items.append(("System RAM", rf, sv, "alert" if rf and rf > 0.97 else "info"))
     if dr.get("kind") or dr.get("total") is not None:
-        dv = L(pct(dr.get("last")), "good b", " last", "muted", f"  {pct(dr.get('total'))}", "ink", " total", "muted",
-               "  tok/step ", "muted", DASH, "muted")
+        live = dr.get("live") is not None
+        dv = L(pct(dr["live"] if live else dr.get("last")), "good b", " live" if live else " last", "muted",
+               f"  {pct(dr.get('total'))}", "ink", " total", "muted",
+               "  tok/step ", "muted", f(dr.get("step"), 2) if dr.get("step") is not None else DASH,
+               "ink" if dr.get("step") is not None else "muted")
         items.append((f"Drafter {(dr.get('kind') or '').upper()}"[:lw - 1], dr.get("total"), dv, "good"))
     vw = min(max(x[2].width for x in items), max(0, w - lw - 12))
     return [meter(lab, fr, w, val, sty, lw, vw) for lab, fr, val, sty in items]
@@ -1118,8 +1137,15 @@ def status_panel(v: dict, w: int, h: int, ui: dict) -> list:
         ld = v.get("loading") or {}
         frac = ld.get("frac")
         rows.append(bar(frac, max(10, w - 14), "warn").add(f"  {pct(frac)}", "warn b"))
-        rows.append(L("elapsed ", "muted", dur(ld.get("elapsed")), "ink"))
+        el = L("elapsed ", "muted", dur(ld.get("elapsed")), "ink")
+        if ld.get("step"):
+            el.add("   stage ", "muted").add(ld["step"], "warn b")
+        if ld.get("gb") and ld["gb"][1]:
+            el.add("   warm ", "muted").add(f"{ld['gb'][0]:.1f} / {ld['gb'][1]:.1f} GB", "ink")
+        rows.append(el)
         rows.append(L(ld.get("stage") or "the engine reads the model and pins its RAM tier", "soft"))
+        if v.get("remote"):
+            rows.append(L("(the server's own progress, from its /health)", "faint i"))
         rows.append(Line())
         rows.append(L("The PC can feel slow while the model loads: up to all but ~6 GB of the free RAM is pinned.",
                       "faint i"))
@@ -1189,12 +1215,15 @@ def speed_view(v: dict, w: int, h: int, ui: dict) -> list:
         rows.append(L("   what moves it: ", "muted", tt["moves"], "soft i"))
         rows.append(L("   evidence (the --bench rules, ", "muted", "same code", "accent", "):", "muted"))
         rows += [L("   · " + x, "soft") for x in tt["evidence"]]
-        tag = L(("live" if tt["source"] == "live" else f"engine log · last {tt['n']} answers"), "faint i")
+        if tt.get("miss_ms") is not None:
+            rows.append(L("   misses: ", "muted", f"{tt['miss_ms']:.1f} ms", "ink", " a token waiting for experts not "
+                          "in VRAM (SSD waits are part of it)", "muted"))
+        tag = L(tt_source(tt), "faint i")
     else:
         rows.append(L("SSD wait / lane busy ms per token: ", "muted", DASH, "muted", "   ", "", v.get("tt_why") or "",
                       "faint i"))
-        rows.append(L("The live STAT line carries no ms yet; the engine log on this PC has them after each answer.",
-                      "faint"))
+        rows.append(L("A 1.3.80+ engine sends them in its STAT line every 8 tokens (live, the last ~64 tokens); older "
+                      "ones only in the engine log after each answer.", "faint"))
         tag = L("--", "muted")
     out += box("WHERE A TOKEN'S TIME GOES", rows, w, tag=tag)
     t, dk, dr, ln = v["tiers"], v["disk"], v["drafter"], v["lane"]
@@ -1205,18 +1234,26 @@ def speed_view(v: dict, w: int, h: int, ui: dict) -> list:
     for dv in dk.get("drives") or []:
         ssd.append(L(f"{'/'.join(dv['roles']) or 'drive'} ", "violet", dv["name"] + " ", "muted",
                      rate(dv.get("read_mb")), "ink b"))
-    if dk.get("mirror_share") is not None:
+    if dk.get("mirror_stat") is not None:
+        a, b = dk["mirror_mb"]
+        ssd.append(L("mirror split (engine) ", "muted", pct(dk["mirror_stat"]), "good b",
+                     f"  SSD2 read {b / 1024:.1f} of {(a + b) / 1024:.1f} GB this answer", "muted"))
+    elif dk.get("mirror_share") is not None:
         ssd.append(L("mirror share (live MB/s) ", "muted", pct(dk["mirror_share"]), "good b"))
     if dk.get("mirror_end"):
         a, b = dk["mirror_end"]
         ssd.append(L("mirror at the last end ", "muted", f"{b / max(1e-9, a + b):.0%}", "ink b",
                      f" ({b:.1f} of {a + b:.1f} GB)", "muted"))
+    exp_mib = ln.get("expert_mib")
     lane = [kv("kind ", (ln.get("name") or DASH) + (f" ({ln['state']})" if ln.get("state") else ""), kw=14),
             kv("threads ", f(v["cpu"].get("lane_threads")), kw=14),
             kv("PCIe share ", f(ln.get("share"), 2), kw=14),
-            kv("experts ", f(tt["lane"], 0) if tt else DASH, "/tok", kw=14),
+            kv("experts ", f(tt["lane"], 1) if tt else DASH, "/tok", kw=14),
             kv("busy ", f(tt["lane_ms"], 1) if tt else DASH, " ms/tok", kw=14),
-            L("bandwidth".ljust(14), "muted", DASH, "muted", "  " + "engine counter (phase 2)", "faint i")]
+            L("bandwidth".ljust(14), "muted", f(ln.get("gbs"), 1) if ln.get("gbs") is not None else DASH, "ink b",
+              " GB/s", "muted", f"  est.: experts/tok × {exp_mib:.1f} MiB ÷ busy ms" if ln.get("gbs") is not None
+              and exp_mib else ("  (an expert's MiB and the lane's ms come from a 1.3.80+ engine)" if tt else ""),
+              "faint i")]
     out += hjoin([box("SSD", ssd, lw[0]), box("LANE", lane, lw[1])], lw)
     tiers_ = [kv("VRAM hit ", pct(t.get("vram_hit"), 1), kw=16),
               kv("RAM→GPU ", f(t.get("ram_fetch"), 2), "/tok", kw=16),
@@ -1225,9 +1262,12 @@ def speed_view(v: dict, w: int, h: int, ui: dict) -> list:
                  and t.get("disk") is not None and t["ram_fetch"] + t["disk"] > 0 else DASH, kw=16),
               kv("tail skip ", f(tt["tail_skip"], 1) if tt else DASH, "/tok", kw=16)]
     drafter = [kv("kind ", (dr.get("kind") or "none").upper(), kw=14),
+               kv("live ", pct(dr.get("live")), kw=14) if dr.get("live") is not None else
                kv("last request ", pct(dr.get("last")), kw=14),
                kv("total ", pct(dr.get("total")), f"  ({f(dr.get('accepted'))} of {f(dr.get('offered'))})", kw=14),
-               L("tokens/step".ljust(14), "muted", DASH, "muted", "  engine counter (phase 2)", "faint i")]
+               L("tokens/step".ljust(14), "muted", f(dr.get("step"), 2) if dr.get("step") is not None else DASH,
+                 "ink b", f"  {dr.get('step_label') or ''}" if dr.get("step") is not None else
+                 "  (a 1.3.80+ engine counts the verify steps)", "faint i")]
     out += hjoin([box("VRAM POOL · RAM TIER", tiers_, lw[0]), box("DRAFTER", drafter, lw[1])], lw)
     b = v.get("bench")
     if b:
@@ -1435,7 +1475,8 @@ def logs_view(v: dict, w: int, h: int, ui: dict) -> list:
     log = ui.get("log")
     if log is None:
         return box("LOGS", [L("The engine log is " + LOCAL_ONLY_HINT + ".", "soft"),
-                            L("Remote reading comes with the server's /api/log (phase 2).", "faint i")], w)
+                            L("A 1.3.80+ server sends its tail over GET /api/log (the API key is needed); this one "
+                              "answers none.", "faint i")], w)
     flt = (ui.get("filter") or "").lower()
     lines = [(k, x) for k, x in log.lines if not flt or flt in x.lower() or flt == k]
     n = max(3, h - 3)
@@ -1443,7 +1484,8 @@ def logs_view(v: dict, w: int, h: int, ui: dict) -> list:
     view = lines[max(0, len(lines) - n - off):len(lines) - off]
     rows = [L(f"{k[:5]:<6}", LOG_STYLE.get(k, "soft") + " b" if k != "info" else "faint", x,
               LOG_STYLE.get(k, "soft")) for k, x in view]
-    tag = L(str(log.path or "")[-50:], "faint")
+    tag = L(str(log.path or ("remote /api/log · " + (log.remote_path or "")) if log.path or log.remote_path else "")[-50:],
+            "faint")
     title = "ENGINE LOG" + (f" · filter '{flt}'" if flt else "")
     return box(title, rows or [L("(nothing yet)", "faint i")], w, tag=tag)
 

@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
+from serve import server as SV  # noqa: E402
 from serve.server import CONTEXT_MIN, MAYA_VERSION, ByteTokenizer, MockEngine, Service, StrataEngine, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -408,12 +409,14 @@ class ShutdownProcess(unittest.TestCase):
         p = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "mock", "--port", str(port)],
                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(ROOT))
         try:
-            for _ in range(100):
+            for _ in range(100):                       # (the port answers "loading" before the engine is in)
                 try:
-                    urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1).close()
-                    break
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1) as h:
+                        if json.loads(h.read()).get("status") == "ok":
+                            break
                 except OSError:
-                    time.sleep(0.1)
+                    pass
+                time.sleep(0.1)
             r = urllib.request.Request(f"http://127.0.0.1:{port}/api/shutdown", method="POST", data=b"{}",
                                        headers={"Content-Type": "application/json"})
             with urllib.request.urlopen(r, timeout=10) as resp:
@@ -425,6 +428,158 @@ class ShutdownProcess(unittest.TestCase):
                 p.kill()
                 p.wait()
             p.stdout.close()
+
+class EarlyBind(unittest.TestCase):
+    """The port is bound before the engine loads (Abyss Terminal phase 2, H1): GET /health says "loading" and how
+    far, everything else gets 503 + Retry-After, and serve(svc, httpd=...) puts the real handler in on the same
+    socket."""
+
+    def setUp(self):
+        self.httpd = SV.bind_early("127.0.0.1", 0, {"model": "dsv41", "api_key": "k", "config": "abyss-x.json"})
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def get(self, path, method="GET"):
+        r = urllib.request.Request(self.base + path, method=method, data=b"{}" if method == "POST" else None,
+                                   headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                return resp.status, resp.headers, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, e.headers, json.loads(e.read() or b"{}")
+
+    def test_loading_then_the_real_server_on_the_same_socket(self):
+        SV.LOADING.update(stage="weights", text="starting the engine: reading the model's weights", parts={},
+                          started=time.time() - 12)
+        s, _, h = self.get("/health")
+        self.assertEqual((s, h["status"], h["service"], h["model"], h["api_key"], h["config"]),
+                         (200, "loading", "abyss", "dsv41", True, "abyss-x.json"))
+        self.assertEqual(h["load"]["stage"], "weights")
+        self.assertIsNone(h["load"]["pct"])
+        self.assertGreaterEqual(h["load"]["elapsed_s"], 12)
+        SV.load_line("glm fast: CUDA0 warming the expert tiers 50% (44.0 of 88.0 GB, 9 s)")
+        SV.load_line("glm fast: CUDA1 warming the expert tiers 25% (3.0 of 12.0 GB, 2 s)")
+        s, _, h = self.get("/health")
+        self.assertEqual((h["load"]["stage"], h["load"]["pct"], h["load"]["done_gb"], h["load"]["total_gb"]),
+                         ("warming", 47.0, 47.0, 100.0))
+        for path, method in (("/metrics", "GET"), ("/v1/models", "GET"), ("/v1/chat/completions", "POST"),
+                             ("/api/shutdown", "POST")):
+            s, hd, body = self.get(path, method)
+            self.assertEqual((path, s, hd.get("Retry-After")), (path, 503, "15"))
+            self.assertIn("loading", body["error"]["message"])
+        # the engine is ready: the real handler takes over, the socket stays
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nhello"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        same = serve(svc, httpd=self.httpd)
+        self.assertIs(same, self.httpd)
+        s, _, h = self.get("/health")
+        self.assertEqual((s, h["status"], h["load"]), (200, "ok", None))
+        s, _, m = self.get("/metrics")
+        self.assertEqual((s, m["live"]["state"]), (200, "idle"))
+
+    def test_a_taken_port_is_an_error(self):
+        with self.assertRaises(OSError):
+            SV.bind_early("127.0.0.1", self.httpd.server_address[1])
+
+
+class LogTail(unittest.TestCase):
+    """GET /api/log (Abyss Terminal on another PC): the engine log's tail by byte offset, whole lines, secrets masked."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "engine.log"
+        self.path.write_text("glm fast: CUDA0 VRAM before the expert pool\n"
+                             "server api_key=hunter22 Bearer tok-abcdef\n"
+                             "glm stat: decode 41.5 ms/tok (24.1 tok/s)\n"
+                             "last line without newline", encoding="utf-8")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_tail_then_continue_by_offset(self):
+        size = self.path.stat().st_size
+        t = SV.log_tail(str(self.path), None, 70, "hunter22")
+        self.assertEqual((t["size"], t["more"]), (size, True))
+        self.assertTrue(t["text"].startswith("glm stat"), t)            # (a tail starts at a whole line)
+        self.assertEqual(t["next"], size - len("last line without newline"))
+        self.assertNotIn("hunter22", SV.log_tail(str(self.path), 0, 4096, "hunter22")["text"])
+        whole = SV.log_tail(str(self.path), 0, 4096, "")
+        self.assertIn("api_key=***", whole["text"])                      # (named keys masked without the value known)
+        self.assertIn("Bearer ***", whole["text"])
+        self.assertEqual(whole["next"], size - len("last line without newline"))   # (an unfinished line waits)
+        rest = SV.log_tail(str(self.path), whole["next"], 4096, "")
+        self.assertEqual((rest["text"], rest["more"]), ("last line without newline", False))
+        self.assertIn("error", SV.log_tail(None, None, 4096, ""))
+        self.assertIn("error", SV.log_tail(str(self.path) + ".missing", None, 4096, ""))
+
+    def test_the_endpoint_needs_the_key(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "</think>\n\nhello"), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.api_key, svc.log_path = "k1", str(self.path)
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            r = urllib.request.Request(base + "/api/log?max=4096")
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(r, timeout=10)
+            cm.exception.close()
+            self.assertEqual(cm.exception.code, 401)
+            r = urllib.request.Request(base + "/api/log?since=0&max=4096", headers={"Authorization": "Bearer k1"})
+            with urllib.request.urlopen(r, timeout=10) as resp:
+                t = json.loads(resp.read())
+            self.assertEqual(t["path"], "engine.log")
+            self.assertIn("glm stat", t["text"])
+            self.assertNotIn("hunter22", t["text"])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class Phase2Lines(unittest.TestCase):
+    """The engine's phase-2 lines parsed (no engine run): STAT's new keys are numbers in `stat` and get a series in
+    /metrics, DONE's 11th column, PP's reused tokens and disk wait - and the older engine's shorter lines still go."""
+
+    def engine(self):
+        e = StrataEngine.__new__(StrataEngine)
+        e.last, e.info, e.max_context = {}, {}, 4096
+        return e
+
+    def test_stat_new_and_old(self):
+        e = self.engine()
+        e._parse_stat("STAT tok_s=24.10 ms_tok=41.50 vram_hit=0.6356 ram_fetch=0.000 disk=5.840 promo=6.020 "
+                      "vram_used=2271 vram_slots=2386 ram_used=6258 ram_slots=6301 ram_gb=66.1 vram_gb=21.9 "
+                      "disk_ms=18.200 disk_waits=4.100 miss_ms=19.000 lane=3.000 lane_ms=1.900 tail_skip=0.000 "
+                      "mirror_mb0=1200.5 mirror_mb1=980.0 w_ms_tok=40.10 w_disk_ms=17.500 w_lane_ms=1.800 "
+                      "spec_acc=120 spec_offered=200 spec_rounds=90")
+        self.assertEqual((e.stat["disk_ms"], e.stat["lane_ms"], e.stat["mirror_mb1"], e.stat["w_ms_tok"],
+                          e.stat["spec_rounds"]), (18.2, 1.9, 980.0, 40.1, 90.0))
+        e._parse_stat("STAT tok_s=20.00 ms_tok=50.00 vram_hit=0.5 ram_fetch=1.0 disk=2.0 promo=1.0 vram_used=1 "
+                      "vram_slots=2 ram_used=3 ram_slots=4 ram_gb=1.0 vram_gb=2.0")   # (an older engine's line)
+        self.assertNotIn("disk_ms", e.stat)
+        tok = ByteTokenizer()
+        svc = Service(e, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.status = {"busy": False, "queued": 0}
+        tiers = svc.metrics()["tiers"]
+        self.assertEqual(tiers["history"]["disk_ms"], [18.2, None])      # (the key's series: None where absent)
+        self.assertEqual(tiers["history"]["ms_tok"], [41.5, 50.0])
+
+    def test_done_and_pp(self):
+        e = self.engine()
+        e._parse_done("DONE 412 5210 6670.0 17100.0 stop 301 410 4800 2500 3900 150")
+        self.assertEqual((e.last["drafts_accepted"], e.last["reused"], e.last["lookups"], e.last["spec_rounds"]),
+                         (301, 4800, 3900, 150))
+        e._parse_done("DONE 412 5210 6670.0 17100.0 stop 301 410 4800 2500 3900")
+        self.assertNotIn("spec_rounds", e.last)
+        e._parse_pp("PP 2048 5210 2600.0 787.0 1024 310.5")
+        self.assertEqual((e.progress, e.prefill_tok_s_mean, e.prompt_reused, e.prompt_disk_ms),
+                         ((2048, 5210), 787.0, 1024, 310.5))
+        e._parse_pp("PP 3072 5210 3900.0 785.0")                          # (an older engine's line)
+        self.assertEqual((e.progress, e.prompt_reused, e.prompt_disk_ms), ((3072, 5210), None, None))
+
 
 if __name__ == "__main__":
     unittest.main()

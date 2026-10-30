@@ -26,8 +26,10 @@ from setup_bridge import WARMED, WARMING, LoadWatch
 CONN = ("connecting", "live", "stale", "disconnected", "auth", "not_abyss", "loading", "stopped", "error")
 STALE_S = 10.0                  # a failed poll within this many seconds of the last good one: STALE (values kept)
 BACKOFF_MAX_S = 10.0
-PHASE2 = "engine counter (phase 2)"   # the hint under a tile whose number the engine does not report yet
+PHASE2 = "this engine reports no per-token ms (Abyss 1.3.80+ does)"   # the hint under a tile without the live counters
 LOCAL_ONLY = "local only"             # ... and under one that needs the engine log on this PC
+WINDOW_TOKENS = 64                    # the engine's STAT window (w_* keys): the last ~64 tokens
+LANE_KINDS = {"igpu": "iGPU lane", "exl3": "EXL3 lane", "cpu": "CPU lane", "off": "lane off"}   # INFO lane=
 _CTRL = re.compile("[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 QUANT_RE = re.compile(r"(?:UD-)?(?:IQ\d_[A-Z]+|Q\d_K(?:_[A-Z]+)?|Q\d_\d|MXFP4|BF16|F16|F32)(?![A-Za-z0-9])")
 # the engine log's lines the Terminal reads besides --bench's (bench_rules): a start, the lane, the mirror, trouble
@@ -165,6 +167,9 @@ class Link:
         except (OSError, ValueError) as e:
             return self._failed(getattr(e, "reason", None) or str(e))
         self.health = health if isinstance(health, dict) else {}
+        if self.health.get("status") == "loading":     # (the port is up, the engine is not: /metrics would be 503)
+            self.state, self.error, self.fails = "loading", "", 0
+            return self.state
         try:
             m = self._get("/metrics?requests=all" if all_requests else "/metrics", auth=True)
         except urllib.error.HTTPError as e:
@@ -189,6 +194,19 @@ class Link:
         self.state = "live" if self.health.get("service", "abyss") == "abyss" else "not_abyss"
         return self.state
 
+    def fetch_log(self, since: int | None, max_bytes: int = 65536) -> dict | None:
+        """GET /api/log (the server's engine log tail, the key sent): its answer, or None when the server has none
+        (an older server: 404) or it cannot be read now."""
+        q = f"?max={int(max_bytes)}" + (f"&since={int(since)}" if since is not None else "")
+        try:
+            t = self._get("/api/log" + q, auth=True)
+        except urllib.error.HTTPError as e:
+            e.close()
+            return None
+        except (OSError, ValueError):
+            return None
+        return t if isinstance(t, dict) and "text" in t else None
+
     def _failed(self, why) -> str:
         self.fails += 1
         self.error = clean(why, 160)
@@ -203,6 +221,8 @@ class Link:
         little jitter (several terminals on one server do not poll in step)."""
         if self.state == "auth":
             return float("inf")                    # (stopped: `r` tries again)
+        if self.state == "loading":
+            return max(interval, 2.0)              # (a start takes minutes: no need to ask more often)
         if self.fails == 0:
             return interval
         return min(BACKOFF_MAX_S, interval * 2 ** (self.fails - 1)) * random.uniform(0.85, 1.15)
@@ -271,6 +291,8 @@ class EngineLog:
         self.started = False                       # a start line seen
         self.pos = 0
         self.first = True
+        self.remote_next = None                    # /api/log: where the next fetch continues (a remote server)
+        self.remote_path = None                    # ... and the log's name there
         if start_at is not None:                   # (a start of ours: its lines only, from where the log stood)
             self.pos, self.first = int(start_at), False
         elif from_end and self.path:
@@ -307,6 +329,25 @@ class EngineLog:
         for x in lines:
             self.feed(x, stamp)
         self.first = False
+        return len(lines)
+
+    def feed_remote(self, tail: dict) -> int:
+        """A GET /api/log answer into the log (the lines from `since` on; the first answer is the tail of the file,
+        looked at like the first local read: the last start on, the older answers' records still counted)."""
+        if not tail or not isinstance(tail.get("text"), str):
+            return 0
+        first = self.remote_next is None
+        self.remote_next = tail.get("next")
+        self.remote_path = tail.get("path")
+        lines = tail["text"].splitlines()
+        if first:
+            starts = [i for i, x in enumerate(lines) if START_LINE.search(x)]
+            older, lines = lines[:starts[-1]] if starts else [], lines[starts[-1]:] if starts else lines
+            for x in older:
+                self._stat(x, None)
+        stamp = None if first else time.time()
+        for x in lines:
+            self.feed(x, stamp)
         return len(lines)
 
     def _stat(self, x: str, stamp) -> bool:
@@ -395,32 +436,54 @@ def _last(xs):
     return None
 
 
-def token_time(m: dict, log: EngineLog | None, backend: str | None) -> dict | None:
-    """Where a token's time goes: the engine's live STAT when it carries the phase-2 counters (disk_ms, lane_ms),
-    else the engine log's last answers on this PC (--bench's records), else None.  The verdict and its advice come
-    from bench_rules - the same as --bench's."""
+def token_time(m: dict, log: EngineLog | None, backend: str | None, generating: bool = False) -> dict | None:
+    """Where a token's time goes: the engine's STAT when it carries the phase-2 counters (disk_ms, lane_ms) - the
+    last ~64 tokens' window (w_* keys) while it writes, the whole answer's means otherwise - else the engine log's last
+    answers (--bench's records; this PC, or a remote server's /api/log), else None.  The verdict and its advice come
+    from bench_rules - the same as --bench's.  `source`: "live" (writing now, the window), "stat" (the last answer's
+    final STAT), "log"."""
     tn = ((m or {}).get("tiers") or {}).get("now") or {}
-    lane_name = (log.lane if log and log.lane else None) or "CPU lane"
+    eng = (m or {}).get("engine") or {}
+    lane_name = LANE_KINDS.get(str(eng.get("lane") or ""), None) or (log.lane if log and log.lane else None) \
+        or "CPU lane"
+    window = False
     if num(tn.get("disk_ms")) is not None and num(tn.get("lane_ms")) is not None and num(tn.get("ms_tok")):
-        rec = {"ms": num(tn["ms_tok"]), "disk_ms": num(tn["disk_ms"]), "lane_ms": num(tn["lane_ms"]),
+        ms, disk, lane = num(tn["ms_tok"]), num(tn["disk_ms"]), num(tn["lane_ms"])
+        if generating and num(tn.get("w_ms_tok")) and num(tn.get("w_disk_ms")) is not None and \
+                num(tn.get("w_lane_ms")) is not None:
+            ms, disk, lane, window = num(tn["w_ms_tok"]), num(tn["w_disk_ms"]), num(tn["w_lane_ms"]), True
+        rec = {"ms": ms, "disk_ms": disk, "lane_ms": lane,
                "ram_fetch": num(tn.get("ram_fetch")) or 0.0, "vram_hit": 100 * (num(tn.get("vram_hit")) or 0),
                "disk_reads": num(tn.get("disk")) or 0.0, "lane": num(tn.get("lane")) or 0.0,
-               "tail_skip": num(tn.get("tail_skip")) or 0.0, "disk_waits": num(tn.get("disk_waits")) or 0.0}
-        recs, source = [rec], "live"
+               "tail_skip": num(tn.get("tail_skip")) or 0.0, "disk_waits": num(tn.get("disk_waits")) or 0.0,
+               "miss_ms": num(tn.get("miss_ms"))}
+        if num(tn.get("spec_offered")):
+            rec["spec"] = (int(num(tn.get("spec_acc")) or 0), int(num(tn["spec_offered"])))
+        recs, source = [rec], "live" if generating else "stat"
     elif log is not None and log.decode_recs():
         recs, source = log.decode_recs(), "log"
     else:
         return None
     verdict, evidence = R.bench_verdict(recs, lane_name)
-    mean = lambda k: R._mean(r.get(k, 0.0) for r in recs)   # noqa: E731
+    mean = lambda k: R._mean(r.get(k) or 0.0 for r in recs)   # noqa: E731
     what, moves = R.advice(verdict, backend)
     spec = [r["spec"] for r in recs if "spec" in r]
-    return {"source": source, "n": len(recs), "ms": mean("ms"), "disk_ms": mean("disk_ms"),
+    return {"source": source, "window": window, "n": len(recs), "ms": mean("ms"), "disk_ms": mean("disk_ms"),
             "lane_ms": mean("lane_ms"), "ram_fetch": mean("ram_fetch"), "vram_hit": mean("vram_hit"),
             "disk_reads": mean("disk_reads"), "disk_waits": mean("disk_waits"), "lane": mean("lane"),
-            "tail_skip": mean("tail_skip"), "lane_name": lane_name, "verdict": verdict, "evidence": evidence,
-            "what": what, "moves": moves,
-            "spec": (sum(a for a, _ in spec), sum(b for _, b in spec)) if spec else None}
+            "tail_skip": mean("tail_skip"), "miss_ms": num(recs[0].get("miss_ms")) if len(recs) == 1 else None,
+            "lane_name": lane_name, "verdict": verdict, "evidence": evidence, "what": what, "moves": moves,
+            "spec": (sum(a for a, _ in spec), sum(b for _, b in spec)) if spec else None,
+            "age": (time.time() - tn["time"]) if source != "log" and tn.get("time") else None}
+
+
+def lane_gbs(experts_per_tok, expert_mib, busy_ms):
+    """The lane's bandwidth, estimated: the experts it computes a token x one expert's bytes / its busy time.
+    None without any of the three."""
+    e, mib, ms = num(experts_per_tok), num(expert_mib), num(busy_ms)
+    if e is None or mib is None or ms is None or e <= 0 or mib <= 0 or ms <= 0:
+        return None
+    return e * mib * 2**20 / (ms / 1000.0) / 1e9
 
 
 def cards(m: dict) -> list:
@@ -592,21 +655,32 @@ def derive(link: Link | None, local: dict | None = None, log: EngineLog | None =
             last_prefill = read / (pm / 1000) if pm > 0 and read > 0 else None
     v["prompt"] = {"now": num(live.get("prefill_tok_s_mean")) if reading else None, "last": last_prefill,
                    "read": live.get("prompt_read"), "total": live.get("prompt_total") or live.get("prompt_tokens"),
-                   "spark": list(hist.get("prefill_tok_s_mean") or [])}
+                   "spark": list(hist.get("prefill_tok_s_mean") or []),
+                   # (a phase-2 engine while reading: the tokens reused from the last turn, the SSD wait so far)
+                   "reused": num(live.get("prompt_reused")) if reading else None,
+                   "disk_ms": num(live.get("prompt_disk_ms")) if reading else None}
     p = v["prompt"]
     p["value"] = p["now"] if p["now"] is not None else p["last"]
     p["label"] = "live" if p["now"] is not None else "last request" if p["last"] is not None else None
     v["elapsed"] = num(live.get("elapsed_s"))
 
     # where a token's time goes, and the bottleneck (--bench's rules)
-    v["tt"] = token_time(m, log, (eng.get("backend") or cfg.get("backend") or "").lower() or None)
-    v["tt_why"] = None if v["tt"] else (PHASE2 + " - remote: until then the local engine log has it"
-                                        if local.get("remote") else "no answer written yet in this engine log"
-                                        if log is not None else PHASE2)
+    v["tt"] = token_time(m, log, (eng.get("backend") or cfg.get("backend") or "").lower() or None, generating=gen)
+    if v["tt"]:
+        v["tt_why"] = None
+    elif not m:
+        v["tt_why"] = "waiting for the server"
+    elif tn:                                     # (a STAT without the ms keys: an engine before 1.3.80)
+        v["tt_why"] = PHASE2 + "; the engine log has it after each answer" + \
+            ("" if log is not None else " - a 1.3.80+ server sends its log too")
+    else:
+        v["tt_why"] = "no answer written yet"
 
     # the expert tiers (STAT, the fast path) and the context
     v["tiers"] = {k: num(tn.get(k)) for k in ("vram_hit", "ram_fetch", "disk", "promo", "vram_used", "vram_slots",
-                                               "ram_used", "ram_slots", "vram_gb", "ram_gb", "tok_s", "ms_tok")}
+                                               "ram_used", "ram_slots", "vram_gb", "ram_gb", "tok_s", "ms_tok",
+                                               "disk_ms", "disk_waits", "miss_ms", "lane", "lane_ms", "tail_skip",
+                                               "w_ms_tok", "w_disk_ms", "w_lane_ms")}
     v["tiers"]["age"] = (now - tn["time"]) if tn.get("time") else None
     v["tiers"]["history"] = tiers.get("history") or {}
     for k, ik in (("vram_slots", "vram_slots"), ("ram_slots", "ram_slots"), ("vram_gb", "vram_gb"), ("ram_gb", "ram_gb")):
@@ -693,11 +767,16 @@ def derive(link: Link | None, local: dict | None = None, log: EngineLog | None =
         d["share"] = (d["read_mb"] or 0) / shard_mb if d in shard and shard_mb > 1.0 else None
     model_mb = sum(d["read_mb"] or 0 for d in drives if "model" in d["roles"])
     mirror_mb = sum(d["read_mb"] or 0 for d in drives if "mirror" in d["roles"] and "model" not in d["roles"])
+    # the mirror's split as the engine counts it (STAT mirror_mb0/1, this answer's expert bytes per drive)
+    mb0, mb1 = num(tn.get("mirror_mb0")), num(tn.get("mirror_mb1"))
     v["disk"] = {"read_mb": num(hw.get("disk_read_mb")), "write_mb": num(hw.get("disk_write_mb")),
                  "shard_mb": shard_mb if shard else None, "shard_n": len(shard),
                  "drives": drives, "spark": list(hist.get("disk_read_mb") or []),
                  "mirror_share": mirror_mb / (model_mb + mirror_mb) if mirror_mb + model_mb > 1.0 and
                  any("mirror" in d["roles"] for d in drives) else None,
+                 "mirror_stat": mb1 / (mb0 + mb1) if mb0 is not None and mb1 is not None and mb0 + mb1 > 0 else None,
+                 "mirror_mb": (mb0, mb1) if mb0 is not None and mb1 is not None else None,
+                 "mirror_on": bool(eng.get("mirror")) if eng.get("mirror") is not None else None,
                  "mirror_end": log.mirror if log else None,
                  "free": num((m.get("storage") or {}).get("free")), "total": num((m.get("storage") or {}).get("total"))}
 
@@ -705,21 +784,40 @@ def derive(link: Link | None, local: dict | None = None, log: EngineLog | None =
     tot = m.get("totals") or {}
     da, do = (num(last.get("drafts_accepted")), num(last.get("drafts_offered"))) if last else (None, None)
     ta, to = num(tot.get("drafts_accepted")), num(tot.get("drafts_offered"))
+    # tokens a verify step: the answer so far over the drafter's rounds (STAT), else the last request's
+    lr, lg = (num(last.get("spec_rounds")), num(last.get("engine_generated"))) if last else (None, None)
+    sr, sa, so = num(tn.get("spec_rounds")), num(tn.get("spec_acc")), num(tn.get("spec_offered"))
+    gen_n = num(live.get("generated")) if gen else None
     v["drafter"] = {"last": da / do if da is not None and do else None, "total": ta / to if ta is not None and to
                     else None, "accepted": ta, "offered": to, "kind": clean(eng.get("drafter") or "", 12) or
-                    ("mtp" if str(eng.get("mtp") or "0") not in ("0", "") else None)}
+                    ("mtp" if str(eng.get("mtp") or "0") not in ("0", "") else None),
+                    "live": sa / so if gen and sa is not None and so else None,
+                    "step": gen_n / sr if gen and gen_n and sr else lg / lr if lg and lr else None,
+                    "step_label": "live" if gen and gen_n and sr else "last request" if lg and lr else None}
     v["requests"], v["totals"] = reqs, tot
-    v["lane"] = {"name": log.lane if log else None, "state": log.lane_state if log else None,
-                 "share": num(eng.get("pcie_share"))}
+    lane_kind = str(eng.get("lane") or "") or None
+    v["lane"] = {"name": LANE_KINDS.get(lane_kind) if lane_kind else (log.lane if log else None),
+                 "kind": lane_kind, "state": log.lane_state if log else None, "share": num(eng.get("pcie_share")),
+                 "expert_mib": num(eng.get("expert_mib")),
+                 "experts": num(tn.get("lane")), "busy_ms": num(tn.get("w_lane_ms") if gen else tn.get("lane_ms")),
+                 "gbs": lane_gbs(num(tn.get("lane")), num(eng.get("expert_mib")),
+                                 num(tn.get("w_lane_ms") if gen else tn.get("lane_ms")))}
 
-    # the start, on this PC: how far the warm-up is (the engine log), its stage and time
-    if conn == "loading" and log is not None:
+    # the start: how far the warm-up is - the server's /health "load" (a 1.3.80+ server binds its port first), else
+    # on this PC the engine log - its stage and time
+    hl = health.get("load") if isinstance(health.get("load"), dict) else None
+    if conn == "loading" and (log is not None or hl):
         frac = None
-        if log.load.parts:
+        if log is not None and log.load.parts:
             total = log.load.total()[0]
             frac = min(1.0, sum(done for done, _ in log.load.parts.values()) / max(total, 1e-9))
-        v["loading"] = {"frac": frac, "stage": log.last_line, "elapsed": now - local["started"]
-                        if local.get("started") else None}
+        if frac is None and hl and num(hl.get("pct")) is not None:
+            frac = num(hl["pct"]) / 100.0
+        stage = (log.last_line if log is not None and log.last_line else None) or (hl or {}).get("text")
+        v["loading"] = {"frac": frac, "stage": clean(stage or "", 160) or None,
+                        "step": clean((hl or {}).get("stage") or "", 20) or None,
+                        "elapsed": now - local["started"] if local.get("started") else num((hl or {}).get("elapsed_s")),
+                        "gb": (num(hl.get("done_gb")), num(hl.get("total_gb"))) if hl else None}
     else:
         v["loading"] = None
     v["bench"] = local.get("bench")

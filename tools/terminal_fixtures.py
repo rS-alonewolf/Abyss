@@ -11,9 +11,29 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
 GIB = 2**30
-SCENARIOS = ("r9700", "lowspec", "split", "multi4", "multi8", "multi10", "loading", "down")
+SCENARIOS = ("r9700", "lowspec", "split", "multi4", "multi8", "multi10", "loading", "starting", "down")
+# the phase-2 engine's STAT keys (tools/terminal_model reads them): the token's breakdown live
+STAT_KEYS = ("tok_s", "ms_tok", "vram_hit", "ram_fetch", "disk", "promo", "disk_ms", "disk_waits", "miss_ms", "lane",
+             "lane_ms", "tail_skip", "mirror_mb0", "mirror_mb1", "w_ms_tok", "w_disk_ms", "w_lane_ms", "spec_acc",
+             "spec_offered", "spec_rounds")
+
+
+def _p2(disk_ms, waits, miss_ms, lane, lane_ms, skip=0.0, mirror=None, w=None, spec=None):
+    """A STAT line's phase-2 keys: the SSD waits, the lane, the mirror's MB (shards' drive, mirror), the last ~64
+    tokens' window (ms, disk ms, lane ms), the drafter (accepted, offered, rounds)."""
+    out = {"disk_ms": disk_ms, "disk_waits": waits, "miss_ms": miss_ms, "lane": lane, "lane_ms": lane_ms,
+           "tail_skip": skip}
+    if mirror:
+        out["mirror_mb0"], out["mirror_mb1"] = mirror
+    if w:
+        out["w_ms_tok"], out["w_disk_ms"], out["w_lane_ms"] = w
+    if spec:
+        out["spec_acc"], out["spec_offered"], out["spec_rounds"] = spec
+    return out
+
 
 
 def _wave(n, lo, hi, phase=0.0):
@@ -37,7 +57,7 @@ def _cpu(n, base, temp, power, isa, name, cores, threads, mhz=4800, max_mhz=5187
 def metrics(name: str, now: float | None = None) -> dict | None:
     """GET /metrics of a scenario (None: the server does not answer)."""
     now = time.time() if now is None else now
-    if name in ("loading", "down"):
+    if name in ("loading", "starting", "down"):
         return None
     if name == "r9700":
         engine = {"model": "deepseek-v4.1-flash-1017-iq2xxs", "max_context": 65536, "images": False,
@@ -46,13 +66,16 @@ def metrics(name: str, now: float | None = None) -> dict | None:
                   "pcie_share": "0.00", "uncensor": 1, "version": "1.3.77", "kv_ctx": 65536, "kv_gb": 1.0,
                   "maya_version": "1.3.77", "trained_context": 1048576,
                   "display_name": "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS", "quant": "UD-IQ2_XXS",
-                  "config": "abyss-dsv41-iq2xxs-r9700l.json", "backend": "hip"}
+                  "config": "abyss-dsv41-iq2xxs-r9700l.json", "backend": "hip",
+                  "lane": "igpu", "drafter": "mtp", "expert_mib": 9.4, "tail_skip": 0, "defer": 0, "mirror": 1,
+                  "helper": 0}
         live = {"state": "generating", "queued": 1, "phase": "answering", "prompt_tokens": 5210, "prompt_read": None,
                 "prompt_total": None, "generated": 412, "max_tokens": 2048, "elapsed_s": 21.3, "tok_s": 24.6,
                 "tok_s_mean": 23.9, "prefill_tok_s_mean": 781.0, "tok_s_window_s": 3}
         tn = {"tok_s": 24.1, "ms_tok": 41.5, "vram_hit": 0.6356, "ram_fetch": 0.0, "disk": 5.84, "promo": 6.02,
               "vram_used": 2271, "vram_slots": 2386, "ram_used": 6258, "ram_slots": 6301, "ram_gb": 66.1,
-              "vram_gb": 21.9, "time": now - 1.2}
+              "vram_gb": 21.9, "time": now - 1.2,
+              **_p2(18.2, 4.1, 19.0, 3.0, 1.9, mirror=(1210.5, 952.0), w=(40.1, 17.5, 1.8), spec=(301, 410, 160))}
         main = {"index": 0, "role": "main", "name": "AMD Radeon AI PRO R9700", "shared_memory": False, "util": 93,
                 "mem_used": int(30.4 * GIB), "mem_total": int(31.86 * GIB), "temp": 71, "temp_junction": 88,
                 "temp_mem": 76, "power": 254.0, "power_limit": 300.0, "clock_mhz": 2475, "mem_clock_mhz": 1258,
@@ -105,7 +128,7 @@ def metrics(name: str, now: float | None = None) -> dict | None:
                 "tok_s_mean": None, "prefill_tok_s_mean": None, "tok_s_window_s": None}
         tn = {"tok_s": 20.4, "ms_tok": 49.0, "vram_hit": 0.31, "ram_fetch": 6.1, "disk": 9.2, "promo": 3.3,
               "vram_used": 610, "vram_slots": 610, "ram_used": 4310, "ram_slots": 4310, "ram_gb": 41.9, "vram_gb": 6.2,
-              "time": now - 95}
+              "time": now - 95, **_p2(24.6, 6.8, 26.0, 4.0, 5.1, w=(49.5, 25.0, 5.0), spec=(0, 0, 0))}
         main = {"index": 0, "role": "main", "name": "NVIDIA GeForce RTX 4060 Ti", "util": 3, "mem_used": int(15.1 * GIB),
                 "mem_total": 16 * GIB, "temp": 46, "temp_junction": None, "temp_mem": None, "power": 19.0,
                 "power_limit": 165.0, "clock_mhz": 210, "mem_clock_mhz": 405, "throttle": ["idle"], "pcie_gen": 1,
@@ -138,6 +161,7 @@ def metrics(name: str, now: float | None = None) -> dict | None:
                   "display_name": "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS", "quant": "IQ2_XXS",
                   "config": "abyss-glm-s-v2-split.json", "backend": "cuda", "engine_kind": "glm-fast"}
         live = {"state": "reading", "queued": 0, "phase": "prompt", "prompt_tokens": 16384, "prompt_read": 6144,
+                "prompt_reused": 2048, "prompt_disk_ms": 1840.0,
                 "prompt_total": 16384, "generated": None, "max_tokens": 4096, "elapsed_s": 10.1, "tok_s": None,
                 "tok_s_mean": None, "prefill_tok_s_mean": 612.0, "tok_s_window_s": None}
         tn = {"tok_s": 61.0, "ms_tok": 16.4, "vram_hit": 0.88, "ram_fetch": 3.9, "disk": 0.0, "promo": 1.2,
@@ -179,9 +203,8 @@ def metrics(name: str, now: float | None = None) -> dict | None:
         return _multi(name, now)
     else:
         raise KeyError(name)
-    return {"engine": engine, "live": live, "tiers": {"now": tn, "history": {k: [tn.get(k)] * 20 for k in
-                                                                            ("tok_s", "ms_tok", "vram_hit",
-                                                                             "ram_fetch", "disk", "promo")}},
+    return {"engine": engine, "live": live, "tiers": {"now": tn, "history": {k: [tn.get(k)] * 20 for k in STAT_KEYS
+                                                                            if k in tn}},
             "requests": reqs, "requests_kept": len(reqs), "totals": totals, "hardware": hw, "hardware_static": static,
             "history": hist, "time": now, "reload": None, "storage": storage}
 
@@ -218,7 +241,8 @@ def _multi(name: str, now: float) -> dict:
                 "max_tokens": 4096, "elapsed_s": 41.0, "tok_s": 31.4, "tok_s_mean": 30.2, "prefill_tok_s_mean": 655.0}
         tn = {"tok_s": 31.0, "ms_tok": 32.3, "vram_hit": 0.86, "ram_fetch": 1.9, "disk": 2.1, "promo": 1.4,
               "vram_used": 8650, "vram_slots": 8650, "ram_used": 2358, "ram_slots": 2358, "ram_gb": 24.7,
-              "vram_gb": 98.4, "time": now - 1.0}
+              "vram_gb": 98.4, "time": now - 1.0,
+              **_p2(5.1, 1.2, 6.0, 2.2, 7.9, mirror=(640.0, 590.0), w=(31.0, 4.4, 7.5), spec=(520, 700, 290))}
         c_hw, c_st = _cpu(32, 34.0, 69.0, 121.0, ["avx2", "avx512f", "avx512vbmi"], "AMD Ryzen 9 7950X 16-Core Processor",
                           16, 32, 5100, 5881)
         ram = (61.0, 128.0, 22.1, 0.0, 0.4, 0.0)
@@ -254,7 +278,8 @@ def _multi(name: str, now: float) -> dict:
                 "max_tokens": 2048, "elapsed_s": 6.0, "tok_s": 38.5, "tok_s_mean": 37.9, "prefill_tok_s_mean": 910.0}
         tn = {"tok_s": 38.2, "ms_tok": 26.2, "vram_hit": 0.97, "ram_fetch": 0.4, "disk": 0.05, "promo": 0.3,
               "vram_used": 17800, "vram_slots": 17800, "ram_used": 1656, "ram_slots": 1656, "ram_gb": 15.6,
-              "vram_gb": 168.0, "time": now - 0.8}
+              "vram_gb": 168.0, "time": now - 0.8,
+              **_p2(0.1, 0.02, 0.3, 0.6, 0.4, w=(26.0, 0.1, 0.4), spec=(90, 110, 60))}
         c_hw, c_st = _cpu(48, 22.0, 58.0, 160.0, ["avx2", "avx512f"], "AMD EPYC 7413 24-Core Processor", 24, 48,
                           3200, 3630)
         ram = (180.0, 256.0, 40.0, 0.0, 0.0, 0.0)
@@ -281,22 +306,28 @@ def _multi(name: str, now: float) -> dict:
     static = {"gpu_name": " + ".join(g["name"] for g in gpus), "gpu_count": len(gpus),
               "gpus": [{"index": g["index"], "role": g["role"], "name": g["name"]} for g in gpus],
               "drives": [{"name": d["name"], "roles": d["roles"], "paths": paths[d["name"]]} for d in drives], **c_st}
-    return {"engine": engine, "live": live, "tiers": {"now": tn, "history": {k: [tn.get(k)] * 20 for k in
-                                                                            ("tok_s", "ms_tok", "vram_hit",
-                                                                             "ram_fetch", "disk", "promo")}},
+    return {"engine": engine, "live": live, "tiers": {"now": tn, "history": {k: [tn.get(k)] * 20 for k in STAT_KEYS
+                                                                            if k in tn}},
             "requests": reqs, "requests_kept": len(reqs), "totals": totals, "hardware": hw, "hardware_static": static,
             "history": hist, "time": now, "reload": None, "storage": storage}
 
 
-def _req(t, dur, finish, api, prompt, reused, out, tg, pp, hit, da, do):
+def _req(t, dur, finish, api, prompt, reused, out, tg, pp, hit, da, do, rounds=None):
     return {"projection": None, "time": t, "duration_s": dur, "finish": finish, "api": api, "prefill_tok_s": pp,
             "prompt_tokens": prompt, "reused": reused, "output_tokens": out, "engine_generated": out,
             "prompt_ms": (prompt - reused) / pp * 1000 if pp else 120.0,
             "decode_ms": out / tg * 1000 if tg else None, "decode_tok_s": tg, "hit_rate": hit,
-            "drafts_accepted": da, "drafts_offered": do}
+            "drafts_accepted": da, "drafts_offered": do,
+            "spec_rounds": rounds if rounds is not None else (max(1, out - da) if do else None)}
 
 
 def health(name: str) -> dict | None:
+    if name == "starting":
+        return {"status": "loading", "max_context": None, "model": "deepseek-v4.1-flash-1017-iq2xxs", "images": False,
+                "api_key": True, "defaults": {}, "version": "1.3.80", "mcp_tools": False, "service": "abyss",
+                "config": "abyss-dsv41-iq2xxs-r9700l.json",
+                "load": {"stage": "warming", "text": "CUDA0 warming the expert tiers 42% (37.0 of 88.0 GB, 7 s)",
+                         "pct": 42.0, "done_gb": 37.0, "total_gb": 88.0, "elapsed_s": 61.0}}
     m = metrics(name)
     if m is None:
         return None
@@ -369,7 +400,7 @@ LOGS = {"r9700": LOG_R9700, "lowspec": LOG_LOWSPEC, "loading": LOG_LOADING, "mul
 def local(name: str, log_path=None, now: float | None = None) -> dict:
     """terminal_local's facts of a scenario: the config (its display name, quant, env), the PID file, the bench line."""
     now = time.time() if now is None else now
-    if name in ("split", "multi8"):
+    if name in ("split", "multi8", "starting"):
         return {"remote": True, "is_local": False, "pid_alive": None}
     cfg = {"r9700": ("abyss-dsv41-iq2xxs-r9700l", "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS", "UD-IQ2_XXS", 65536, "hip",
                      {"STRATA_GLM_MIRROR": "/mnt/ssd2/V4.1-UD-IQ2_XXS", "GPU_MAX_HW_QUEUES": "2"}, 8082),
@@ -415,8 +446,9 @@ class FakeServer:
     """An Abyss server's monitoring side on 127.0.0.1 (a free port): /health, /metrics (the Bearer `key` when set),
     /v1/models and POST /api/shutdown (recorded, 202).  `scenario` can change between polls; down() closes it."""
 
-    def __init__(self, scenario: str = "r9700", key: str | None = None, service: str = "abyss"):
+    def __init__(self, scenario: str = "r9700", key: str | None = None, service: str = "abyss", log_text=None):
         self.scenario, self.key, self.service = scenario, key, service
+        self.log_text = log_text                   # GET /api/log's file (None: an older server, 404)
         self.shutdowns: list = []
         self.hits: list = []
         outer = self
@@ -447,9 +479,30 @@ class FakeServer:
                 h = health(outer.scenario) or {}
                 if path == "/health":
                     self._json(200, dict(h, service=outer.service, api_key=bool(outer.key)))
+                elif outer.scenario == "starting":     # (the phase-2 server before its engine is ready)
+                    self.send_response(503)
+                    self.send_header("Retry-After", "15")
+                    self.send_header("Content-Length", "2")
+                    self.end_headers()
+                    self.wfile.write(b"{}")
                 elif path == "/metrics":
                     if self._auth():
                         self._json(200, metrics(outer.scenario))
+                elif path == "/api/log":
+                    if self._auth():
+                        if outer.log_text is None:
+                            self._json(404, {"error": {"message": "not found"}})
+                        else:
+                            q = {k: v[-1] for k, v in parse_qs(self.path.partition("?")[2]).items()}
+                            since = int(q["since"]) if q.get("since", "").lstrip("-").isdigit() else None
+                            mx = int(q.get("max") or 65536)
+                            data = outer.log_text.encode()
+                            start = max(0, len(data) - mx) if since is None or since < 0 else min(since, len(data))
+                            piece = data[start:start + mx]
+                            cut = piece.rfind(b"\n") + 1 or len(piece)
+                            self._json(200, {"path": "engine.log", "size": len(data), "since": start,
+                                             "next": start + cut, "text": piece[:cut].decode(),
+                                             "more": start + cut < len(data)})
                 elif path == "/v1/models":
                     if self._auth():
                         self._json(200, {"object": "list", "data": [{"id": h.get("model"), "object": "model"}]})

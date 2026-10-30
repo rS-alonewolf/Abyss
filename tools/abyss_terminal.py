@@ -9,7 +9,7 @@ server detached (it keeps serving after the Terminal closes) and stops it.
     ./abyss.sh --terminal --url http://host:8082 --key-env ABYSS_API_KEY     a remote server (read-only)
     ./abyss.sh --terminal --plain                  no Textual: plain text redrawn every second (old consoles)
     ./abyss.sh --terminal --once / --json          one reading, printed (scripts, issue reports)
-    ./abyss.sh --terminal --demo r9700             recorded readings, no server needed (r9700 lowspec split loading
+    ./abyss.sh --terminal --demo r9700             recorded readings, no server needed (r9700 lowspec split loading starting
                                                    down)
     python tools/abyss_terminal.py ...             the same without abyss.sh (python -m tools.abyss_terminal too)
 
@@ -107,7 +107,7 @@ class Session:
         self.configs: list | None = None
         self.log: M.EngineLog | None = None
         self.pid_info = None
-        self._last_pid_check = self._last_cfg_scan = 0.0
+        self._last_pid_check = self._last_cfg_scan = self._last_remote_log = 0.0
         self.poll = poll
         self.fake = None
         key = os.environ.get(key_env) if key_env else None
@@ -115,7 +115,8 @@ class Session:
             self.say(f"${key_env} is empty: no key sent", 8)
         if demo:
             import terminal_fixtures as F
-            self.fake = F.FakeServer(demo if demo in F.SCENARIOS else "r9700")
+            self.fake = F.FakeServer(demo if demo in F.SCENARIOS else "r9700",
+                                     log_text="\n".join(F.LOGS.get(demo) or []) + "\n" if demo in F.LOGS else None)
             if demo in ("loading", "down"):
                 self.fake.down()
             base = self.fake.url
@@ -125,7 +126,7 @@ class Session:
                 self.log = M.EngineLog(None)
                 for x in F.LOGS[demo]:
                     self.log.feed(x, None)
-            self.remote = demo in ("split", "multi8")
+            self.remote = demo in ("split", "multi8", "starting")
             if self.remote:
                 self.configs = None
         elif url:
@@ -196,6 +197,9 @@ class Session:
             self.log.read()
         if self.bench_log is not None:
             self.bench_log.read()
+        if self.remote and not self.demo and now - self._last_remote_log >= 2.0 and self.link.state == "live":
+            self._last_remote_log = now
+            self.fetch_remote_log()
         if self.cfg_path is not None and not self.demo and now - self._last_pid_check >= 2.0:
             self._last_pid_check = now
             self.pid_info = T.read_pid(self.cfg_path)
@@ -205,6 +209,19 @@ class Session:
         if self.message and now > self.message_until:
             self.message = ""
         self.poller.all_requests = self.view == 3
+
+    def fetch_remote_log(self) -> int:
+        """A 1.3.80+ server's engine log over GET /api/log (every 2 s; the key goes along): the per-request "glm stat"
+        lines feed the Speed view and the Logs view as the local file does.  0 when the server has no /api/log."""
+        if self.log is None:
+            self.log = M.EngineLog(None)
+        with self.poller.lock:
+            tail = self.link.fetch_log(self.log.remote_next, 256 * 1024 if self.log.remote_next is None else 64 * 1024)
+        if tail is None:
+            if self.log.remote_next is None:   # (an older server, or not yet: leave the log None so the hint shows)
+                self.log = None
+            return 0
+        return self.log.feed_remote(tail)
 
     def scan_configs(self) -> None:
         out = []
@@ -560,7 +577,7 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--once", action="store_true", help="print one reading and exit")
     ap.add_argument("--json", action="store_true", help="print one reading as JSON and exit")
     ap.add_argument("--demo", metavar="SCENARIO", help="recorded readings, no server: r9700, lowspec, split, "
-                                                       "multi4, multi8, multi10, loading, down")
+                                                       "multi4, multi8, multi10, loading, starting, down")
     return ap
 
 

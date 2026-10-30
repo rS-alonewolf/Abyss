@@ -207,10 +207,43 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int], window_s: flo
     return (now[0] - base[0]) <= max(0.5, STALL_CPU_SHARE * window_s) and (now[1] - base[1]) <= STALL_IO_EPS_B
 
 
+# What the engine's start is doing, for GET /health while it loads (the port is bound before the engine starts, so
+# Abyss Terminal on another PC sees "loading" and how far, not a refused connection): narrate_start fills it from the
+# engine log, StrataEngine.__init__ resets it (a restart too - a context reload shows the same under "reloading").
+LOADING = {"stage": None, "text": None, "pct": None, "done_gb": None, "total_gb": None, "started": None, "parts": {}}
+LOAD_STAGES = ("weights", "experts", "loaded", "warming", "up")
+WARMING_LINE = re.compile(r"glm fast: (\S+?)(\d+) warming the expert tiers \d+% \(([\d.]+) of ([\d.]+) GB")
+WARMED_LINE = re.compile(r"glm fast: (\S+?)(\d+) tiers warm: \d+ experts \(([\d.]+) GB\)")
+
+
+def load_progress() -> dict:
+    """/health's `load` while the engine starts: the stage, its text, the warm-up's percent and GB (None until the
+    engine says), the seconds since the start began."""
+    st = LOADING
+    parts = st.get("parts") or {}
+    done = sum(d for d, _ in parts.values())
+    total = sum(t for _, t in parts.values())
+    return {"stage": st.get("stage"), "text": st.get("text"),
+            "pct": round(100.0 * min(1.0, done / total), 1) if total > 0 else None,
+            "done_gb": round(done, 2) if parts else None, "total_gb": round(total, 2) if parts else None,
+            "elapsed_s": round(time.time() - st["started"], 1) if st.get("started") else None}
+
+
+def load_line(line: str) -> None:
+    """One engine-log line into LOADING (the warm-up of each GPU's expert tiers, in GB)."""
+    if m := WARMING_LINE.search(line):
+        LOADING["parts"][int(m.group(2))] = (float(m.group(3)), float(m.group(4)))
+        LOADING["stage"], LOADING["text"] = "warming", line.split("glm fast: ", 1)[-1].strip()[:160]
+    elif m := WARMED_LINE.search(line):
+        LOADING["parts"][int(m.group(2))] = (float(m.group(3)), float(m.group(3)))
+        LOADING["stage"], LOADING["text"] = "warming", line.split("glm fast: ", 1)[-1].strip()[:160]
+
+
 def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
     """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
-    people closed the window thinking it had hung.  The warning comes at that step, not after it."""
+    people closed the window thinking it had hung.  The warning comes at that step, not after it.  The same lines
+    fill LOADING for GET /health."""
     gb = 0.0
     if "--native" in args:                              # about the size of the experts it will read
         try:
@@ -227,6 +260,8 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             said.add(key)
             last = time.time()
             print(text, flush=True)
+        if key in LOAD_STAGES and LOAD_STAGES.index(key) >= LOAD_STAGES.index(LOADING.get("stage") or "weights"):
+            LOADING["stage"], LOADING["text"] = key, text.split("\n", 1)[0].replace("[maya] ", "", 1)[:160]
 
     say("weights", "[maya] starting the engine: reading the model's weights ...")
     pos = offset
@@ -242,7 +277,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
                 if "PLE on" in line or "expert arena:" in line:
-                    say("arena", f"[maya] loading the experts into RAM ({size}) and locking part of them for the GPU.\n"
+                    say("experts", f"[maya] loading the experts into RAM ({size}) and locking part of them for the GPU.\n"
                                  "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
                                  "         Please wait and don't close this window; the browser opens when it is ready.")
                 elif " loaded " in line and "GiB at" in line:
@@ -250,11 +285,13 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
                         f" ({time.time() - t0:.0f} s so far)")
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
-                    say("cache", f"[maya] filling the GPU's expert cache ({n}) ...")
+                    say("warming", f"[maya] filling the GPU's expert cache ({n}) ...")
                 elif "session is up" in line:
                     say("up", "[maya] almost ready ...")
                 elif "WARNING - " in line:   # the engine's own (e.g. Windows' commit limit capping the RAM tier)
                     print("[maya] WARNING: " + line.split("WARNING - ", 1)[1].strip(), flush=True)
+                else:
+                    load_line(line)          # (the warm-up's GB: GET /health's `load` while the port waits)
         if time.time() - last > heartbeat:
             last = time.time()
             print(f"[maya] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
@@ -285,6 +322,8 @@ class StrataEngine:
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0
+        LOADING.update(stage="weights", text="starting the engine: reading the model's weights", parts={},
+                       started=time.time())             # (GET /health's `load` while this start runs)
         if log:
             threading.Thread(target=narrate_start, args=(log, log_start, args, loading),
                              daemon=True).start()
@@ -468,6 +507,21 @@ class StrataEngine:
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
+        if len(f) >= 12:                                  # the drafter's verify steps (tokens a step = generated / it)
+            self.last.update(spec_rounds=int(f[11]))
+
+    def _parse_pp(self, line):
+        """PP read total ms tok_s [reused disk_ms]: the prompt's progress and prefill rate; a phase-2 engine adds the
+        reused tokens and the prompt's SSD wait so far (ms) - older engines leave those None."""
+        f = line.split()
+        if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
+            self.progress = (int(f[1]), int(f[2]))
+            self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+            self.prompt_reused = int(f[5]) if len(f) >= 6 and f[5].isdigit() else None
+            try:
+                self.prompt_disk_ms = float(f[6]) if len(f) >= 7 else None
+            except ValueError:
+                self.prompt_disk_ms = None
 
     def _parse_stat(self, line):
         """STAT key=value ... (the GLM engine, every few tokens): live expert-tier counters for the Monitor."""
@@ -564,6 +618,7 @@ class StrataEngine:
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         self.progress = None
         self.prefill_tok_s_mean = None
+        self.prompt_reused = self.prompt_disk_ms = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -599,10 +654,7 @@ class StrataEngine:
                         return
                     yield int(line[2:])
                 elif line.startswith("PP "):
-                    f = line.split()
-                    if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                        self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
-                        self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                    self._parse_pp(line)                  # prompt progress, one per chunk: also a heartbeat (the
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
                     yield None
@@ -1472,6 +1524,8 @@ class Service:
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
+            live["prompt_reused"] = getattr(self.engine, "prompt_reused", None)
+            live["prompt_disk_ms"] = getattr(self.engine, "prompt_disk_ms", None)
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
                   "trained_context": self.trained_context, **self.label}
@@ -1808,7 +1862,9 @@ class Service:
                         if n and last.get("generated") and last.get("decode_ms") else None,
                         "hit_rate": hit_rate,
                         # the drafter's proposals this request (MTP / NextN / DSpark): None without a DONE that says
-                        "drafts_accepted": last.get("drafts_accepted"), "drafts_offered": last.get("drafts_offered")})
+                        "drafts_accepted": last.get("drafts_accepted"), "drafts_offered": last.get("drafts_offered"),
+                        # ... and its verify steps (a phase-2 engine): tokens a step = engine_generated / spec_rounds
+                        "spec_rounds": last.get("spec_rounds")})
                     t = self.totals
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
@@ -2338,6 +2394,96 @@ def cut_in_flight(svc: Service, engine, wait_s: float = 15.0, force: bool = Fals
     return "stuck"
 
 
+LOG_SECRET = re.compile(r"(?i)(api[_-]?key|bearer|x-api-key|authorization)([\s=:\"']+)([^\s\"',]+)")
+
+
+def log_tail(path, since: int | None, max_bytes: int = 65536, api_key: str = "") -> dict:
+    """GET /api/log: the engine log from byte `since` (None or past the end: the last `max_bytes`), whole lines, at most
+    `max_bytes` (<= 1 MiB).  `next` is where the next call continues; `size` the file's size now.  The API key's
+    values (and any `api_key=...` / Bearer tokens in a line) are masked."""
+    max_bytes = max(64, min(int(max_bytes), 1 << 20))
+    out = {"path": os.path.basename(path) if path else None, "size": 0, "since": 0, "next": 0, "text": "",
+           "more": False}
+    if not path:
+        out["error"] = "this server has no engine log (no \"log\" in its config)"
+        return out
+    try:
+        size = os.path.getsize(path)
+        start = size - max_bytes if since is None or since < 0 or since > size else since
+        start = max(0, start)
+        with open(path, "rb") as f:
+            f.seek(start)
+            chunk = f.read(max_bytes + 1)
+    except OSError as e:
+        out["error"] = str(e)
+        return out
+    more = len(chunk) > max_bytes
+    chunk = chunk[:max_bytes]
+    if start > 0 and since is None:                     # (a tail: start at a whole line)
+        nl = chunk.find(b"\n")
+        if 0 <= nl < len(chunk) - 1:
+            start += nl + 1
+            chunk = chunk[nl + 1:]
+    cut = chunk.rfind(b"\n") + 1                       # (whole lines only; the rest comes next time)
+    if cut == 0 and not more and start + len(chunk) >= size:
+        cut = len(chunk)                                # (the file's last line without its newline yet)
+    text = chunk[:cut].decode("utf-8", "replace")
+    text = LOG_SECRET.sub(lambda m: m.group(1) + m.group(2) + "***", text)
+    for k in [x for x in (api_key or "").split(",") if len(x.strip()) >= 6]:
+        text = text.replace(k.strip(), "***")
+    out.update(size=size, since=start, next=start + cut, text=text, more=more or start + cut < size)
+    return out
+
+
+def gate(httpd) -> type:
+    """The request handler of a server bound before the engine is ready: a handler class that serves `loading` answers
+    until `httpd.handler` is set to the real one (serve(svc, httpd=...)).  One listening socket for the whole life,
+    so a client never sees the port closed between the two (Windows has no SO_REUSEADDR here)."""
+    def handler(request, client_address, server):
+        cls = getattr(server, "handler", None) or loading_handler(server)
+        return cls(request, client_address, server)
+    return handler
+
+
+def loading_handler(httpd) -> type:
+    facts = getattr(httpd, "facts", None) or {}
+
+    class Loading(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, *a):
+            pass
+
+        def _json(self, code, obj, retry=None):
+            body = json.dumps(obj, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            if retry:
+                self.send_header("Retry-After", str(retry))
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path = self.path.split("?")[0].rstrip("/")
+            if path == "/health":
+                self._json(200, {"status": "loading", "max_context": None, "model": facts.get("model"),
+                                 "images": False, "api_key": bool(facts.get("api_key")), "defaults": {},
+                                 "version": MAYA_VERSION, "mcp_tools": False, "service": "abyss",
+                                 "config": facts.get("config"), "load": load_progress()})
+                return
+            self._json(503, {"error": {"type": "overloaded_error", "message": "the model is still loading; "
+                                       "GET /health says how far"}}, retry=15)
+
+        def do_POST(self):
+            self._json(503, {"error": {"type": "overloaded_error", "message": "the model is still loading; "
+                                       "GET /health says how far"}}, retry=15)
+
+        do_DELETE = do_PUT = do_OPTIONS = do_POST
+
+    return Loading
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
@@ -2478,14 +2624,26 @@ def make_handler(svc: Service):
                 rec = {k: v for k, v in svc.sampling_defaults.items() if k in ("temperature", "top_p", "top_k")}
                 if svc.default_effort:
                     rec["reasoning_effort"] = effort_level(svc.default_effort) or svc.default_effort
-                self._json(200, {"status": "updating" if svc.updater.busy() else
-                                           "reloading" if svc.reloading() else "ok",
+                reloading = svc.reloading()
+                self._json(200, {"status": "updating" if svc.updater.busy() else "reloading" if reloading else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key), "defaults": rec,
                                  "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp),
                                  # which server this is (Strata answers "strata"): Abyss and Maya share this
                                  # /health and llama.cpp's /props, so a client tells them apart by this field
-                                 "service": "abyss"})
+                                 "service": "abyss", "config": svc.label.get("config"),
+                                 # a reload's engine start, as the first start's (loading_handler)
+                                 "load": load_progress() if reloading else None})
+            elif path == "/api/log":
+                # Abyss Terminal on another PC: the engine log's tail (`since` = a byte offset the last answer gave as
+                # `next`, else the last `max` bytes; `max` at most 1 MiB), the API key's values masked
+                if self._authorized():
+                    q = parse_qs(urlsplit(self.path).query)
+                    since = q.get("since", [None])[0]
+                    mx = q.get("max", [None])[0]
+                    self._json(200, log_tail(getattr(svc, "log_path", None),
+                                             int(since) if since is not None and since.lstrip("-").isdigit() else None,
+                                             int(mx) if mx is not None and mx.isdigit() else 65536, svc.api_key))
             elif path == "/api/context":
                 # the dashboard's Context size: the range, the measured cost of the current size, a reload's state
                 if self._authorized():
@@ -2947,9 +3105,25 @@ def lan_addresses() -> list[str]:
     return ([first] if ok(first) else []) + sorted(ip for ip in ips if ok(ip) and ip != first)
 
 
-def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
+def serve(svc: Service, host="127.0.0.1", port=8095, httpd=None) -> ThreadingHTTPServer:
+    """The HTTP server on `host:port`, serving on a thread - or, with `httpd` (bound before the engine started,
+    answering "loading"), that one from now on with the real handler."""
     svc.start_telemetry()
+    if httpd is not None:
+        httpd.handler = make_handler(svc)
+        return httpd
     httpd = Server((host, port), make_handler(svc))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
+
+
+def bind_early(host: str, port: int, facts: dict | None = None) -> ThreadingHTTPServer:
+    """The port, bound and answering before the engine loads: GET /health says "loading" and how far (LOADING), every
+    other request gets 503 + Retry-After.  serve(svc, httpd=...) puts the real handler in.  OSError: the port is taken."""
+    httpd = Server((host, port), None)
+    httpd.RequestHandlerClass = gate(httpd)
+    httpd.facts = dict(facts or {})
+    httpd.handler = None
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 
@@ -3089,8 +3263,10 @@ def main() -> int:
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
-    try:                                                # before the minutes of loading: is the port free?
-        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
+    try:                                                # before the minutes of loading: the port, bound now - /health
+        httpd = bind_early(a.host, a.port, {            # says "loading" and how far until the engine is ready
+            "model": cfg.get("model_name"), "api_key": a.api_key or cfg.get("api_key", ""),
+            "config": Path(a.config).name if a.config else None})
     except OSError:
         ap.error(f"port {a.port} is already in use - is Maya (or another server) already running? "
                  f"Close it, or start this one with a different --port")
@@ -3222,7 +3398,8 @@ def main() -> int:
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
-    httpd = serve(svc, host=a.host, port=a.port)
+    svc.log_path = cfg.get("log") if a.engine == "strata" else None   # (GET /api/log)
+    httpd = serve(svc, host=a.host, port=a.port, httpd=httpd)
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"

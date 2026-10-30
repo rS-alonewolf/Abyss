@@ -43,8 +43,9 @@ class FakeLink:
 
     def __init__(self, sc, key=None, base="http://127.0.0.1:8082"):
         self.metrics, self.health = F.metrics(sc), F.health(sc)
-        self.state = "live" if self.metrics else "disconnected"
-        self.error = "" if self.metrics else "[Errno 111] Connection refused"
+        self.state = "live" if self.metrics else "loading" if (self.health or {}).get("status") == "loading" \
+            else "disconnected"
+        self.error = "" if self.metrics or self.state == "loading" else "[Errno 111] Connection refused"
         self.base, self.key = base, key
         self.last_ok = time.time() - 0.3 if self.metrics else None
         self.ever_ok = bool(self.metrics)
@@ -60,7 +61,7 @@ def log_of(sc):
 
 
 def view(sc, seen=None, **kw):
-    remote = sc in ("split", "multi8")
+    remote = sc in ("split", "multi8", "starting")
     link = FakeLink(sc, key="k" if remote else None,
                     base="http://192.168.1.20:8082" if remote else "http://127.0.0.1:8082")
     return M.derive(link, F.local(sc), log_of(sc), seen=seen if seen is not None else {}, **kw)
@@ -136,6 +137,42 @@ class Connection(unittest.TestCase):
             p.stop()
             self.assertIn("/metrics?requests=all", srv.hits)
 
+    def test_a_server_still_loading_is_loading_not_disconnected(self):
+        with F.FakeServer("starting", key="k") as srv:
+            link = M.Link(srv.url, key="k")
+            self.assertEqual(link.poll(), "loading")                  # (/health 200 "loading"; /metrics not asked)
+            self.assertEqual((link.fails, link.error, link.health["load"]["pct"]), (0, "", 42.0))
+            self.assertNotIn("/metrics", srv.hits)
+            self.assertGreaterEqual(link.next_delay(1.0), 2.0)
+            srv.scenario = "r9700"
+            self.assertEqual(link.poll(), "live")
+
+    def test_the_remote_log_comes_over_api_log(self):
+        text = "\n".join(F.LOG_R9700) + "\n"
+        with F.FakeServer("r9700", key="k", log_text=text) as srv:
+            os.environ["T_KEY"] = "k"
+            s = A.Session(url=srv.url, key_env="T_KEY", poll=False)
+            s.link.poll()
+            self.assertIsNone(s.log)
+            n = s.fetch_remote_log()
+            self.assertGreater(n, 0)
+            self.assertEqual(s.log.remote_next, len(text.encode()))
+            self.assertEqual(s.log.lane, "iGPU lane")
+            self.assertTrue(s.log.decode_recs())                      # the "glm stat" records: the Speed view's
+            self.assertEqual(s.fetch_remote_log(), 0)                 # (nothing new)
+            v = s.view_data()
+            self.assertEqual(v["tt"]["source"], "live")
+            text2 = "\n".join(x.plain for x in D.logs_view(v, 120, 30, s.ui()))
+            self.assertIn("remote /api/log", text2)
+            self.assertIn("glm stat", text2)
+            s.close()
+        with F.FakeServer("r9700", key="k") as srv:                   # an older server: no /api/log, the hint stays
+            s = A.Session(url=srv.url, key_env="T_KEY", poll=False)
+            s.link.poll()
+            self.assertEqual(s.fetch_remote_log(), 0)
+            self.assertIsNone(s.log)
+            s.close()
+
     def test_shutdown_goes_to_the_server(self):
         with F.FakeServer("r9700") as srv:
             with tempfile.TemporaryDirectory() as d:
@@ -155,8 +192,16 @@ class Numbers(unittest.TestCase):
         self.assertEqual(v["decode"]["value"], 24.6)
         self.assertEqual(v["prompt"]["label"], "last request")
         tt = v["tt"]
-        self.assertEqual((tt["source"], tt["verdict"], tt["lane_name"]), ("log", "ssd", "iGPU lane"))
+        # a 1.3.80+ engine: the live STAT's window (the last ~64 tokens), the lane's kind from INFO
+        self.assertEqual((tt["source"], tt["window"], tt["verdict"], tt["lane_name"]), ("live", True, "ssd", "iGPU lane"))
+        self.assertEqual((tt["ms"], tt["disk_ms"], tt["lane_ms"], tt["spec"]), (40.1, 17.5, 1.8, (301, 410)))
         self.assertAlmostEqual(v["disk"]["mirror_share"], 2660 / 5920, places=3)
+        self.assertAlmostEqual(v["disk"]["mirror_stat"], 952.0 / (1210.5 + 952.0), places=3)   # the engine's own count
+        self.assertAlmostEqual(v["lane"]["gbs"], 3.0 * 9.4 * 2**20 / 0.0018 / 1e9, places=2)   # 3 experts x 9.4 MiB / 1.8 ms
+        self.assertEqual(v["lane"]["kind"], "igpu")
+        self.assertAlmostEqual(v["drafter"]["step"], 412 / 160, places=3)                         # tokens a verify step
+        self.assertEqual(v["drafter"]["step_label"], "live")
+        self.assertAlmostEqual(v["drafter"]["live"], 301 / 410, places=3)
         self.assertEqual(v["gpu"]["busiest"], 93)                # the iGPU lane's 64% is not the model's card
         self.assertEqual([c["role"] for c in v["cards"]], ["main", "igpu"])
         self.assertEqual(v["drafter"]["total"], 214 / 402)
@@ -168,12 +213,40 @@ class Numbers(unittest.TestCase):
         self.assertEqual(v["tt"]["verdict"], R.bench_verdict(lg.decode_recs(), "iGPU lane")[0])
         self.assertEqual(v["tt"]["what"], R.advice("ssd", "hip")[0])
 
+    def test_an_older_engine_falls_back_to_the_log(self):
+        link = FakeLink("r9700")
+        for k in list(link.metrics["tiers"]["now"]):          # (a 1.3.79 STAT: the six old keys only)
+            if k in F.STAT_KEYS[6:]:
+                del link.metrics["tiers"]["now"][k]
+        for k in ("lane", "drafter", "expert_mib", "tail_skip", "defer", "mirror", "helper"):
+            link.metrics["engine"].pop(k, None)
+        for r in link.metrics["requests"]:
+            r.pop("spec_rounds", None)
+        v = M.derive(link, F.local("r9700"), log_of("r9700"), seen={})
+        self.assertEqual((v["tt"]["source"], v["tt"]["verdict"], v["tt"]["lane_name"]), ("log", "ssd", "iGPU lane"))
+        self.assertAlmostEqual(v["tt"]["disk_ms"], 12.8, places=1)
+        self.assertIsNone(v["lane"]["gbs"])
+        self.assertIsNone(v["disk"]["mirror_stat"])
+        self.assertIsNone(v["drafter"]["step"])
+        v = M.derive(link, {"remote": True}, None, seen={})   # ... and remote without the log: the hint says why
+        self.assertIsNone(v["tt"])
+        self.assertIn("1.3.80", v["tt_why"])
+
+    def test_idle_shows_the_last_answer_s_stat_not_the_window(self):
+        v = view("lowspec")
+        self.assertEqual((v["tt"]["source"], v["tt"]["window"], v["tt"]["ms"], v["tt"]["disk_ms"]),
+                         ("stat", False, 49.0, 24.6))
+        self.assertEqual(v["tt"]["verdict"], "ssd")
+        self.assertIn("last answer", D.tt_source(v["tt"]))
+
     def test_remote_split_has_no_token_time_yet_and_says_why(self):
         v = view("split")
         self.assertIsNone(v["tt"])
-        self.assertIn("phase 2", v["tt_why"])
+        self.assertIn("1.3.80", v["tt_why"])
         self.assertEqual(v["state"], "reading")
         self.assertEqual(v["prompt"]["label"], "live")
+        self.assertEqual((v["prompt"]["reused"], v["prompt"]["disk_ms"]), (2048, 1840.0))   # the PP line's new fields
+        self.assertIn("reused 2K  SSD 1.8 s", "\n".join(x.plain for x in D.speed_tile(v, "prompt", 70)))
         self.assertEqual(v["gpu"]["busiest"], 97)
         self.assertEqual((v["pcie"]["gen"], v["pcie"]["width"]), (3, 4))
         self.assertTrue(any("plain http" in t for t, _ in v["banners"]))
@@ -183,7 +256,24 @@ class Numbers(unittest.TestCase):
         link = FakeLink("split")
         link.metrics["tiers"]["now"].update(disk_ms=0.5, lane_ms=14.9, lane=180.0)
         v = M.derive(link, {"remote": True}, None, seen={})
-        self.assertEqual((v["tt"]["source"], v["tt"]["verdict"]), ("live", "cpu"))
+        self.assertEqual((v["tt"]["source"], v["tt"]["verdict"]), ("stat", "cpu"))   # (reading: the last answer's)
+        link.metrics["live"]["state"] = "generating"
+        v = M.derive(link, {"remote": True}, None, seen={})
+        self.assertEqual((v["tt"]["source"], v["tt"]["window"], v["tt"]["verdict"]), ("live", False, "cpu"))
+        link.metrics["tiers"]["now"].update(w_ms_tok=16.0, w_disk_ms=0.2, w_lane_ms=3.0)
+        v = M.derive(link, {"remote": True}, None, seen={})
+        self.assertEqual((v["tt"]["window"], v["tt"]["verdict"], v["tt"]["lane_ms"]), (True, "gpu", 3.0))
+
+    def test_a_remote_server_still_loading_says_how_far(self):
+        v = view("starting")
+        self.assertEqual((v["conn"], v["remote"]), ("loading", True))
+        self.assertEqual((v["loading"]["frac"], v["loading"]["step"], v["loading"]["elapsed"], v["loading"]["gb"]),
+                         (0.42, "warming", 61.0, (37.0, 88.0)))
+        text = "\n".join(x.plain for x in D.overview(v, 100, 30, {}))
+        self.assertIn("LOADING", text)
+        self.assertIn("42%", text)
+        self.assertIn("37.0 / 88.0 GB", text)
+        self.assertIn("LOADING 42%", "\n".join(x.plain for x in D.header(v, 120)))
 
     def test_missing_is_dashes_never_zero(self):
         link = FakeLink("lowspec")
@@ -291,8 +381,15 @@ class Drawing(unittest.TestCase):
     def test_the_bottleneck_is_named_on_the_overview(self):
         text = "\n".join(x.plain for x in D.overview(view("r9700"), 160, 46, {}))
         self.assertIn("BOTTLENECK", text)
-        self.assertIn("SSD WAIT 12.8 ms", text)
+        self.assertIn("SSD WAIT 17.5 ms", text)          # the live window's
+        self.assertIn("live · last ~64 tokens", text)
         self.assertIn("THROUGHPUT", text)
+        self.assertIn("tok/step 2.58", text)
+        text = "\n".join(x.plain for x in D.speed_view(view("r9700"), 160, 50, {}))
+        self.assertIn("mirror split (engine) 44%", text)
+        self.assertIn("GB/s", text)
+        self.assertIn("16.4 GB/s", text)
+        self.assertIn("tokens/step   2.58", text)
 
     def test_plain_output_colour_mono_and_none(self):
         lines = D.screen(view("r9700"), 80, 24, {"view": 0})
@@ -515,7 +612,7 @@ class Layout(unittest.TestCase):
 
 SHOTS = [("r9700", 0), ("r9700", 1), ("r9700", 2), ("r9700", 3), ("r9700", 4), ("r9700", 5), ("r9700", 6),
          ("r9700", 7), ("lowspec", 0), ("lowspec", 2), ("split", 0), ("split", 4), ("loading", 0), ("down", 0),
-         ("multi4", 4), ("multi10", 2), ("multi10", 4)]
+         ("multi4", 4), ("multi10", 2), ("multi10", 4), ("starting", 0)]
 
 
 @needs_textual
