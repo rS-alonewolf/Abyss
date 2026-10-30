@@ -339,8 +339,9 @@ The screen is Textual, installed into `.venv` from `third_party/wheels` the firs
   a card whose link fell while working, or that sits on a link under half the others' (an x1 riser, Gen2/Gen3 x4), is
   pink and named in a banner. Every drive shows its MB/s and its share of the expert reads (any number of drives). At
   80x24 the cards are summed up in one line (busiest / VRAM / hottest / lowest link) with the cards that matter.
-- **Detached:** a server the Terminal starts runs in a session of its own (`abyss.py --config <config> --plain`,
-  output in `<config>.server.log`, PID in `<config>.pid`) - quitting asks *keep serving* or *stop it*; a server that
+- **Detached:** a server the Terminal starts runs in a session of its own (`abyss.py --config <config> --plain` with
+  `ABYSS_NO_BROWSER=1`, so no browser opens; output in `<config>.server.log`, PID in `<config>.pid`) - quitting asks
+  *keep serving* or *stop it*; a server that
   was already running is left alone. A stop is `POST /api/shutdown`, else Ctrl+C to the server's process group; after
   60 s it is killed. The next `--terminal` attaches again.
 - **The header** always names the model with its quant (e.g. *DeepSeek V4.1 Flash 1017 UD-IQ2_XXS*) and shows the
