@@ -5,6 +5,7 @@ CUDA: Linux; Windows (experimental). HIP: experimental gfx1100/gfx1201/gfx1151, 
     ./abyss.sh                 the first run sets everything up and starts the dashboard; later runs just start it
     ./abyss.sh --setup         set up again (other GPUs, another context length, another model folder)
     ./abyss.sh --check         only check this PC
+    ./abyss.sh --terminal      Abyss Terminal: watch the server, start / stop / switch models (tools/abyss_terminal.py)
     ./abyss.sh --backend hip --gpu 0 --check    check an RX 7900 XT / XTX with system ROCm 10
 
 On Windows START-ABYSS.bat takes the same options.  Both make the private Python environment (.venv) and run this

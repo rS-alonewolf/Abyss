@@ -1133,8 +1133,10 @@ def models_view(v: dict, w: int, h: int, ui: dict) -> list:
                                     L("A remote server is read-only here.", "faint i")], w)
     sel = ui.get("sel", 0)
     inner = w - 4
-    namew = max(16, inner - 46)
-    rows = [L(f"{'':2}{'MODEL':<{namew}} {'CTX':>5} {'GPU':>5} {'PORT':>5} {'BACK':>4}  STATE", "muted b")]
+    cfgw = min(34, inner - 82) if inner >= 110 else 0     # (wide: the config's file too - names repeat)
+    namew = max(16, inner - 46 - (cfgw + 1 if cfgw else 0))
+    rows = [L(f"{'':2}{'MODEL':<{namew}} " + (f"{'CONFIG':<{cfgw}} " if cfgw else "") +
+              f"{'CTX':>5} {'GPU':>5} {'PORT':>5} {'BACK':>4}  STATE", "muted b")]
     bench = v.get("bench") or {}
     for i, c in enumerate(cfgs):
         name, quant = pretty_name(c.get("display"), c.get("quant"), c.get("model_name") or c["stem"])
@@ -1145,6 +1147,7 @@ def models_view(v: dict, w: int, h: int, ui: dict) -> list:
         mark = "▶ " if i == sel else "  "
         base = " r" if i == sel else ""
         ln = L(mark, "accent b", f"{label[:namew]:<{namew}} ", ("ink b" + base).strip(),
+               f"{c['stem'][:cfgw]:<{cfgw}} " if cfgw else "", ("faint" + base).strip(),
                f"{toks(c.get('ctx')):>5} ", ("muted" + base).strip(),
                f"{','.join(str(g) for g in c.get('gpus') or []):>5} ", ("muted" + base).strip(),
                f"{c.get('port'):>5} ", ("muted" + base).strip(), f"{c.get('backend', '')[:4].upper():>4}  ",

@@ -112,6 +112,9 @@ def cmdline(pid: int) -> list:
 
 
 def alive(pid: int) -> bool:
+    for p in _CHILDREN:                        # (a start of this Terminal's that ended: reaped, not a zombie)
+        if p.pid == pid:
+            return p.poll() is None
     if WIN:
         try:
             import psutil
@@ -119,11 +122,6 @@ def alive(pid: int) -> bool:
         except ImportError:
             r = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True)
             return str(pid) in r.stdout
-    try:                                       # (a start of this Terminal's that ended: reap it, not a zombie)
-        if os.waitpid(pid, os.WNOHANG)[0] == pid:
-            return False
-    except ChildProcessError:
-        pass
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -202,7 +200,10 @@ def signal_stop(pid: int) -> None:
     """Ctrl+C for a detached server: SIGINT to its process group (as a terminal's Ctrl+C reaches the start, the
     server and the engine); Windows: CTRL_BREAK_EVENT to its group."""
     if WIN:
-        os.kill(pid, signal.CTRL_BREAK_EVENT)
+        try:
+            os.kill(pid, signal.CTRL_BREAK_EVENT)
+        except OSError:                         # (a detached start has no console to send it to)
+            subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True)
     else:
         os.killpg(pid, signal.SIGINT)
 

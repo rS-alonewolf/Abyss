@@ -216,6 +216,11 @@ class TerminalApp(App):
     def action_move(self, d: int) -> None:
         if self.s.view in (3, 5, 7):
             self.s.move(d)
+            if self.s.view in (3, 7):                   # (keep the chosen row in sight)
+                body = self.query_one("#body")
+                row = self.s.sel[self.s.view] + 4 + len((self.v or {}).get("banners") or [])
+                if row < body.scroll_y + 1 or row > body.scroll_y + body.size.height - 3:
+                    body.scroll_to(y=max(0, row - body.size.height // 2), animate=False)
         else:
             body = self.query_one("#body")
             body.scroll_relative(y=d, animate=False)

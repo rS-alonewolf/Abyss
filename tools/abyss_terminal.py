@@ -338,11 +338,11 @@ class Session:
             out = Path(cfg_path).with_suffix(".bench.log")
             import subprocess
             kw = {"creationflags": 0x00000008 | 0x00000200} if T.WIN else {"start_new_session": True}
+            cmd = [sys.executable, str(self.root / "abyss.py"), "--bench", "--config", str(cfg_path), "--plain"]
             with open(out, "wb") as f:
-                subprocess.Popen([sys.executable, str(self.root / "abyss.py"), "--bench", "--config", str(cfg_path),
-                                  "--plain"], cwd=str(self.root), stdin=subprocess.DEVNULL, stdout=f,
-                                 stderr=subprocess.STDOUT, env=dict(os.environ, MAYA_SH="1", PYTHONUNBUFFERED="1"),
-                                 **kw)
+                T._CHILDREN.append(subprocess.Popen(cmd, cwd=str(self.root), stdin=subprocess.DEVNULL, stdout=f,
+                                                    stderr=subprocess.STDOUT, **kw,
+                                                    env=dict(os.environ, MAYA_SH="1", PYTHONUNBUFFERED="1")))
             self.bench_log = M.EngineLog(out, start_at=0)
             self.view = 5
             return f"--bench running: its output in Logs ({out.name}); abyss-bench.txt when it ends"
