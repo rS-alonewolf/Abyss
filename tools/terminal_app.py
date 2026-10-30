@@ -12,6 +12,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Input, OptionList, Static
 
@@ -170,6 +171,12 @@ class TerminalApp(App):
 
     # ------------------------------------------------------------------------------------------------ drawing
     def redraw(self, poll: bool = True) -> None:
+        try:
+            self._redraw(poll)
+        except NoMatches:                       # (a timer firing while the app closes: its widgets are gone)
+            pass
+
+    def _redraw(self, poll: bool = True) -> None:
         s = self.s
         if poll:
             s.tick()
