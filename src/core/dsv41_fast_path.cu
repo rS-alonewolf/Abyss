@@ -607,7 +607,9 @@ void engram_async_loop(V41Engram* E) {
                                        dst + (size_t) k * kEngCols * kEngDim, e))
                 ok = false;
             std::atomic_thread_fence(std::memory_order_release);
-            std::atomic_ref<unsigned int>(flag[k]).store(seq, std::memory_order_release);   // (even on a failure)
+            // even on a failure: the layer's kernel spins on this flag (engram_wait) and must not hang the GPU; the
+            // failure reaches the host at the token's end (dsv41_engram_ok) and the token's answer is an error
+            std::atomic_ref<unsigned int>(flag[k]).store(seq, std::memory_order_release);
         }
         l.lock();
         if (!ok && !E->a_bad) { E->a_bad = true; E->a_err = e; }
@@ -640,11 +642,18 @@ void engram_pf_stop(V41Engram& E) {
     E.p_stop.store(false, std::memory_order_relaxed);
 }
 
-// waits for the background reader to be idle; its failure, if any, is this call's
+// waits for the background reader to be idle; its failure, if any, is this call's - and this call's only: the flag
+// is cleared here, so one transient read error (an EIO, a drive's hiccup) fails the token it belonged to and not
+// every V4.1 request after it (before, a_bad stayed set for the life of the process)
 bool engram_sync(V41Engram& E, std::string& err) {
     std::unique_lock<std::mutex> l(E.am);
     E.acv.wait(l, [&] { return !E.a_busy; });
-    if (E.a_bad) { err = E.a_err.empty() ? "deepseek41: Engram row read failed" : E.a_err; return false; }
+    if (E.a_bad) {
+        err = E.a_err.empty() ? "deepseek41: Engram row read failed" : E.a_err;
+        E.a_bad = false;
+        E.a_err.clear();
+        return false;
+    }
     return true;
 }
 
@@ -780,6 +789,14 @@ bool Glm5Model::dsv41_engram_window_add(int il, int t, float* R, std::string& er
     const int k = F->L[(size_t) il].eng;
     if (k < 0) { err = "deepseek41: layer " + std::to_string(il) + " has no Engram table"; return false; }
     return dsv41_engram_add(il, R, err, F->v41_pblk + (size_t) (t * 2 + k) * kEngCols * kEngDim);
+}
+
+// after a token's layers: the background reader's failure for this token, if any (its rows were never written, the
+// layer computed on stale ones) - the token's step fails with it, the reader's flag is clear again for the next one
+bool Glm5Model::dsv41_engram_ok(std::string& err) {
+    auto* E = (V41Engram*) v41_eng_;
+    if (E == nullptr || fast_ == nullptr || !fast_->v41_eng_async) return true;
+    return engram_sync(*E, err);
 }
 
 bool Glm5Model::dsv41_engram_add(int il, float* R, std::string& err, const float* rows) {

@@ -5927,6 +5927,7 @@ int Glm5Model::fast_sample(strata::kernels::SamplerParams& sp, std::string& err)
         cudaMemcpyAsync(F->tok_h, d_tok_, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
     }
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm sampler", err) || !F->route_ok(err)) return -1;
+    if (g_.v41 && !dsv41_engram_ok(err)) return -1;   // (an Engram row this token's layers waited for never arrived)
     if (F->gap_on) {
         F->gap_sample += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0).count();
         ++F->gap_sample_n;
