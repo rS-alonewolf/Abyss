@@ -205,6 +205,6 @@ These change part of the config file; the other keys stay as they are.
 | --- | --- | --- |
 | `Abyss/<config name>.shared-settings.json` | the defaults chosen on the Chat page that other apps get too (`POST /settings`: temperature, the uncensoring switch, ...) | change them on the page; deleting the file restores the defaults |
 | `Abyss/.abyss-gpu-tune-<GPU number>.json`, `Abyss/abyss-gpu-tune.txt` | `--gpu-tune`'s measurements and the report for an issue | no |
-| `~/.config/project-maya/calibration.json` | `--calibrate`'s results (per PC, model and context) | no |
+| `~/.config/project-maya/calibration.json` | `--calibrate`'s results (per PC, model, context, and the GPU's PCIe link and driver: a card moved to another slot or a driver update leaves the old result unused, with one line saying so) | no |
 | `Abyss-tools/logs/last-model` | the model `abyss.sh start` started last | no |
 | `Abyss-tools/abyss.sh`, `common.sh` | the start / stop tools; setup brings them up to date (the old ones kept as `.bak`) | no |

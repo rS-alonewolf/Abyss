@@ -204,6 +204,6 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 | --- | --- | --- |
 | `Abyss/<設定ファイル名>.shared-settings.json` | チャット画面で決めた、他のアプリにも渡す既定値（`POST /settings`。temperature、無検閲化の入り切りなど） | 画面から変える。消すと既定に戻る |
 | `Abyss/.abyss-gpu-tune-<GPU 番号>.json`、`Abyss/abyss-gpu-tune.txt` | `--gpu-tune` の測定結果と、issue に貼る報告 | 触らない |
-| `~/.config/project-maya/calibration.json` | `--calibrate` の結果（PC・モデル・コンテキストごと） | 触らない |
+| `~/.config/project-maya/calibration.json` | `--calibrate` の結果（PC・モデル・コンテキスト・GPU の PCIe リンクとドライバごと。カードを別のスロットに移したりドライバを更新すると古い結果は使われず、1 行で知らせる） | 触らない |
 | `Abyss-tools/logs/last-model` | `abyss.sh start` で最後に起動したモデル名 | 触らない |
 | `Abyss-tools/abyss.sh`、`common.sh` | 起動・停止の道具。セットアップのたびに最新になる（古いものは `.bak`） | 触らない |
