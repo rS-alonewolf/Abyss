@@ -379,7 +379,9 @@ measurements, and [docs/deepseek41/SPEC.md](deepseek41/SPEC.md) what the model c
   [docs/deepseek41/README.md](deepseek41/README.md#a-lighter-dense-pack-q5_k).
 - **Start it in a memory-capped scope** (`systemd-run --user --scope -p MemoryMax=88G ...`): the page cache and the
   pinned tier together can push systemd-oomd into killing the desktop session.
-- **Not yet:** speculative decoding, a layer split, conversation slots on disk, images.
+- **Speculative decoding** (v1.3.53, opt-in): the DSpark drafter for V4.1 (`--dspark`), with the n-gram window; the
+  model's own MTP layers are in no GGUF. The prompt's attention is batched since v1.3.60.
+- **Not yet:** a layer split, conversation slots on disk, images.
 
 ## Ornith-1.5-122B
 
@@ -572,6 +574,14 @@ Environment variables for the engine, in the config's `"env"` block (all of Maya
 | `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | your expert usage between starts; `0` = off |
 | `STRATA_GLM_NO_REUSE` | off | `1`: no conversation reuse |
 | `STRATA_GLM_THINK_RESERVE` | 1024 | (server) tokens a thinking block always leaves for the answer |
+| `STRATA_ENGINE_STALL_S` | 90 | (server) an engine silent that long with no CPU, disk or GPU work is ended and started again by the next request; `0` off |
+| `STRATA_ENGINE_START_S` | 1800 | (server) the most a start may take before READY (a model loading from the SSD takes minutes); past it the engine is ended and the start fails with a line; `0` no limit (v1.3.78) |
+| `STRATA_ENGINE_DRAIN_S` | 120 | (server) a request stopped early (the client left) is drained to its DONE; an engine silent that long after the STOP is ended; `0` no limit (v1.3.78) |
+| `STRATA_ENGINE_WRAP_S` | 40 | (server) at Ctrl+C / SIGTERM a request in progress closes its thinking and answers for up to this long, then is cut |
+| `STRATA_ENGINE_QUIT_S` | 50 | (server) how long the engine gets to end after QUIT (with `STRATA_GLM_SLOT_KEEP` it writes its conversation first); then it is killed. llama-swap's unloadTimeout should exceed it |
+| `STRATA_VISION_START_S` / `STRATA_VISION_ENCODE_S` | 600 / 120 | (server) the image encoder's start and each picture's answer; past them it is ended, the request gets an error and the next picture starts it again (v1.3.78) |
+| `STRATA_HTTP_BACKLOG` | 256 | (server) the listen backlog: requests waiting to be accepted |
+| `STRATA_MAX_BODY_MIB` | 256 | (server) the largest request body; a larger one is answered 413 before it is read |
 | `GPU_MAX_HW_QUEUES` | 2 (HIP) | ROCm's hardware queues a device: the server passes 2 when neither the shell nor the config sets it (v1.3.40). AI PRO R9700 DeepSeek V4 prompts 8K / 16K: 586-650 / 676-684 tok/s on 1 (a value R9700 guides spread against a MES firmware's idle power; 12 W idle here either way), 653-737 / 748-756 on ROCm's 4, 866-995 / 999-1,011 on 2 |
 | `STRATA_GLM_IGPU` | auto | the iGPU lane: on when `libabyss_igpu.so` and a HIP device are there and it is faster than the CPU; `0` off, `1` on even when slower. `STRATA_GLM_IGPU_LIB=<path>`: another library |
 | `STRATA_GLM_IGPU_TIMEOUT_MS` | 20 | a lane call later than this goes to the CPU threads (0: wait) |
@@ -652,6 +662,6 @@ KL 0.009 over 3000 tokens, with the same next-token accuracy.
   does not beat one fast card with the iGPU lane - `auto` then runs on the fast card alone. Windows is untested for DeepSeek V4.
 - `./abyss.sh` (Maya's installer) is for GLM; DeepSeek V4 is set up with `./setup-deepseek.sh`; DeepSeek V4.1 by hand
   ([docs/deepseek41/README.md](deepseek41/README.md)).
-- DeepSeek V4.1: no speculative decoding (no GGUF carries its MTP layers), no layer split, no conversation slots on
-  disk, the prompt's attention a token at a time. Up to v1.3.31 it crashed on the 16,385th token of a context (and
-  chose its attention rows wrongly past 8K); use v1.3.32 or later for long chats.
+- DeepSeek V4.1: no MTP drafter in any GGUF (the opt-in DSpark drafter, v1.3.53, drafts instead), no layer split, no
+  conversation slots on disk. Up to v1.3.31 it crashed on the 16,385th token of a context (and chose its attention
+  rows wrongly past 8K); use v1.3.32 or later for long chats; the prompt's attention is batched since v1.3.60.

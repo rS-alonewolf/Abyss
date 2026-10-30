@@ -179,9 +179,10 @@ As `./setup-deepseek.sh` writes it (an AMD GPU, the DSpark drafter on):
 | `api_key` | the key `/v1/*` requires (`Authorization: Bearer ...` or `x-api-key`), several separated by commas. Always set it when `host` is open | `"my-secret"` |
 | `fit_max_tokens` | `true`: a `max_tokens` beyond the context left is shortened instead of refused with a 400 | `true` |
 | `mcp_servers` | MCP servers the Chat page can use (Claude Desktop's format) | `{"name": {...}}` |
+| `installer` | what setup chose (the model and quant, for the Monitor's label); setup writes it, nothing reads it to decide | `{"quant": "UD-IQ2_XXS"}` |
 
 **Images (GLM-5.3-Flash only)**: `vision` holds the image encoder's settings (`exe`, `mmproj`, `model`, `gpu`,
-`resident`, `max_tokens`, `no_flash_attn`). `./abyss.sh` writes it; it is normally left alone.
+`resident`, `threads`, `max_tokens`, `no_flash_attn`). `./abyss.sh` writes it; it is normally left alone.
 
 Unknown keys are ignored. A bad value in `sampling`, though, stops the server from starting (so a typo cannot quietly
 change how it answers).

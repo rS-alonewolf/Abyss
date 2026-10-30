@@ -227,7 +227,7 @@ cp $U/pack/expert_*.txt $O/pack/
 
 Then point the config's `--glm-pack` and `tokenizer` at `$O/pack`. `GGUF_PY` / `LIBGGML` as for `requant_dense.py`.
 
-## Quality and speed (RTX 5090 + Radeon 8060S lane + 94 GB RAM + NVMe at 3.4 GB/s)
+## Quality and speed (measured in v1.3.31 on an RTX 5090 + Radeon 8060S lane + 94 GB RAM + NVMe at 3.4 GB/s; the R9700 numbers are in the README and docs/BENCH)
 
 Quality is measured against the unquantized 1017's top-256 log-probs on Lucebox's 8 held-out sequences
 (8 x 1,023 positions, `eval/` of [Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF](https://huggingface.co/Lucebox/DeepSeek-V4.1-Flash-1017-ROCMFP-GGUF)):
@@ -239,7 +239,7 @@ Quality is measured against the unquantized 1017's top-256 log-probs on Lucebox'
 | hybrid: Lucebox Q8_0 dense + 8-bit Engram, mrfakename Q2_K/Q3_K experts | 118 ms/token (8.5 tok/s) | 0.168 | 83.4% | 9.25 |
 | (Lucebox ROCMFP2S-IM1017, their numbers) | - | 0.253 | 78.7% | 9.78 |
 
-swe-bench with the config above (v1.3.31, 60 tasks x 5): of the first 35 tasks it resolved 34 (quality 84.9;
+swe-bench with the config above (v1.3.31, a partial run: the first 35 of 60 tasks x 5; the full run is still owed): of those 35 tasks it resolved 34 (quality 84.9;
 DeepSeek V4 Flash 35 and 85.0) at **51.6 tok/s** end to end, 38-59 a task (V4 Flash on the same 35 tasks: 107.2).
 The engine averaged 19.1 ms a token over those 175 answers: 15.3 ms where it read under 0.5 experts a token from the
 SSD, 28.2 ms past 1.5. The run is valid only up to task 35, where a 15K-token reasoning hit the 16K bug fixed in
@@ -282,6 +282,7 @@ but with a 3.4 GB/s SSD 37.4 ms a token still loses to 34.9 without lookahead - 
 
 ## Not yet for V4.1
 
-MTP drafts (the 1017 FP8 release has three MTP layers; no GGUF carries them - the DSpark drafter above is the opt-in alternative),
-conversation slots on disk, a layer split, a batched prompt attention (the prompt's attention runs a token at a time,
-~5 ms a token), images, and the one-command setup.
+MTP drafts from the model's own layers (the 1017 FP8 release has three MTP layers; no GGUF carries them - the DSpark
+drafter above, v1.3.53, is the opt-in alternative), conversation slots on disk, a layer split, images, and the
+one-command setup. The prompt's attention has been batched since v1.3.60 (it ran a token at a time, ~5 ms each,
+before).

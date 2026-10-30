@@ -178,9 +178,10 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 | `api_key` | `/v1/*` に必要な合言葉（`Authorization: Bearer ...` か `x-api-key`）。カンマ区切りで複数。`host` を開けるときは必ず設定 | `"my-secret"` |
 | `fit_max_tokens` | `true`: `max_tokens` が残りのコンテキストを超えたら縮めて受ける（既定は 400 で断る） | `true` |
 | `mcp_servers` | チャット画面から使う MCP サーバー（Claude Desktop と同じ形式） | `{"name": {...}}` |
+| `installer` | セットアップが選んだもの（モデルと量子化。Monitor の表示名用）。セットアップが書き、判断には使わない | `{"quant": "UD-IQ2_XXS"}` |
 
 **画像（GLM-5.3-Flash のみ）**: `vision` に画像エンコーダーの設定が入ります（`exe`、`mmproj`、`model`、`gpu`、`resident`、
-`max_tokens`、`no_flash_attn`）。`./abyss.sh` が書くので、通常は触りません。
+`threads`、`max_tokens`、`no_flash_attn`）。`./abyss.sh` が書くので、通常は触りません。
 
 知らない項目は無視されます。ただし `sampling` の値が間違っていると、サーバーは起動しません（設定の書き間違いで答え方が
 黙って変わらないようにするためです）。
