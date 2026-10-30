@@ -499,7 +499,12 @@ class OutputParser:
         # the answer text that has gone out, followed to tell a call from a quoted one (Strata #1058): the open code
         # fence, the current line, and the backticks of the current paragraph
         self.fence, self.line, self.ticks = "", "", 0
+        # characters looked at for an end tag or a streamed value, in all: a test hook - a long tool argument fed in
+        # small pieces must cost about its length, not its length times the pieces (Maya #626's idea: each new piece
+        # searched the whole call again, and a Write of a 100 KB file took minutes of CPU on the way out)
+        self.scanned = 0
         self._reset_scan()
+        self._reset_body()
 
     def _track(self, text: str) -> str:
         """Follow answer text that goes out (see fence above).  Returns the text."""
@@ -525,8 +530,52 @@ class OutputParser:
         """The answer so far leaves the next character inside a code fence or inline code."""
         return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
 
+    def _reset_body(self):
+        """The body of the call being read (the text after <tool_call> or a DSML opening) is kept as pieces, not grown
+        as one string, and its end tag is looked for in each new piece plus the tail that a tag split across pieces
+        needs - the whole body is joined once, when the end is there."""
+        self.body: list[str] = []    # the pieces
+        self.blen = 0                # their length
+        self.win = ""                # the body's tail not yet known to be free of the end tag
+        self.seen = 0                # where `win` starts in the body
+        self.bend = -1               # where the end tag starts in the body; -1: not there yet
+
+    def _body_end(self) -> str:
+        return DSML_ENDS[self.dsml_tag] if self.state == "dsml" else CALL_END
+
+    def _body_push(self, text: str) -> None:
+        """A piece of the call body (see _reset_body).  With stream_tools the scanner gets it too."""
+        self.body.append(text)
+        self.blen += len(text)
+        if self.stream_tools and self.state == "call":
+            self.srest += text
+        if self.bend >= 0 or not text:
+            return
+        end = self._body_end()
+        self.win += text
+        self.scanned += len(self.win)
+        k = self.win.find(end)
+        if k >= 0:
+            self.bend = self.seen + k
+            return
+        keep = len(end) - 1          # a suffix this long may be the start of the end tag
+        if len(self.win) > keep:
+            self.seen += len(self.win) - keep
+            self.win = self.win[-keep:]
+
+    def _body_take(self) -> tuple[str, str]:
+        """(the body before its end tag, the text after the tag); the body is forgotten."""
+        whole = "".join(self.body)
+        body, rest = whole[:self.bend], whole[self.bend + len(self._body_end()):]
+        self._reset_body()
+        return body, rest
+
+    def _body_text(self) -> str:
+        return "".join(self.body)
+
     def _reset_scan(self):
-        self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
+        self.srest = ""              # the call body not yet consumed by the scanner (only the body: never past its end)
+        self.sraw = 0                # how far `srest` was searched for the end of a raw value
         self.ss = "name"             # name -> between -> str|raw -> ... -> done
         self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
         self.sfirst = True
@@ -543,14 +592,18 @@ class OutputParser:
         args("{")
 
     def _scan(self) -> list[Event]:
-        """Advance the streaming view of the call body in self.buf (see stream_tools)."""
+        """Advance the streaming view of the call body (see stream_tools): self.srest holds what the scanner has not
+        consumed yet, so each piece is looked at about once however many pieces the call comes in."""
         out = []
 
         def args(s):
             if s:
                 out.append(Event("tool_args", s, call=self.scall))
+
+        def take(n):
+            self.srest = self.srest[n:]
         while True:
-            rest = self.buf[self.sp:]
+            rest = self.srest
             if self.ss == "name":
                 lead = rest.lstrip()
                 if not lead or FUNC_START.startswith(lead):
@@ -561,7 +614,7 @@ class OutputParser:
                     if b < 0:
                         return out
                     self._start_call(rest[a + len(FUNC_START):b], out, args)
-                    self.sp += b + 1
+                    take(b + 1)
                     self.ss = "between"
                 else:
                     # GLM: the name runs to the first tag (or the line's end); until one has arrived it may go on
@@ -570,7 +623,7 @@ class OutputParser:
                     if b < 0 or not rest[:b].strip():
                         return out      # (no name before a tag: malformed - the whole call's parse says so)
                     self._start_call(rest[:b].strip(), out, args)
-                    self.sp += b
+                    take(b)
                     self.glm, self.vend, self.ss = True, ARG_VAL_END, "between"
             elif self.ss == "between" and self.glm:
                 stripped = rest.lstrip()
@@ -586,15 +639,15 @@ class OutputParser:
                 pname = stripped[len(ARG_KEY):k1].strip()
                 args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                 self.sfirst = False
-                self.sp += (len(rest) - len(stripped)) + k1 + len(ARG_KEY_END) + v0 + len(ARG_VAL)
+                take((len(rest) - len(stripped)) + k1 + len(ARG_KEY_END) + v0 + len(ARG_VAL))
                 if self.sdeclared.get(pname) == "string":
                     args('"')
                     self.ss, self.sval_started = "str", True     # GLM's values are written as they are
                 else:
-                    self.ss = "raw"
+                    self.ss, self.sraw = "raw", 0
             elif self.ss == "between":
                 stripped = rest.lstrip()
-                self.sp += len(rest) - len(stripped)
+                take(len(rest) - len(stripped))
                 if stripped.startswith("<parameter="):
                     b = stripped.find(">")
                     if b < 0:
@@ -602,15 +655,15 @@ class OutputParser:
                     pname = stripped[11:b]
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                     self.sfirst = False
-                    self.sp += b + 1
+                    take(b + 1)
                     if self.sdeclared.get(pname) == "string":
                         args('"')
                         self.ss, self.sval_started = "str", False
                     else:
-                        self.ss = "raw"
+                        self.ss, self.sraw = "raw", 0
                 elif stripped.startswith("</function>"):
                     args("}")
-                    self.sp += len("</function>")
+                    take(len("</function>"))
                     self.ss = "done"
                 else:
                     return out          # a tag still arriving (or trailing text): wait
@@ -619,16 +672,17 @@ class OutputParser:
                     if not rest:
                         return out
                     if rest[0] == "\n":          # the value's leading newline is not part of it
-                        self.sp += 1
+                        take(1)
                         rest = rest[1:]
                     self.sval_started = True
+                self.scanned += len(rest)
                 end = rest.find(self.vend)
                 if end >= 0:
                     value = rest[:end]
                     if value.endswith("\n") and not self.glm:
                         value = value[:-1]
                     args(json.dumps(value)[1:-1] + '"')
-                    self.sp += end + len(self.vend)
+                    take(end + len(self.vend))
                     self.ss = "between"
                     continue
                 safe = len(rest) - self._hold(rest, (self.vend,))
@@ -636,11 +690,14 @@ class OutputParser:
                     safe -= 1
                 if safe > 0:
                     args(json.dumps(rest[:safe])[1:-1])
-                    self.sp += safe
+                    take(safe)         # (what stays is at most the tag's length: the next piece is searched with it)
                 return out
             elif self.ss == "raw":
-                end = rest.find(self.vend)
+                # a value of another type goes out whole, once complete: searched from where the last look ended
+                self.scanned += len(rest) - self.sraw
+                end = rest.find(self.vend, self.sraw)
                 if end < 0:
+                    self.sraw = max(0, len(rest) - len(self.vend) + 1)
                     return out
                 value = rest[:end]
                 if not self.glm:
@@ -653,8 +710,8 @@ class OutputParser:
                 except ValueError:
                     v = value
                 args(json.dumps(v, ensure_ascii=False))
-                self.sp += end + len(self.vend)
-                self.ss = "between"
+                take(end + len(self.vend))
+                self.ss, self.sraw = "between", 0
             else:
                 return out
 
@@ -667,7 +724,7 @@ class OutputParser:
         if self.ss == "str":
             tail += '"'
         elif self.ss == "raw":
-            tail += json.dumps(self.buf[self.sp:].strip("\n"))
+            tail += json.dumps(self.srest.strip("\n"))
         tail += "}"
         out.append(Event("tool_args", tail, call=self.scall))
         self.ss = "done"
@@ -683,7 +740,10 @@ class OutputParser:
         return best
 
     def feed(self, delta: str, think_end: bool = False) -> list[Event]:
-        self.buf += delta
+        if self.state in ("call", "dsml"):
+            self._body_push(delta)       # (the text before a call is short: it goes out as it comes; a call's body is not)
+        else:
+            self.buf += delta
         out: list[Event] = []
         while True:
             if self.state == "reasoning" and self.think_token:
@@ -751,32 +811,30 @@ class OutputParser:
                     continue
                 if i and self.buf[:i].strip():
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
-                self.buf = self.buf[i + len(tag):]
                 self.state = "dsml" if dsml else "call"
                 self.dsml_tag = dtag
+                rest, self.buf = self.buf[i + len(tag):], ""
+                self._body_push(rest)
             elif self.state == "dsml":
-                end = DSML_ENDS[self.dsml_tag]
-                i = self.buf.find(end)
-                if i < 0:
+                if self.bend < 0:
                     return out
-                body, self.buf = self.buf[:i], self.buf[i + len(end):]
+                body, self.buf = self._body_take()
                 for call in parse_dsml_calls(body):
                     out.append(Event("tool_call", call=call))
                 self.state, self.lead = "content", True
             else:
-                i = self.buf.find(CALL_END)
+                i = self.bend
                 if self.stream_tools:
-                    if i >= 0:
-                        whole, self.buf = self.buf, self.buf[:i]     # scan only the body
+                    if i >= 0:                    # scan only the body: the scanner never sees past its end tag
+                        over = self.blen - i
+                        self.srest = self.srest[:len(self.srest) - over] if len(self.srest) >= over else ""
                         out += self._scan()
                         out += self._close_scan()
-                        self.buf = whole
                     else:
                         out += self._scan()
                 if i < 0:
                     return out
-                body = self.buf[:i]
-                self.buf = self.buf[i + len(CALL_END):]
+                body, self.buf = self._body_take()
                 call = parse_tool_call(body, self.schemas.get(call_name(body)))
                 if self.scall is not None:
                     call.id = self.scall.id
@@ -791,13 +849,14 @@ class OutputParser:
             out += self._scan()                 # the output ended inside a call that was already announced
             out += self._close_scan()
             out.append(Event("tool_call", call=self.scall))
-            self.buf = ""
+            self._reset_body()
             self._reset_scan()
             return out
-        if self.buf or self.state == "dsml":           # (a block that ended at its opening tag stays text too)
+        body = self._body_text() if self.state in ("call", "dsml") else self.buf
+        if body or self.state == "dsml":               # (a block that ended at its opening tag stays text too)
             kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
-            text = CALL_START + self.buf if self.state == "call" else self.dsml_tag + self.buf if self.state == "dsml" \
-                else self.buf
+            text = CALL_START + body if self.state == "call" else self.dsml_tag + body if self.state == "dsml" else body
             out.append(Event(kind, text))
             self.buf = ""
+            self._reset_body()
         return out

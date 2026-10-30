@@ -169,6 +169,32 @@ def _stall_seconds() -> float:
 
 
 ENGINE_STALL_S = _stall_seconds()
+
+
+def env_seconds(name: str, default: float) -> float:
+    """A wait in seconds from the environment (0 = no limit); the default when unset or not a number."""
+    try:
+        return max(0.0, float(os.environ.get(name) or default))
+    except ValueError:
+        return float(default)
+
+
+def readline_within(proc, timeout: float, what: str) -> str:
+    """One line of proc's stdout within `timeout` seconds (0: no limit).  Past it the process is killed - the reader
+    thread then ends on its EOF - and a TimeoutError names `what`, so a request waiting on it gets an error instead of
+    holding the service forever."""
+    if timeout <= 0:
+        return proc.stdout.readline()
+    box: queue.Queue = queue.Queue()
+    threading.Thread(target=lambda: box.put(proc.stdout.readline()), daemon=True).start()
+    try:
+        return box.get(timeout=timeout)
+    except queue.Empty:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        raise TimeoutError(f"{what} within {timeout:.0f} s") from None
 STALL_CPU_SHARE = 0.02      # the engine may use 2% of one core over the window and still count as stuck: its idle
                             # threads' polls (the GLM service threads sleep 2 ms at a time when quiet); work is cores
 STALL_IO_EPS_B = 1 << 20    # bytes it may read or write in that window
@@ -274,7 +300,25 @@ class StrataEngine:
             self.info["version"] = json.loads((Path(exe).parent / "BUILD.json").read_text()).get("version")
         except (OSError, ValueError):
             self.info["version"] = None
-        for line in self.proc.stdout:
+        # the engine's stdout on a thread from the start, so the READY wait and a request can wait with a timeout
+        # (heartbeats, cancel checks); the thread is this process's own (a restart's old one must not mark the new
+        # process ended when the old pipe closes)
+        self.lines: queue.Queue = queue.Queue()
+        threading.Thread(target=self._pump, args=(self.proc, self.lines), daemon=True).start()
+        # a model that loads from the SSD takes minutes; past STRATA_ENGINE_START_S (30 min; 0 = no limit) with no
+        # READY the engine is ended and the start fails with a line that says so, instead of a server that never opens
+        start_s = env_seconds("STRATA_ENGINE_START_S", 1800)
+        deadline = time.monotonic() + start_s if start_s > 0 else None
+        while True:
+            try:
+                line = self.lines.get(timeout=None if deadline is None else max(0.1, deadline - time.monotonic()))
+            except queue.Empty:
+                loading.set()
+                self._end(f"the engine said no READY within {start_s:.0f} s (STRATA_ENGINE_START_S); ending it")
+                raise RuntimeError(f"the engine did not become ready within {start_s:.0f} s (STRATA_ENGINE_START_S "
+                                   "raises it)" + (f" - see {log}" if log else "")) from None
+            if line is None:
+                break
             if line.startswith("NOTE "):
                 print("[maya] " + line[5:].strip(), flush=True)
             if line.startswith("INFO "):
@@ -295,9 +339,6 @@ class StrataEngine:
             self.info["version"] = str(self.info["engine"])
         if log:
             self._context_cost(log_start)
-        # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
-        self.lines: queue.Queue = queue.Queue()
-        threading.Thread(target=self._pump, daemon=True).start()
 
     def _context_cost(self, offset: int):
         """What this start's context costs in VRAM, from the GLM engine's own start lines ("CUDA0 VRAM before the
@@ -326,27 +367,12 @@ class StrataEngine:
             args += ["--max-context", str(int(n))]
         self.spawn = (exe, args, cwd, log, env)
 
-    def stop(self, timeout: float = 60.0):
-        """Ask the engine to end (QUIT: it frees its GPU memory itself), and end it if it does not in time - then wait
-        until the GPUs have that memory back."""
-        try:
-            self.proc.stdin.write("QUIT\n")
-            self.proc.stdin.flush()
-            self.proc.wait(timeout=timeout)
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            try:
-                self.proc.kill()
-                self.proc.wait(timeout=20)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        self.ended = True
-        wait_gpu_release(self.proc.pid)
-
-    def _pump(self):
-        for line in self.proc.stdout:
-            self.lines.put(line)
-        self.ended = True                               # its output closed: it is gone, even before the OS says so
-        self.lines.put(None)
+    def _pump(self, proc, lines):
+        for line in proc.stdout:
+            lines.put(line)
+        if self.proc is proc:
+            self.ended = True                           # its output closed: it is gone, even before the OS says so
+        lines.put(None)
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
@@ -361,7 +387,7 @@ class StrataEngine:
         for line in reversed(tail.splitlines()):
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
-                        "line: " + line.strip() + " - please report it at github.com/mw00/project-maya/issues.")
+                        "line: " + line.strip() + " - please report it at github.com/zephel01/Abyss/issues.")
         return ("The usual cause is running out of RAM: Linux then ends the biggest program (check: sudo dmesg | "
                 "grep -i -E 'killed process|out of memory'); Windows slows down instead. Close other programs or use a "
                 "smaller model (Q2_0 / IQ2_XS).")
@@ -417,9 +443,14 @@ class StrataEngine:
             return None
 
     def restart(self):
-        """Start the engine again (the same command) after it died; the new process has its own line queue."""
+        """Start the engine again (the same command; set_context may have changed it): after it died, or for a new
+        context.  An engine still running is asked to QUIT first (close(): with STRATA_GLM_SLOT_KEEP it writes the
+        conversation it holds) and killed only if it does not end in time - a plain kill lost that conversation on
+        every context change.  The new process has its own line queue."""
+        if self.alive():
+            self.close()
         try:
-            self.proc.kill()
+            self.proc.kill()                            # (ended already: nothing; close() gave up: for sure)
             self.proc.wait(timeout=20)
         except (OSError, subprocess.TimeoutExpired):
             pass
@@ -598,8 +629,25 @@ class StrataEngine:
                         self.proc.stdin.flush()
                     except OSError:
                         pass
+                # an engine that says nothing for STRATA_ENGINE_DRAIN_S seconds (120; 0 = no limit) after the STOP, or
+                # that the stall watchdog finds idle, is ended: the next request starts it again (before, this wait
+                # held the service's FIFO forever when a stopped request never reached its DONE)
+                drain_s = env_seconds("STRATA_ENGINE_DRAIN_S", 120)
+                heard, stall = time.monotonic(), {}
                 while True:
-                    line = self.lines.get()
+                    try:
+                        line = self.lines.get(timeout=10)
+                    except queue.Empty:
+                        why = self._stall_check(heard, stall) if ENGINE_STALL_S > 0 else None
+                        if why is None and drain_s > 0 and time.monotonic() - heard > drain_s:
+                            why = (f"the engine said nothing for {drain_s:.0f} s after the request was stopped "
+                                   "(STRATA_ENGINE_DRAIN_S sets this, 0 = no limit)")
+                        if why:
+                            self._end(why + "; ending it - the next request starts it again")
+                            break
+                        continue
+                    heard = time.monotonic()
+                    stall.clear()
                     if line is None or line.startswith("ERR"):
                         break
                     if line.startswith("DONE"):
@@ -719,7 +767,7 @@ class Vision:
                                          stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                          stderr=self.log or subprocess.DEVNULL, text=True, encoding="utf-8",
                                          bufsize=1, env=self.env)
-            line = self.proc.stdout.readline()
+            line = readline_within(self.proc, env_seconds("STRATA_VISION_START_S", 600), "the vision encoder did not start")
             if not line.startswith("READY"):
                 raise RuntimeError("the vision encoder did not start: " + line.strip())
         except Exception:
@@ -821,7 +869,13 @@ class Vision:
             img.write_bytes(data)
             self.proc.stdin.write(f"ENC {img} {out}\n")
             self.proc.stdin.flush()
-            line = self.proc.stdout.readline().strip()
+            try:   # (an encoder that never answers - a GPU hang - is ended and started again by the next picture)
+                line = readline_within(self.proc, env_seconds("STRATA_VISION_ENCODE_S", 120),
+                                       "the vision encoder did not answer").strip()
+            except TimeoutError as e:
+                img.unlink(missing_ok=True)
+                self._stop()
+                raise ValueError(f"the image could not be read: {e} (STRATA_VISION_ENCODE_S raises it)") from None
             img.unlink(missing_ok=True)
             if not line.startswith("OK"):
                 raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
@@ -1248,8 +1302,7 @@ class Service:
         return reload
 
     def _restart_with(self, n: int):
-        if hasattr(self.engine, "set_context"):
-            self.engine.stop()
+        if hasattr(self.engine, "set_context"):     # (restart() ends the running engine with QUIT first)
             self.engine.set_context(n)
             self.engine.restart()
         else:                                            # the mock engine: nothing to start
@@ -2289,6 +2342,10 @@ def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
         answer_started = False                              # a malformed request's 400 only replaces an answer not begun
+        # TCP_NODELAY on every connection: a stream's small SSE pieces (one token each) leave as they are written - with
+        # Nagle's algorithm on, a piece waited for the client's ACK of the one before, up to 40 ms (the delayed ACK)
+        # on a slow link (Maya #626's idea); the whole answers are one write, nothing changes for them
+        disable_nagle_algorithm = True
 
         def log_message(self, fmt, *args):
             pass
@@ -2346,12 +2403,16 @@ def make_handler(svc: Service):
             self.end_headers()
             self.wfile.write(body)
 
-        def _authorized(self) -> bool:
+        def _key_given(self) -> bool:
+            """The configured API key is in this request (Bearer or x-api-key), or none is configured."""
             if not svc.api_key:
                 return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
-            if given and any(hmac.compare_digest(given.encode(), k.encode()) for k in key_list(svc.api_key)):
+            return bool(given) and any(hmac.compare_digest(given.encode(), k.encode()) for k in key_list(svc.api_key))
+
+        def _authorized(self) -> bool:
+            if self._key_given():
                 return True
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
@@ -2454,6 +2515,10 @@ def make_handler(svc: Service):
                         s["tokens_per_s_mean"] = round(svc._tok_s_mean(), 1)
                 for k in ("started", "first_token"):
                     s.pop(k, None)
+                if not self._key_given():
+                    # a health probe without the key still learns busy / queued; the rest - the tail of the text
+                    # being generated, the prompt's size, the tool being called - stays behind the key
+                    s = {k: s[k] for k in ("busy", "queued") if k in s}
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
@@ -2803,16 +2868,42 @@ class Server(ThreadingHTTPServer):
 
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_SHUTDOWN_WAIT_S")
+# ... read by this server at the moment they matter (the thinking budget's floor, the shutdown's waits): the config's
+# values reach it the same way (MANUAL lists STRATA_GLM_THINK_RESERVE as a config setting; they went to the engine only)
+SERVER_ENV_LATE = ("STRATA_GLM_THINK_RESERVE", "STRATA_ENGINE_WRAP_S", "STRATA_ENGINE_QUIT_S")
+# every one of them is a number: a value that is not one is dropped here, with a line, instead of a float() / int() at
+# shutdown or in a request (`STRATA_ENGINE_QUIT_S=50s` ended the server with a traceback)
+SERVER_ENV_INT = ("STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_GLM_THINK_RESERVE")
+
+
+def clean_server_env() -> list[str]:
+    """Drops the server's own STRATA_* settings whose value is not a number (an int where one is read as int), so the
+    default applies; returns what was dropped, for the log."""
+    bad = []
+    for k in SERVER_ENV + SERVER_ENV_LATE:
+        v = os.environ.get(k)
+        if v is None or v.strip() == "":
+            continue
+        try:
+            n = float(v)
+            if k in SERVER_ENV_INT:
+                os.environ[k] = str(int(n))
+        except ValueError:
+            bad.append(f"{k}={v!r}")
+            del os.environ[k]
+    return bad
 
 
 def apply_server_env(cfg: dict) -> None:
     """The config's "env" entries this server reads itself (`--env` puts every setting there; the rest go to the
     engine): in effect before it starts."""
     global ENGINE_STALL_S
-    for k in SERVER_ENV:
+    for k in SERVER_ENV + SERVER_ENV_LATE:
         v = (cfg.get("env") or {}).get(k)
         if v is not None:
             os.environ[k] = str(v)
+    for what in clean_server_env():
+        print(f"[maya] {what} is not a number: ignored (the default applies)", flush=True)
     ENGINE_STALL_S = _stall_seconds()
     Server.request_queue_size = _backlog()
 

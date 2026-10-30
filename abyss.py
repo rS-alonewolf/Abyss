@@ -80,7 +80,12 @@ VEXE = VBUILD / "bin" / ("strata-vision.exe" if WIN else "strata-vision")  # the
 VSTAMP = VBUILD / "MAYA-BUILD.json"
 MIN_CC = 70                                        # Volta (V100) and newer (the GLM path; see arch_setting)
 MAX_GPUS = 16                                      # the layer split's parts at most (glm_model.hpp, kMaxParts)
-HIP_ARCHS = ("gfx1100", "gfx1201", "gfx1151")        # Maya also supports Strix Halo (unified memory)
+# every HIP build targets the validated Radeons: RX 7900 (gfx1100), RX 9070 / AI PRO R9700 (gfx1201), Strix Halo (gfx1151)
+HIP_BUILD_ARCHS = ("gfx1100", "gfx1201", "gfx1151")
+# ... and setup accepts their siblings, which run the same kernels (cmake/hip_backend.cmake: community / unvalidated),
+# adding the one it finds to the build: RX 7800 XT / 7700 XT (gfx1101), RX 7600 (gfx1102), Radeon 890M (gfx1150),
+# RX 9060 (gfx1200)
+HIP_ARCHS = HIP_BUILD_ARCHS + ("gfx1101", "gfx1102", "gfx1150", "gfx1200")
 PY_PACKAGES = list(S.PY_PACKAGES)                  # (pillow: pictures in formats other than JPEG/PNG/BMP/GIF)
 CONTEXTS = [8192, 32768, 65536, 131072]
 DEFAULT_CONTEXT = 32768
@@ -615,7 +620,9 @@ def check_hip_pc(a, installed=False) -> dict:
         say(f"    {gpu_label(g)} - " + ("can be used" if g in usable else "not supported by Maya's HIP build"))
     if not usable:
         fail("no supported AMD GPU found", "this port targets RX 7900 XT / XTX (gfx1100), RX 9070 / AI PRO R9700 "
-             "(gfx1201), and Strix Halo / Gorgon Halo, Radeon 8050S / 8060S / 8065S (gfx1151)")
+             "(gfx1201), and Strix Halo / Gorgon Halo, Radeon 8050S / 8060S / 8065S (gfx1151); their siblings RX 7800 "
+             "XT / 7700 XT (gfx1101), RX 7600 (gfx1102), Radeon 890M (gfx1150) and RX 9060 (gfx1200) build too "
+             "(not validated here - please report)")
     if WIN and hipinfo and all(g.get("source") == "registry" for g in found):
         warn(f"ROCm's hipInfo sees no AMD GPU (the list above is Windows'): the engine cannot start until it does - "
              f"update AMD's driver (AMD Software: Adrenalin Edition, https://www.amd.com/en/support), restart, and "
@@ -698,7 +705,8 @@ def check_hip_pc(a, installed=False) -> dict:
     elif any(hip_unified_memory(g) for g in chosen):
         ok("APU / unified memory: the engine sizes the GPU expert pool from available system RAM")
     select_build_backend("hip")
-    return {"backend": "hip", "gpus": chosen, "archs": list(HIP_ARCHS), "rocm": str(root),
+    archs = list(HIP_BUILD_ARCHS) + sorted({g["arch"] for g in chosen} - set(HIP_BUILD_ARCHS))
+    return {"backend": "hip", "gpus": chosen, "archs": archs, "rocm": str(root),
             **({"rocm_bin": str(bindir)} if WIN else {})}
 
 
@@ -1912,48 +1920,110 @@ def keep_args(old: list, new: list, flags: tuple) -> list:
 CAL_STORE = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "project-maya" / "calibration.json"
 
 
+def gpu_link_driver(cfg: dict, found: dict) -> tuple[str, str]:
+    """("Gen4 x16", "580.65.06") for the config's GPUs: the PCIe link each card and its slot can do together, and the
+    driver.  NVIDIA: nvidia-smi's maximum link (the current one trains down to Gen1 when the card is idle, so it is no
+    key); AMD: the narrowest maximum on the way from the card to its root port (sysfs), the amdgpu module's version.
+    "?" where there is no card or no tool - the key then says so, and two "?" match each other."""
+    sel = list(cfg.get("gpu") or [])
+    links, drivers = [], []
+    if cfg.get("backend") == "hip":
+        for pci in cfg.get("gpu_pci") or []:
+            chain = pcie_chain(pci) if not WIN else []
+            links.append(f"Gen{min(c[2] for c in chain)} x{min(c[3] for c in chain)}" if chain else "?")
+        try:
+            drivers.append(Path("/sys/module/amdgpu/version").read_text().strip() or "in-tree")
+        except OSError:
+            drivers.append("?")
+    else:
+        got = nvidia_links(sel) if sel and shutil.which("nvidia-smi") else {}
+        for i in sel:
+            chain = got.get(i)
+            links.append(f"Gen{chain[0][2]} x{chain[0][3]}" if chain else "?")
+            drivers.append((found.get(i) or {}).get("driver") or "?")
+    return " + ".join(links) or "?", " + ".join(sorted(set(drivers))) or "?"
+
+
 def hardware_key(cfg: dict) -> str:
     """What a calibration is valid for: these GPUs, this CPU and RAM, the model (its quant), the context, text or
-    images (the context's KV cache and the image encoder take VRAM from the expert pool)."""
+    images (the context's KV cache and the image encoder take VRAM from the expert pool), and - last, so the nearest-
+    context search below still compares the rest - the GPUs' PCIe link and driver: a card moved between an x16 slot
+    and an OCuLink x4, or a driver update, changes what the tuning measured (Maya #419's idea), and the old result was
+    reused as if nothing had changed."""
     found = {g["index"]: g for g in S.gpus() or []}
     sel = [found.get(i) or {} for i in cfg.get("gpu") or []]
     a = cfg.get("args") or []
     ctx = a[a.index("--max-context") + 1] if "--max-context" in a[:-1] else "?"
     quant = (cfg.get("installer") or {}).get("quant") or cfg.get("model_name", "?")
+    link, driver = gpu_link_driver(cfg, found)
     return "|".join([" + ".join(g.get("name", "?") for g in sel) or "?",
                      f"{sum(g.get('vram_gb', 0) for g in sel):.0f}GB", S.cpu_info()[0], f"{S.ram_gb():.0f}GB", quant,
-                     str(ctx), "images" if cfg.get("vision") else "text"])
+                     str(ctx), "images" if cfg.get("vision") else "text", link, driver])
+
+
+KEY_FIELDS = 9                 # the fields of hardware_key; a key with fewer was written before the link and driver
 
 
 def load_calibrations() -> dict:
     try:
-        return json.loads(CAL_STORE.read_text(encoding="utf-8"))
+        store = json.loads(CAL_STORE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    return store if isinstance(store, dict) else {}
+
+
+_STALE_SAID: set = set()
+
+
+def stale_calibration_note(store: dict, key: str) -> str | None:
+    """One line when the store holds a tuning for this PC and model that is not used because the GPUs' PCIe link or
+    driver has changed since (or the entry predates the link and driver in the key); None when there is none.  Said
+    once per key."""
+    want = key.split("|")
+    for k, v in store.items():
+        have = k.split("|")
+        if not isinstance(v, dict) or have[:5] != want[:5] or have[6:7] != want[6:7] or have[7:] == want[7:]:
+            continue
+        when = f" ({v['date']})" if v.get("date") else ""
+        if len(have) < KEY_FIELDS:
+            was = "before the GPU's PCIe link and driver were part of the record"
+        else:
+            was = f"on {have[7]}, driver {have[8]} - now {want[7]}, driver {want[8]}"
+        note = (f"the tuning saved for this PC and model{when} was measured {was}: it is not used, "
+                f"{ME} --calibrate measures again")
+        if key not in _STALE_SAID:
+            _STALE_SAID.add(key)
+            warn(note)
+        return note
+    return None
 
 
 def saved_calibration(cfg: dict, any_context=False) -> dict | None:
     """The settings an earlier tuning found for this PC, model and context, if any (CUDA only, as the tuning).
     any_context: else the ones tuned at the nearest other context, with that context in "context" - the CPU lane's
     split depends on the PC far more than on the context, and a setup for another context used to drop them (#57: the
-    engine's own settings, half the speed on a two-socket DDR3 PC)."""
+    engine's own settings, half the speed on a two-socket DDR3 PC).  A tuning made on another PCIe link or driver (or
+    before they were recorded) is stale: not used, said once (stale_calibration_note)."""
     if cfg.get("backend") == "hip":
         return None
     store, key = load_calibrations(), hardware_key(cfg)
-    if key in store or not any_context:
-        return store.get(key)
+    if key in store:
+        return store[key]
     want = key.split("|")
     best, best_d = None, None
-    for k, v in store.items():
-        have = k.split("|")
-        if len(have) != len(want) or have[:5] != want[:5] or have[6:] != want[6:]:
-            continue
-        try:
-            d = abs(math.log(int(have[5]) / int(want[5])))
-        except (ValueError, ZeroDivisionError):
-            continue
-        if isinstance(v, dict) and (best_d is None or d < best_d):
-            best, best_d = dict(v, context=int(have[5])), d
+    if any_context:
+        for k, v in store.items():
+            have = k.split("|")
+            if len(have) != len(want) or have[:5] != want[:5] or have[6:] != want[6:]:
+                continue
+            try:
+                d = abs(math.log(int(have[5]) / int(want[5])))
+            except (ValueError, ZeroDivisionError):
+                continue
+            if isinstance(v, dict) and (best_d is None or d < best_d):
+                best, best_d = dict(v, context=int(have[5])), d
+    if best is None and any_context:               # (the setup's lookup: nothing usable at any context)
+        stale_calibration_note(store, key)
     return best
 
 

@@ -14,8 +14,9 @@ iGPU が計算します（iGPU レーン）。
 | RX 7900 XT / XTX | gfx1100 | エンジン | コミュニティのビルド（[issue #4](https://github.com/zephel01/Abyss/issues/4)、Windows） |
 | Ryzen AI Max の Radeon 8050S / 8060S | gfx1151 | エンジン（単体）、または iGPU レーン | 8060S で測定 |
 
-- エンジンのビルド対象は gfx1100、gfx1201、gfx1151 です。ほかの Radeon（RDNA2 以前、gfx1200 の RX 9060 など）は
-  対象外です。
+- エンジンのビルド対象は gfx1100、gfx1201、gfx1151 です。同じ世代の RX 7800 XT / 7700 XT（gfx1101）、RX 7600（gfx1102）、
+  Radeon 890M（gfx1150）、RX 9060（gfx1200）は同じカーネルで動き、見つかればセットアップがビルドに加えます（v1.3.78、
+  実機未確認 - 報告をお願いします）。RDNA2 以前は対象外です。
 - iGPU レーンは gfx1103 / gfx1150〜1153 の内蔵 GPU で動きます。
 - NVIDIA と AMD を 1 つのプロセスで使うこと（CUDA と HIP の混在）には対応していません。NVIDIA の GPU がある PC
   では、CUDA 版が Radeon の iGPU をレーンに使います（[MANUAL の「iGPU レーン」](../MANUAL.ja.md)）。

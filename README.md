@@ -87,7 +87,7 @@ the APU's iGPU as a lane).
 | | DeepSeek's DSpark drafter for it, bleysg's [GGUF](https://huggingface.co/bleysg/DeepSeek-V4-Flash-DSpark-drafter-GGUF) (`--dspark`, v1.3.43) | 6.9 GB | measured on an AI PRO R9700 (swe-bench +28%); NVIDIA: builds, not measured |
 | DeepSeek V4.1 Flash 1017 | unsloth [UD-IQ2_XXS](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), re-uploaded 2026-10-28 (the pick for quality) | 300 GB | measured on an AI PRO R9700: KL 0.141 (old file 0.188), swe-bench 8 tasks 33.9 tok/s on 32 GB + 96 GB, 29.5 on 32 GB + 64 GB ([which file](docs/deepseek41/README.md#ggufs-that-load)) |
 | | unsloth [UD-IQ1_M](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), re-uploaded 2026-10-28 (the pick for speed) | 250 GB | measured the same way: KL 0.199 (old 0.270), **40.6 tok/s** on 32 GB + 96 GB, 30.5 on 32 GB + 64 GB |
-| | nazeshinjite [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) | 366 GB | measured, swe-bench 34 of the first 35 |
+| | nazeshinjite [Q2](https://huggingface.co/nazeshinjite/DeepSeek-V4.1-Flash-1017-ds4-GGUF) | 366 GB | measured, swe-bench 34 of 35 (a partial run, v1.3.31: the first 35 of 60 tasks; the full run is still owed) |
 | | unsloth [UD-IQ1_S](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (re-uploaded 2026-10-28) | 233 GB | measured: runs, not recommended (KL 0.257; old file 0.36) |
 | | mrfakename Q2_K; Lucebox dense + Engram with mrfakename's experts (a hybrid) | 247 / 201 GB | runs: low quality alone / the most accurate, slow |
 | | unsloth's other quants, Project Maya's Maya-S | 178-508 GB | same layout as UD-IQ1_S, untested |
@@ -179,7 +179,7 @@ Same machine, nazeshinjite's [Q2 GGUF](https://huggingface.co/nazeshinjite/DeepS
 | --- | :---: | :---: |
 | Disk tail skip (`STRATA_GLM_TAIL_SKIP=3` + `_DISK=1`) | ~28 tok/s (35.9 ms a token, 8 held-out texts) | 0.241, 78.9% |
 | Exact routing | 17.7 tok/s | 0.229, 79.2% |
-| swe-bench, first 35 of 60 tasks x 5 (tail skip) | 51.6 tok/s end to end, 34 of 35 resolved | (DeepSeek V4 Flash: 107.2 tok/s, 35 of 35) |
+| swe-bench, a partial run (v1.3.31: the first 35 of 60 tasks x 5, tail skip; the full 60 still owed) | 51.6 tok/s end to end, 34 of 35 resolved | (DeepSeek V4 Flash: 107.2 tok/s, 35 of 35) |
 
 Speed follows the experts read from the SSD a token: answers that read almost none run at 65–75 tok/s. The 60-task
 run broke at task 35 on the 16K bug fixed in v1.3.32 and is being re-run. Details:
@@ -333,8 +333,9 @@ kernels match the FP32 ones to ~2e-6, and speculative decoding gives the token p
 - [x] DeepSeek's DSpark drafter for V4 Flash 0731 (v1.3.43, opt-in; measured on an AI PRO R9700, not yet on NVIDIA)
 - [ ] Conversation slots on disk
 - [ ] Windows for DeepSeek V4 (Linux tested; community builds on an RX 7900 XT, see [AMD HIP](docs/maya/AMD_HIP.md))
-- [ ] DeepSeek V4.1: speculative decoding (its MTP / DSpark drafter), a batched prompt attention, a layer split,
-  the one-command setup, fewer SSD reads (eviction policy, the lane computing disk-landed experts)
+- [x] DeepSeek V4.1: speculative decoding (the DSpark drafter, v1.3.53, opt-in) and a batched prompt attention (v1.3.60)
+- [ ] DeepSeek V4.1: its own MTP layers as the drafter (no GGUF carries them), a layer split, the one-command setup,
+  fewer SSD reads (eviction policy, the lane computing disk-landed experts)
 - [ ] Speed with several cards: a split's prompts (30% behind one RTX 5090 here); a run on a V100; discrete Radeon cards
 - [ ] Prompt-path tuning at short lengths (staging RAM-tier experts still dominates an 8K prompt)
 

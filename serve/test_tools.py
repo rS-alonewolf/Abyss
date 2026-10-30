@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import unittest
 import urllib.request
 from pathlib import Path
@@ -404,6 +405,143 @@ class ForcedToolCalls(unittest.TestCase):
         self.post("/v1/chat/completions", {"model": "m", "tools": tools, "tool_choice": "auto",
                                            "messages": [{"role": "user", "content": "hi"}]})
         self.assertFalse(tok.decode(engine.last_prompt).rstrip().endswith("<tool_call>"))
+
+
+DSML_LONG = ("<\uff5cDSML\uff5c calls>\n<\uff5cDSML\uff5c invoke name=\"bash\">\n"
+             "<\uff5cDSML\uff5c parameter name=\"command\" string=\"true\">%s</\uff5cDSML\uff5c parameter>\n"
+             "</\uff5cDSML\uff5c invoke>\n</\uff5cDSML\uff5c calls>")
+QWEN_LONG = "<tool_call>\n<function=bash>\n<parameter=command>\n%s\n</parameter>\n</function>\n</tool_call>"
+GLM_LONG = "<tool_call>bash<arg_key>command</arg_key><arg_value>%s</arg_value></tool_call>"
+QWEN_RAW_LONG = "<tool_call>\n<function=get_weather>\n<parameter=where>\n%s\n</parameter>\n</function>\n</tool_call>"
+
+
+def merged(events) -> list:
+    """Events with neighbouring pieces of the same text kind joined and call ids dropped: what a client sees, however
+    the text was cut into pieces."""
+    out = []
+    for e in events:
+        call = None if e.call is None else (e.call.name, json.dumps(e.call.arguments, sort_keys=True))
+        if out and out[-1][0] == e.kind and e.kind in ("reasoning", "content", "tool_args") and out[-1][2] == call:
+            out[-1] = (e.kind, out[-1][1] + e.text, call)
+        else:
+            out.append((e.kind, e.text, call))
+    return out
+
+
+def fed(text: str, pieces, stream_tools=True, think_token=False) -> tuple:
+    """(merged events, the parser) for `text` fed in `pieces` (an int: that many characters at a time; a list of
+    cut offsets)."""
+    p = OutputParser(thinking=True, tools=TOOLS, stream_tools=stream_tools, think_token=think_token)
+    cuts = list(range(0, len(text), pieces)) if isinstance(pieces, int) else [0] + list(pieces)
+    out = []
+    for a, b in zip(cuts, cuts[1:] + [len(text)]):
+        out += p.feed(text[a:b])
+    return merged(out + p.finish()), p
+
+
+class LongStreamedArguments(unittest.TestCase):
+    """A long tool argument (an agent's Write of a whole file) streamed in small pieces: the same events as the text
+    fed whole, in time that grows with the length, not with the length times the pieces (each piece used to search
+    the whole call from its start for the end tag - Maya #626's finding)."""
+
+    FORMS = {"qwen": QWEN_LONG, "glm": GLM_LONG, "dsml": DSML_LONG, "qwen-raw": QWEN_RAW_LONG}
+
+    def long_text(self, form) -> str:
+        if form == "qwen-raw":
+            value = "[" + ", ".join(str(i) for i in range(40000)) + "]"            # a 200 KB array (a non-string value)
+        else:
+            value = ("def f(x):\n    return x * 2  # a line of a file being written\n" * 4000)
+        return "Writing the file.</think>\n\n" + self.FORMS[form] % value[:200_000] + "\nDone."
+
+    def test_same_events_as_whole_and_linear_work(self):
+        for form in self.FORMS:
+            for stream_tools in (True, False):
+                text = self.long_text(form)
+                whole, _ = fed(text, len(text), stream_tools)
+                for step in (8, 64):
+                    with self.subTest(form=form, stream_tools=stream_tools, step=step):
+                        t0 = time.perf_counter()
+                        got, p = fed(text, step, stream_tools)
+                        took = time.perf_counter() - t0
+                        self.assertEqual(got, whole)
+                        self.assertEqual([k for k, _, _ in got if k == "tool_call"], ["tool_call"])
+                        if stream_tools and form != "dsml":          # (a DSML block is reported once it is whole)
+                            streamed = "".join(t for k, t, _ in got if k == "tool_args")
+                            final = next(c for k, _, c in got if k == "tool_call")
+                            self.assertEqual(json.loads(streamed), json.loads(final[1]))
+                        # the characters looked at: each piece plus the overlap a split tag needs (11-15 characters), by
+                        # the end-tag search and the streamed value's - about 2 x (step + overlap) / step x the length
+                        self.assertLess(p.scanned, len(text) * (2 * (step + 16) / step + 1), (form, step, p.scanned))
+                        self.assertLess(took, 5.0, (form, step, took))   # (the old search: ~1 s at step 8, growing n^2)
+
+    def test_quadratic_growth_is_gone(self):
+        text = self.long_text("qwen")
+        half = text[:len(text) // 2]
+        _, p_half = fed(half, 8)
+        _, p_full = fed(text, 8)
+        self.assertLess(p_full.scanned, 2.5 * p_half.scanned)      # twice the text: about twice the work
+
+
+class SplitMarkers(unittest.TestCase):
+    """Every tag the parser knows cut at every offset between two pieces (and three): the events of the whole text,
+    in every form (GLM, Qwen, DSML V4 and V4.1, a quoted call, an unterminated one, a think token)."""
+
+    TEXTS = {
+        "glm": "Checking.</think>\n\nNow.\n\n" + GLM + "\nAfter.",
+        "qwen": "Checking.</think>\n\n" + QWEN,
+        "dsml-v4": "Checking.</think>\n\n" + DSML_V4,
+        "dsml-v41": "Checking.</think>\n\n" + DSML_V41 + "\nAfter.",
+        "two-calls": "T</think>" + GLM + "\n<tool_call>bash<arg_key>command</arg_key><arg_value>date</arg_value></tool_call>",
+        "quoted": "T</think>Write `" + GLM + "` to run it, or:\n```\n" + QWEN + "\n```\nThat is all.",
+        "unterminated-qwen": "T</think>" + QWEN[:QWEN.index("</parameter>") + 5],
+        "unterminated-glm": "T</think>" + GLM[:GLM.index("</arg_value>") + 7],
+        "unterminated-dsml": "T</think>" + DSML_V41[:60],
+        "no-call": "T</think>a plain answer with a < sign and `code` in it\n",
+        "glm-newlines": "T</think><tool_call>bash<arg_key>command</arg_key><arg_value>\nls -la\n</arg_value></tool_call>",
+    }
+
+    def test_every_offset(self):
+        for name, text in self.TEXTS.items():
+            for stream_tools in (True, False):
+                whole, _ = fed(text, len(text), stream_tools)
+                for cut in range(1, len(text)):
+                    got, _ = fed(text, [cut], stream_tools)
+                    self.assertEqual(got, whole, (name, stream_tools, cut))
+                for step in (1, 2, 3, 5, 7, 11, 13):
+                    got, _ = fed(text, step, stream_tools)
+                    self.assertEqual(got, whole, (name, stream_tools, step))
+
+    def test_three_pieces_around_the_end_tags(self):
+        for name, text in self.TEXTS.items():
+            whole, _ = fed(text, len(text))
+            for tag in ("</tool_call>", "</arg_value>", "</parameter>", "</\uff5cDSML\uff5c calls>", "</think>"):
+                at = text.find(tag)
+                if at < 0:
+                    continue
+                for a in range(max(1, at - 2), at + len(tag)):
+                    for b in range(a + 1, min(len(text), at + len(tag) + 2)):
+                        got, _ = fed(text, [a, b])
+                        self.assertEqual(got, whole, (name, tag, a, b))
+
+    def test_think_token(self):
+        text = "It writes `</think>` itself. Done.</think>\n\n" + GLM
+        p = OutputParser(thinking=True, tools=TOOLS, stream_tools=True, think_token=True)
+        end = text.index("Done.</think>") + len("Done.</think>")
+        out = p.feed(text[:end - 8]) + p.feed(text[end - 8:end], think_end=True)
+        for i in range(end, len(text), 3):
+            out += p.feed(text[i:i + 3])
+        out += p.finish()
+        got = merged(out)
+        self.assertEqual(got[0], ("reasoning", "It writes `</think>` itself. Done.", None))
+        self.assertEqual([k for k, _, _ in got if k == "tool_call"], ["tool_call"])
+
+
+class StreamSockets(unittest.TestCase):
+    def test_no_nagle_on_the_server_connections(self):
+        from serve.server import make_handler
+        handler = make_handler(Service(MockEngine(ByteTokenizer(), "", max_context=512), ByteTokenizer(),
+                                       ChatTemplate(ROOT / "serve/chat_template.jinja")))
+        self.assertTrue(handler.disable_nagle_algorithm)     # (socketserver sets TCP_NODELAY on each connection)
 
 
 if __name__ == "__main__":

@@ -180,9 +180,10 @@ As `./setup-deepseek.sh` writes it (an AMD GPU, the DSpark drafter on):
 | `allow_shutdown` | `false`: `POST /api/shutdown` (stopping the server and engine from another program, e.g. when the engine runs away) is refused. Default on: allowed with the `api_key`, or from this PC when there is no key. Over Tailscale, set an `api_key` ([MANUAL](MANUAL.md#using-it)) | `false` |
 | `fit_max_tokens` | `true`: a `max_tokens` beyond the context left is shortened instead of refused with a 400 | `true` |
 | `mcp_servers` | MCP servers the Chat page can use (Claude Desktop's format) | `{"name": {...}}` |
+| `installer` | what setup chose (the model and quant, for the Monitor's label); setup writes it, nothing reads it to decide | `{"quant": "UD-IQ2_XXS"}` |
 
 **Images (GLM-5.3-Flash only)**: `vision` holds the image encoder's settings (`exe`, `mmproj`, `model`, `gpu`,
-`resident`, `max_tokens`, `no_flash_attn`). `./abyss.sh` writes it; it is normally left alone.
+`resident`, `threads`, `max_tokens`, `no_flash_attn`). `./abyss.sh` writes it; it is normally left alone.
 
 Unknown keys are ignored. A bad value in `sampling`, though, stops the server from starting (so a typo cannot quietly
 change how it answers).
@@ -205,6 +206,6 @@ These change part of the config file; the other keys stay as they are.
 | --- | --- | --- |
 | `Abyss/<config name>.shared-settings.json` | the defaults chosen on the Chat page that other apps get too (`POST /settings`: temperature, the uncensoring switch, ...) | change them on the page; deleting the file restores the defaults |
 | `Abyss/.abyss-gpu-tune-<GPU number>.json`, `Abyss/abyss-gpu-tune.txt` | `--gpu-tune`'s measurements and the report for an issue | no |
-| `~/.config/project-maya/calibration.json` | `--calibrate`'s results (per PC, model and context) | no |
+| `~/.config/project-maya/calibration.json` | `--calibrate`'s results (per PC, model, context, and the GPU's PCIe link and driver: a card moved to another slot or a driver update leaves the old result unused, with one line saying so) | no |
 | `Abyss-tools/logs/last-model` | the model `abyss.sh start` started last | no |
 | `Abyss-tools/abyss.sh`, `common.sh` | the start / stop tools; setup brings them up to date (the old ones kept as `.bak`) | no |

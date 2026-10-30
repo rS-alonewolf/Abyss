@@ -57,6 +57,87 @@ another's - and closing it leaves the model serving ([MANUAL](docs/MANUAL.md#aby
   `tiers.history` carries every numeric STAT key (keys a newer engine adds get their series).
 - A value that cannot be read is `null` (shown as `--`), never 0.
 
+## v1.3.79 - 2026-10-30
+
+**Two items of the 2026-10-30 Strata/Maya review (no GPU needed; the ideas are Maya #626 and #419, the code is
+Abyss's own).** Host-side changes only (the server's parser and the setup's calibration store); the engine is the
+same as v1.3.78. Not yet seen on hardware: the PCIe link as an RTX 5090 on OCuLink reports it (this weekend).
+
+- Streamed tool calls: a call's body was one growing string and every new piece searched it from the start for the
+  end tag (and the streamed value's end), so an agent's Write of a 200 KB file cost about a second of CPU at 8
+  characters a piece, growing with the square of the length. The body is kept as pieces, the end tag is looked for
+  in the new piece plus the tail a tag split across pieces needs, and the streaming scanner consumes what it has
+  reported: 20-100x faster on the 200 KB case, the events byte for byte the same (checked against the old parser on
+  7,680 chunkings of 24 texts in every form - GLM, Qwen, DSML V4 and V4.1, quoted and unterminated calls).
+- The server's connections set `TCP_NODELAY`: a stream's one-token SSE pieces no longer wait for the delayed ACK of the
+  piece before (up to 40 ms each on a slow link).
+- `--calibrate`'s store (`~/.config/project-maya/calibration.json`) keys its results by the GPU's PCIe link (what the
+  card and its slot can do together) and the driver version too: a card moved between an x16 slot and an OCuLink x4,
+  or a driver update, used to reuse the tuning measured on the other. An older store is read and its entries are
+  stale: not used, and the setup says once, in one line, what the saved tuning was measured on, what it is now, and
+  that `./abyss.sh --calibrate` measures again. The nearest-context lookup still works on the same slot and driver.
+
+## v1.3.78 - 2026-10-30
+
+**Bug-fix pack (the 2026-10-30 review's week-1 items, no GPU needed): a prompt-path out-of-range read, the server's
+engine stop paths, waits with limits, the SSD mirror's copy check, bounds on the memory knobs, and the docs' stale
+"not yet" lines.** Checked on the AI PRO R9700 (HIP): `./abyss.sh --bench` matches the known-good runs
+(DeepSeek V4.1 UD-IQ2_XXS KL 0.0036, Ornith-1.5-122B UD-Q4_K_XL 0.0058; GLM-5.3-Flash Maya-S-v2 0.0316, the same
+"slightly off" as v1.3.69's 0.0337) at the usual speeds; a 32,768-token V4.1 prompt (583 tok/s) with the mirror on a
+second SSD (43.7% of the reads from it, decode 22.3 tok/s); Qwen3.8 on the CLI with `--max-context 512` stops with
+"the sequence exceeds max_ctx" at the end, no out-of-range write. Not checked here: the RTX 5090 (CUDA) and the RDNA
+sibling chips (no card).
+
+- Prompt path: the MMQ row-id table (`iota`) is allocated and filled 512 entries past `T * n_exp_used`. `mul_mat_q`
+  loads a whole tile of ids before it checks the row bounds, so the last tile read past the table - a long prompt's
+  (or a split's) "illegal memory access", an out-of-range read under compute-sanitizer (Maya #645's `IDS_PAD`, the same idea).
+- Qwen3.5 / Qwen3.8 drafters: the chain of draft steps stops where the context ends (`draft_kmax`); it wrote KV rows
+  past `--max-context` when the context was nearly full (the server's margin of 8 hid it, the CLI had none). DSpark
+  keeps its rows in a ring and was not affected.
+- DeepSeek V4.1 Engram: a failed background row read fails its own token (the step ends with the error) and is then
+  forgotten; before, the flag stayed set and every later V4.1 request failed with it, after one transient EIO.
+- `STRATA_GLM_MIRROR`: a copy is accepted after its size, first and last MiB **and 32 blocks of 256 KiB spread over
+  the file** match (~10 MiB a shard; a copy that stopped part way, or a file only fallocated to the size, passed the old
+  head/tail check and `read_slice` then returned other bytes). A read interrupted by a signal is done again instead of
+  turning the mirror off for the run. Reads that leave the O_DIRECT path are counted and reported with the mirror's
+  timing line. The file layer is `src/core/shard_io.cpp` now, with a host-only test (`tools/test_shard_io.py`).
+- Numbers from the environment: `env_num` (include/strata/core/knobs.hpp) reads them - a value that is not a number
+  (`1,0`, `50s`) gives the default and a line, one outside its range is clamped and said. `STRATA_GLM_RAM_FRAC` is held
+  to 0.05..0.95 on a discrete card (1.0 lifted the cap: the thrash case); `STRATA_GLM_RESERVE_MB` / `POOL_GB` / `VRAM_GB`
+  cannot go negative; `STRATA_DS41_ENGRAM_THREADS` is bounded at 64, `_CACHE_MB` at 64 GB; `STRATA_WATCHDOG_S` with a
+  typo keeps its default instead of turning the watchdog off; `STRATA_GLM_RAM_HEADROOM_GB` has one default in one place
+  (6 GB, 16 with unified memory; the two sizing sites had their own).
+- Server (`serve/server.py`): `StrataEngine.stop` was defined twice and the later one (STOP the request) hid the first
+  (QUIT, kill, wait for the GPU memory), so a context change from the dashboard killed the engine outright and a
+  conversation kept with `STRATA_GLM_SLOT_KEEP` was lost; a restart now asks QUIT first (up to `STRATA_ENGINE_QUIT_S`).
+  Waits have limits with a line that says which: the start's READY (`STRATA_ENGINE_START_S`, 30 min), a stopped
+  request's drain to DONE (`STRATA_ENGINE_DRAIN_S`, 120 s of silence; the stall watchdog applies there too), the image
+  encoder's start and each picture (`STRATA_VISION_START_S` / `_ENCODE_S`, 600 / 120 s). The config's `"env"`
+  `STRATA_GLM_THINK_RESERVE` / `STRATA_ENGINE_WRAP_S` / `STRATA_ENGINE_QUIT_S` reach the server (MANUAL listed
+  THINK_RESERVE as a config setting; they went to the engine only), and every server-side number is checked at start
+  instead of a traceback at shutdown. `GET /status` without the configured API key shows `busy` / `queued` only: the
+  tail of the text being generated, the prompt's size and the tool being called need the key (they went out to anyone
+  on the network with `host: 0.0.0.0`).
+- About > Updates: a zip install (no git origin) looked at Project Maya's releases; the fallback is zephel01/Abyss, as
+  are the watchdog's report line and the setup screen's link.
+- AMD: the RDNA sibling chips - RX 7800 XT / 7700 XT (gfx1101), RX 7600 (gfx1102), Radeon 890M (gfx1150), RX 9060
+  (gfx1200) - take their family's expert kernels (they fell back to the legacy ones, 20-30% slower a call, the same
+  sums; the device guards already named them) and setup builds for the one it finds next to the three validated
+  targets. Not validated on a real card: please report.
+- Tests (CPU only, in CI): the fake-engine tests (`serve/test_engine_process.py`: QUIT on restart, an ignored QUIT, the
+  drain and start limits, a context reload, the vision limit, `/status` with and without the key, the env numbers),
+  `tools/test_shard_io.py`, `tools/test_knobs.py` (the env table, `draft_kmax`), and a docs lint
+  (`tools/test_docs_env.py`): every setting the code reads is in MANUAL / SETTINGS or on `tools/env_undocumented.txt`
+  (237 debug and experimental names today - the list only shrinks), EN and JA name the same settings and config keys,
+  every config key is in SETTINGS.
+- Docs: MANUAL / README / docs/deepseek41 no longer say V4.1 has no speculative decoding (DSpark, v1.3.53) or that its
+  prompt attention runs a token at a time (batched in v1.3.60); the swe-bench "first 35 of 60" rows say they are a
+  partial v1.3.31 run with the full run still owed; the server's settings (`STRATA_ENGINE_STALL_S` / `_WRAP_S` /
+  `_QUIT_S`, `STRATA_HTTP_BACKLOG`, `STRATA_MAX_BODY_MIB`) and the new limits are in MANUAL's table; SETTINGS names
+  `installer` and vision `threads`; docs/amd lists the sibling Radeons.
+- Not done from the review's list (reasons): `tail_skip_disk` before the 90% early return - with the tail skip off
+  there is nothing starved, so a RAM fill default of 0 is right; DSpark's drafter cannot overrun (a ring of 256 rows).
+
 ## v1.3.77 - 2026-10-29
 
 **Two SSDs without a RAID: copy the model's shards to a second NVMe and `STRATA_GLM_MIRROR=<folder>` reads every

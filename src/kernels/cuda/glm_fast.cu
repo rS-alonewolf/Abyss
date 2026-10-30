@@ -4598,10 +4598,16 @@ RdnaArch rdna_expert_arch() {
     if (cached_device != device) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return RdnaArch::none;
+        // the kernels are RDNA3 (gfx11, wave32 + sudot4), RDNA3.5 (gfx115x) and RDNA4 (gfx120x) ones: the sibling
+        // chips of each family run the same code objects (the device guards in intrinsics.hpp / dsv4_fast.cu name
+        // them all), so an RX 7800 XT / 7700 (gfx1101), 7600 (gfx1102), Radeon 890M (gfx1150) and RX 9060 (gfx1200)
+        // take their family's kernels instead of the legacy ones (20-30% slower a call, bit-identical sums).
+        // gfx1103 (the 780M) stays on the legacy kernels: its build is the portable one (cmake/hip_backend.cmake)
         const char* a = prop.gcnArchName;
-        arch = std::strncmp(a, "gfx1100", 7) == 0 ? RdnaArch::gfx1100
-             : std::strncmp(a, "gfx1151", 7) == 0 ? RdnaArch::gfx1151
-             : std::strncmp(a, "gfx1201", 7) == 0 ? RdnaArch::gfx1201 : RdnaArch::none;
+        const auto is = [a](const char* name) { return std::strncmp(a, name, 7) == 0; };
+        arch = is("gfx1100") || is("gfx1101") || is("gfx1102") ? RdnaArch::gfx1100
+             : is("gfx1151") || is("gfx1150") ? RdnaArch::gfx1151
+             : is("gfx1201") || is("gfx1200") ? RdnaArch::gfx1201 : RdnaArch::none;
         cached_device = device;
     }
     return arch;

@@ -434,6 +434,7 @@ public:
     bool dsv41_engram_prompt(int il, int T, float* R, std::string& err);   // row numbers, then each Engram layer's adds
     void dsv41_reset();                                    // a new sequence: the Engram history, the pending pairs
     void dsv41_engram_report() const;                      // STRATA_GLM_TIMING: the Engram rows and the cache's share
+    bool dsv41_engram_ok(std::string& err);                // after a token: the async reader's failure, if any, is this token's
     bool dsv41_head(std::string& err);                     // the collapse with the last sublayer's pre -> head_x / xq
     // ---- the refusal-direction edit (src/core/glm_abl.cu; STRATA_GLM_ABL / --uncensor).  Each is a no-op without an
     // edit, past its layers or at a zero strength.  abl_apply: an ABL1 edit's sites - rows of a layer's attention

@@ -16,6 +16,8 @@
 // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
 // resident experts are excluded, and every other layer's slots are untouched.
 #include "glm_fast_state.hpp"
+#include "shard_io.hpp"
+#include "strata/core/knobs.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
@@ -35,6 +37,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cctype>
+#include <cerrno>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -410,86 +413,35 @@ constexpr int kVramReserveMb = 1536;
 constexpr int kVramReserveMb = 700;
 #endif
 
-// The 2nd SSD (STRATA_GLM_MIRROR, see pack_shard_mmap), best effort: every read goes to the drive that should finish
-// it first - the one with the least in flight for its measured speed (a running average of bytes per microsecond a
-// read, both drives start equal) - so two drives of any speeds add up and a slow or busy one simply takes less.  A
-// shard without a copy reads from its own drive; a failed mirror read is done again there and turns the mirror off.
-// mirror_bytes[0 / 1]: bytes read from the shards' own drive / the mirror (the stats line).
-std::atomic<uint64_t> mirror_bytes[2];
-static std::atomic<bool> mirror_off{false};
-static std::atomic<int> mirror_inflight[2];
-static std::atomic<float> mirror_speed[2] = {1.0f, 1.0f};   // bytes / us, a running average
-static std::atomic<uint32_t> mirror_reads{0};
-static int mirror_pick() {
-    const float c0 = (float) (mirror_inflight[0].load(std::memory_order_relaxed) + 1) / mirror_speed[0].load(),
-                c1 = (float) (mirror_inflight[1].load(std::memory_order_relaxed) + 1) / mirror_speed[1].load();
-    const int best = c1 < c0 ? 1 : 0;
-    // one read in 32 goes to the other drive: a drive that looked slow once (a busy spell, the warm-up) gets measured
-    // again - without it, its stale speed kept it unpicked for the rest of the run (0.0% from the mirror, 2026-10-29)
-    return (mirror_reads.fetch_add(1, std::memory_order_relaxed) & 31) == 31 ? 1 - best : best;
+// RAM left free beside the pinned expert tier (STRATA_GLM_RAM_HEADROOM_GB): 6 GB with a discrete card, 16 on a
+// unified-memory APU, whose pool is that RAM - the one place both tier sizings read it from (the AMD setup writes 16
+// into its configs on purpose)
+inline double ram_headroom_gb(bool unified) {
+    return strata::core::env_num("STRATA_GLM_RAM_HEADROOM_GB", unified ? 16.0 : 6.0, 0.0, 4096.0);
 }
+// the VRAM kept free, from the build's default or STRATA_GLM_RESERVE_MB (never negative: it was cast to size_t)
+inline size_t vram_reserve_bytes(int default_mb) {
+    return (size_t) strata::core::env_num("STRATA_GLM_RESERVE_MB", default_mb, 0.0, 1048576.0) << 20;
+}
+// STRATA_GLM_POOL_GB / STRATA_GLM_VRAM_GB as bytes, or 0 when unset
+inline size_t env_gib(const char* name) {
+    return (size_t) (strata::core::env_num(name, 0.0, 0.0, 65536.0) * 1073741824.0);
+}
+
+// The 2nd SSD (STRATA_GLM_MIRROR, see pack_shard_mmap), the O_DIRECT bounce buffers, the fallbacks and their counters
+// live in shard_io.cpp (host-only, tested by tools/test_shard_io.py).
 
 // [off, off + len) of a shard into dst: O_DIRECT through an aligned per-thread bounce buffer when the shard has a
 // direct fd (no page cache), a buffered pread otherwise, the mapping as the last resort
 void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* dst) {
 #ifndef _WIN32
-    if (sh.fd_direct >= 0) {
-        // freed when its thread ends
-        struct Bounce {
-            uint8_t* p = nullptr;
-            size_t cap = 0;
-            ~Bounce() { std::free(p); }
-        };
-        static thread_local Bounce bb;
-        uint8_t*& bounce = bb.p;
-        size_t& cap = bb.cap;
-        const uint64_t a0 = off & ~(uint64_t) 4095, a1 = (off + len + 4095) & ~(uint64_t) 4095;
-        const size_t need = (size_t) (a1 - a0);
-        if (cap < need) {
-            std::free(bounce);
-            bounce = (uint8_t*) std::aligned_alloc(4096, need);
-            cap = bounce ? need : 0;
-        }
-        if (bounce != nullptr) {
-            const bool two = sh.fd_mirror >= 0 && !mirror_off.load(std::memory_order_relaxed);
-            for (int pass = two && mirror_pick() == 1 ? 0 : 1; pass < 2; ++pass) {
-                const int fdr = pass == 0 ? sh.fd_mirror : sh.fd_direct, d = pass == 0 ? 1 : 0;
-                if (two) mirror_inflight[d].fetch_add(1, std::memory_order_relaxed);
-                const auto t0 = std::chrono::steady_clock::now();
-                size_t got = 0;
-                while (got < need) {
-                    const ssize_t r = pread(fdr, bounce + got, need - got, (off_t) (a0 + got));
-                    if (r <= 0) break;   // EOF: the last aligned read is short where the file ends
-                    got += (size_t) r;
-                }
-                if (two) {
-                    mirror_inflight[d].fetch_sub(1, std::memory_order_relaxed);
-                    const float us = (float) std::chrono::duration_cast<std::chrono::microseconds>(
-                                         std::chrono::steady_clock::now() - t0).count() + 1.0f;
-                    // per read in flight: the drive's speed while it was shared with the others in flight
-                    const float sp = (float) got / us * (float) (mirror_inflight[d].load(std::memory_order_relaxed) + 1);
-                    mirror_speed[d].store(0.9f * mirror_speed[d].load() + 0.1f * sp, std::memory_order_relaxed);
-                }
-                if (got >= (size_t) (off - a0) + len) {
-                    std::memcpy(dst, bounce + (off - a0), len);
-                    mirror_bytes[pass == 0 ? 1 : 0].fetch_add(need, std::memory_order_relaxed);
-                    return;
-                }
-                if (pass == 0 && !mirror_off.exchange(true))
-                    fprintf(stderr, "[mirror] read failed at %llu: the mirror is off, reading from the shards' drive\n",
-                            (unsigned long long) off);
-            }
-        }
-    }
-    size_t done = 0;
-    while (done < len) {
-        const ssize_t r = pread(sh.fd, dst + done, len - done, (off_t) (off + done));
-        if (r <= 0) {
-            std::memcpy(dst + done, sh.base + off + done, len - done);
-            return;
-        }
-        done += (size_t) r;
-    }
+    namespace sio = strata::core::shard_io;
+    if (sh.fd_direct >= 0 && sio::read_direct(sh.fd_direct, sh.fd_mirror, off, len, dst)) return;
+    if (sio::read_buffered(sh.fd, sh.base, off, len, dst)) return;
+    // the views went after the load (pack_release_views) and the file could not be read: nothing to fall back to
+    std::fprintf(stderr, "glm fast: an expert read of %s at %llu failed (%s) - STRATA_GLM_KEEP_MAP=1 keeps the mapping "
+                         "to fall back to\n", sh.path.c_str(), (unsigned long long) off, std::strerror(errno));
+    std::abort();
 #else
     // Windows: the unbuffered handle the same way (sector-aligned offset, size and buffer), the mapping otherwise.
     // The handle is overlapped (reads from many threads run at once): each read waits on this thread's own event
@@ -1020,8 +972,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                          (double) (sc_bytes_ + F->arena_bytes + 8 * sstride) / G, (used - known) / G);
         }
         // headroom: the context's own growth is already allocated (state arena); see kVramReserveMb
-        size_t reserve = (size_t) (F->unified_memory ? 1024 : glmfast::kVramReserveMb) << 20;
-        if (const char* r = getenv("STRATA_GLM_RESERVE_MB")) reserve = (size_t) std::atoll(r) << 20;
+        const size_t reserve = glmfast::vram_reserve_bytes(F->unified_memory ? 1024 : glmfast::kVramReserveMb);
         size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
 #if defined(STRATA_USE_HIP)
         if (F->unified_memory) {
@@ -1034,8 +985,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                     if (std::sscanf(line, "MemAvailable: %lld kB", &avail_kb) == 1) break;
                 std::fclose(mf);
             }
-            double head_gb = 16.0;
-            if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+            const double head_gb = glmfast::ram_headroom_gb(true);
             size_t expert_bytes = 0;
             for (int il = l0_; il < lt_; ++il) {
                 const auto& Ly = F->L[(size_t) il];
@@ -1049,12 +999,11 @@ bool Glm5Model::fast_setup(std::string& err) {
                          (double) expert_bytes / 1073741824.0, (double) avail / 1073741824.0);
         }
 #endif
-        if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
-            avail = std::min(avail, (size_t) (std::atof(cap) * 1073741824.0));
+        if (getenv("STRATA_GLM_POOL_GB")) avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
         // STRATA_GLM_VRAM_GB=<n>: behave like a card with n GB - the cap counts everything this process already
         // holds on the device (context, dense weights, state, arenas), so the pool gets what such a card would have
-        if (const char* vc = getenv("STRATA_GLM_VRAM_GB")) {
-            const size_t cap = (size_t) (std::atof(vc) * 1073741824.0);
+        if (getenv("STRATA_GLM_VRAM_GB")) {
+            const size_t cap = glmfast::env_gib("STRATA_GLM_VRAM_GB");
             const size_t used = total_b - free_b;
             const size_t room = cap > used + reserve ? cap - used - reserve : 0;
             std::fprintf(stderr, "glm fast: CUDA%d VRAM cap %.1f GB: %.2f GB already in use, %.2f GB left for experts\n",
@@ -1376,8 +1325,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         const int later = n_parts_ - 1 - part_;   // the parts that start after this one
         const int64_t unseen_pf = (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.staging +
                                   (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.hop;
-        double head_gb = F->unified_memory ? 16.0 : 6.0;
-        if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+        const double head_gb = glmfast::ram_headroom_gb(F->unified_memory);
         const int64_t head_b = (int64_t) (head_gb * 1073741824.0);
         // the disk staging pinned after the tier (one set of max(8, k) experts per in-flight route, below)
         const int64_t stage_b = (int64_t) std::max(8, g.n_exp_used) * gf::kCpuAnswers *
@@ -1422,8 +1370,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                     // prompt 301 s instead of 11) - the page cache the Engram tables and the shards go through
                     // needs the room
 #ifdef __linux__
-                    double frac = F->unified_memory ? 1.0 : 0.73;
-                    if (const char* fr = getenv("STRATA_GLM_RAM_FRAC")) frac = std::max(0.0, std::atof(fr));
+                    // (a value of 1.0 or more would lift the cap - the thrash case itself: a discrete card's is held
+                    // to 0.95; a unified-memory APU has no cap unless one is set)
+                    const double frac = strata::core::env_num("STRATA_GLM_RAM_FRAC", F->unified_memory ? 1.0 : 0.73,
+                                                              0.05, F->unified_memory ? 1.0 : 0.95);
                     if (const int64_t mt = mem_total(); mt > 0 && frac < 1.0)
                         total = std::min<int64_t>(total, std::max<int64_t>(0, (int64_t) ((double) mt * frac) - stage_b));
 #endif
@@ -3344,10 +3294,15 @@ void Glm5Model::fast_destroy() {
                      (unsigned long long) F->prefetches.load(), (unsigned long long) F->miss_layers.load(),
                      (double) F->miss_us.load() / 1000.0);
         if (g_.v41) dsv41_engram_report();
-        if (const uint64_t m0 = glmfast::mirror_bytes[0].load(), m1 = glmfast::mirror_bytes[1].load(); m1 > 0)
+        if (const uint64_t m0 = strata::core::shard_io::mirror_bytes[0].load(), m1 = strata::core::shard_io::mirror_bytes[1].load(); m1 > 0)
             std::fprintf(stderr, "glm fast mirror CUDA%d: %.2f GB from the shards' drive, %.2f GB from the mirror "
-                                 "(%.1f%%)\n", dev_, (double) m0 / 1e9, (double) m1 / 1e9,
-                         100.0 * (double) m1 / (double) (m0 + m1));
+                                 "(%.1f%%)%s\n", dev_, (double) m0 / 1e9, (double) m1 / 1e9,
+                         100.0 * (double) m1 / (double) (m0 + m1),
+                         strata::core::shard_io::mirror_on() ? "" : " - the mirror was turned off by a read error");
+        if (const uint64_t fb = strata::core::shard_io::fallback_buffered.load(), fm = strata::core::shard_io::fallback_mapped.load(); fb > 0)
+            std::fprintf(stderr, "glm fast CUDA%d: %llu expert reads left the O_DIRECT path (buffered pread; %llu of them "
+                                 "copied from the mapping) - an SSD or filesystem that refuses O_DIRECT reads, or short reads\n",
+                         dev_, (unsigned long long) fb, (unsigned long long) fm);
         if (F->disk_lane)
             std::fprintf(stderr, "glm fast disk lane CUDA%d: %llu disk experts computed in RAM, %.1f ms; %llu evicted at "
                                  "the miss\n", dev_, (unsigned long long) F->dlane_experts.load(),
@@ -5927,6 +5882,7 @@ int Glm5Model::fast_sample(strata::kernels::SamplerParams& sp, std::string& err)
         cudaMemcpyAsync(F->tok_h, d_tok_, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
     }
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm sampler", err) || !F->route_ok(err)) return -1;
+    if (g_.v41 && !dsv41_engram_ok(err)) return -1;   // (an Engram row this token's layers waited for never arrived)
     if (F->gap_on) {
         F->gap_sample += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0).count();
         ++F->gap_sample_n;
@@ -5984,13 +5940,11 @@ void Glm5Model::gap_report() {
 // prompt path and the layer split search size from the same number, before the pool is carved (a discrete card's:
 // fast_setup prices a unified-memory APU's pool itself).
 size_t Glm5Model::pool_avail(size_t free_b, size_t total_b) {
-    size_t reserve = (size_t) glmfast::kVramReserveMb << 20;
-    if (const char* r = getenv("STRATA_GLM_RESERVE_MB")) reserve = (size_t) std::atoll(r) << 20;
+    const size_t reserve = glmfast::vram_reserve_bytes(glmfast::kVramReserveMb);
     size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
-    if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
-        avail = std::min(avail, (size_t) (std::atof(cap) * 1073741824.0));
-    if (const char* vc = getenv("STRATA_GLM_VRAM_GB")) {
-        const size_t cap = (size_t) (std::atof(vc) * 1073741824.0);
+    if (getenv("STRATA_GLM_POOL_GB")) avail = std::min(avail, glmfast::env_gib("STRATA_GLM_POOL_GB"));
+    if (getenv("STRATA_GLM_VRAM_GB")) {
+        const size_t cap = glmfast::env_gib("STRATA_GLM_VRAM_GB");
         const size_t used = total_b - free_b;
         avail = std::min(avail, cap > used + reserve ? cap - used - reserve : (size_t) 0);
     }

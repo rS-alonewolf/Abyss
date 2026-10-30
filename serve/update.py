@@ -1,9 +1,10 @@
-"""The dashboard's About > Updates: is a newer Project Maya release out, and updating this folder to it.
+"""The dashboard's About > Updates: is a newer Abyss release out, and updating this folder to it.
 
 The check asks GitHub for the latest release of the repository this folder was cloned from (git's origin; else
-mw00/project-maya) - only when the dashboard asks, at most every six hours (MAYA_UPDATE_CHECK=0 turns it off).
+zephel01/Abyss - a zip install has no origin, and until v1.3.78 it looked at Project Maya's releases) - only when the
+dashboard asks, at most every six hours (MAYA_UPDATE_CHECK=0 turns it off).
 Updating fast-forwards the git checkout to that release's tag, then the server ends with UPDATE_EXIT: abyss.sh /
-START-ABYSS.bat (abyss.py) start Maya again, which compiles what changed in the engine and loads the model.  A folder
+START-ABYSS.bat (abyss.py) start Abyss again, which compiles what changed in the engine and loads the model.  A folder
 that can't do that (no git, local changes, a server started some other way) gets the reason and the steps by hand."""
 import json
 import os
@@ -15,7 +16,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-REPO = "mw00/project-maya"
+REPO = "zephel01/Abyss"
 UPDATE_EXIT = 75                    # the server's exit code that tells abyss.py: updated, start again (EX_TEMPFAIL)
 SUPERVISED = "MAYA_RESTART_ON_UPDATE"   # set by abyss.py for the server it starts: it starts it again after an update
 CHECK_EVERY = 6 * 3600

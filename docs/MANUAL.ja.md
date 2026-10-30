@@ -453,7 +453,9 @@ v1.3.29 から、同じエンジンで DeepSeek-V4.1-Flash-1017 が動く。準�
   [docs/deepseek41/README.md](deepseek41/README.md#a-lighter-dense-pack-q5_k)。
 - **メモリ上限つきのスコープで起動する**（`systemd-run --user --scope -p MemoryMax=88G ...`）。ページキャッシュと pinned の
   層が重なると、systemd-oomd がデスクトップのセッションを止めることがある。
-- **まだできないこと:** 投機デコード、層の分割、会話のディスク保存、画像。
+- **投機デコード**（v1.3.53、任意）: V4.1 用の DSpark ドラフター（`--dspark`）と n-gram 窓。モデル自身の MTP 層はどの GGUF にも
+  入っていない。prompt の attention は v1.3.60 からまとめて計算する。
+- **まだできないこと:** 層の分割、会話のディスク保存、画像。
 
 ## Ornith-1.5-122B
 
@@ -618,8 +620,8 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_WARM` | オン | `0`: 起動時に読み込まない（使われたエキスパートから載っていく。最初の応答が遅い） |
 | `STRATA_GLM_RAM_GB` | 空き RAM から | pinned の RAM 層の大きさを GB で固定。大きくすると SSD の待ちは減るが、そのエキスパートは CPU のレーンが計算する。DDR4 のデスクトップの V4.1 で 80 → 88 GB にすると SSD の待ち 11.1 → 8.7 ms、レーン 9.4 → 10.6 ms、生成 +3%（docs/BENCH） |
 | `STRATA_GLM_EXPERT_HELPER` / `_GIB` | オフ / 13 GiB | DeepSeek V4.1、CUDA のみ: 2 枚目の GPU の番号（例 `1`）と、そこに常駐させるデコード用エキスパートの置き場の大きさ。`0` でオフ。プロンプトは 1 枚目のまま。GPU が無い、置き場が入らない、ヘルパーでエラーが出たときは CPU で計算します。分割しない native pack と CPU レーンが必要で、投機デコードとレイヤーグラフはオフのとき。[設定と制限（英語）](EXPERT_HELPER.md) |
-| `STRATA_GLM_RAM_HEADROOM_GB` | 6 | RAM 層を決めるとき、システムのために空けておく RAM |
-| `STRATA_GLM_RAM_FRAC` | 0.73 | Linux・単体 GPU で `STRATA_GLM_RAM_GB` がないとき、RAM 層が pin する RAM の上限 (全体に対する割合)。94 GB 機で 73% を超えて pin するとスラッシングした |
+| `STRATA_GLM_RAM_HEADROOM_GB` | 6（ユニファイドメモリでは 16） | RAM 層を決めるとき、システムのために空けておく RAM。AMD のセットアップは config に 16 を書く |
+| `STRATA_GLM_RAM_FRAC` | 0.73 | Linux・単体 GPU で `STRATA_GLM_RAM_GB` がないとき、RAM 層が pin する RAM の上限 (全体に対する割合)。94 GB 機で 73% を超えて pin するとスラッシングした。0.05〜0.95 に収める（上限を外す値はログに一行出して丸める） |
 | `STRATA_GLM_STREAM_FETCH` | オン | SSD から読んだエキスパートを、読めた塊から順に VRAM へコピーする。PCIe のコピーが SSD の読みのすぐ後ろを走る（v1.3.31。DeepSeek V4.1 で 1 トークン −9%）。`0` で読み終わってからまとめてコピー |
 | `STRATA_GLM_RAM_THP` | オン（Linux） | RAM 層を透過的ヒュージページに置く（空きの 2 MB ブロックの範囲で。APU のレーンが再検証するページが 512 分の 1 になり、数秒の停止が消える）。`0` でドライバの pinned ページ |
 | `STRATA_GLM_RESERVE_MB` | 700（CUDA）、1536（HIP） | エキスパート用プールの横に空けておく VRAM。HIP は v1.3.68 から多めに空けます。最初のプロンプトのときに hipBLASLt の GEMM がカーネルを読み込み（約 0.7 GB）、0.7 GB の空きでは R9700 で `--max-context 131072` のときに読み込めず、プロンプトの GEMM がすべて失敗して 8K のプロンプトに 1,300 秒かかっていました。プールが小さくなる分、生成は約 3% 遅くなります |
@@ -640,6 +642,14 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | 起動をまたいで残すエキスパートの使用記録。`0` で無効 |
 | `STRATA_GLM_NO_REUSE` | オフ | `1`: 会話を再利用しない |
 | `STRATA_GLM_THINK_RESERVE` | 1024 | （サーバー）思考が回答のために必ず残すトークン数 |
+| `STRATA_ENGINE_STALL_S` | 90 | （サーバー）この秒数、何も言わず CPU・ディスク・GPU も使わないエンジンは止めて、次のリクエストで起動し直す。`0` で無効 |
+| `STRATA_ENGINE_START_S` | 1800 | （サーバー）起動から READY までの上限（SSD から読むモデルは数分かかる）。超えるとエンジンを止め、起動失敗として理由を 1 行出す。`0` で無制限（v1.3.78） |
+| `STRATA_ENGINE_DRAIN_S` | 120 | （サーバー）途中で終わったリクエスト（クライアントが切った）は DONE まで読み捨てる。STOP のあとこの秒数黙ったエンジンは止める。`0` で無制限（v1.3.78） |
+| `STRATA_ENGINE_WRAP_S` | 40 | （サーバー）Ctrl+C / SIGTERM のとき、進行中のリクエストは思考を閉じて回答するのをこの秒数まで待ち、そのあと打ち切る |
+| `STRATA_ENGINE_QUIT_S` | 50 | （サーバー）QUIT のあとエンジンが終わるまで待つ秒数（`STRATA_GLM_SLOT_KEEP` では先に会話を書き出す）。超えると kill。llama-swap の unloadTimeout はこれより長く |
+| `STRATA_VISION_START_S` / `STRATA_VISION_ENCODE_S` | 600 / 120 | （サーバー）画像エンコーダーの起動と 1 枚ごとの応答の上限。超えると止めてリクエストはエラー、次の画像で起動し直す（v1.3.78） |
+| `STRATA_HTTP_BACKLOG` | 256 | （サーバー）listen のバックログ（accept 待ちのリクエスト数） |
+| `STRATA_MAX_BODY_MIB` | 256 | （サーバー）リクエスト本文の上限。超えると読まずに 413 |
 | `GPU_MAX_HW_QUEUES` | 2（HIP） | ROCm がデバイスごとに作る HW キューの数。シェルにも設定ファイルにもないとき、サーバーが 2 を渡す（v1.3.40）。AI PRO R9700 の DeepSeek V4 の 8K / 16K の prompt は、1 で 586〜650 / 676〜684 tok/s（R9700 向けの手順でアイドル電力の回避策として広まっている値。この PC ではどちらでもアイドル 12 W）、ROCm の既定の 4 で 653〜737 / 748〜756、2 で 866〜995 / 999〜1,011 |
 | `STRATA_GLM_IGPU` | 自動 | iGPU レーン。`libabyss_igpu.so` と HIP のデバイスがあり、CPU より速ければ使う。`0` で使わない、`1` で遅くても使う。`STRATA_GLM_IGPU_LIB=<パス>` で別のライブラリ |
 | `STRATA_GLM_IGPU_TIMEOUT_MS` | 20 | これより遅れたレーンの呼び出しは CPU のスレッドが引き継ぐ（0: 待つ） |
@@ -719,6 +729,6 @@ prompt）まで測った。アテンションのキャッシュは小さい（65
   届かない。そのとき `auto` は速いカード 1 枚で動かす。Windows は DeepSeek V4 では未確認。
 - `./abyss.sh`（Maya から引き継いだインストーラ）は GLM 用。DeepSeek V4 は `./setup-deepseek.sh`。DeepSeek V4.1 は手作業
   （[docs/deepseek41/README.md](deepseek41/README.md)）。
-- DeepSeek V4.1: 投機デコード（MTP 層を持つ GGUF がない）、層の分割、会話のディスク保存はまだない。prompt のアテンションは
-  1 トークンずつ。v1.3.31 までは、コンテキストの 16,385 トークン目で落ちた（8K を超えるとアテンションの行選びも崩れていた）。
-  長い会話には v1.3.32 以降を使う。
+- DeepSeek V4.1: モデル自身の MTP 層でのドラフトはない（MTP 層を持つ GGUF がない。v1.3.53 からの DSpark ドラフター（任意）が
+  代わり）。層の分割、会話のディスク保存はまだない。prompt のアテンションは v1.3.60 からまとめて計算する。v1.3.31 までは、
+  コンテキストの 16,385 トークン目で落ちた（8K を超えるとアテンションの行選びも崩れていた）。長い会話には v1.3.32 以降を使う。

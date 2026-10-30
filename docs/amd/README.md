@@ -14,8 +14,9 @@ the iGPU computes the RAM-tier experts (the iGPU lane).
 | RX 7900 XT / XTX | gfx1100 | engine | community builds ([issue #4](https://github.com/zephel01/Abyss/issues/4), Windows) |
 | Ryzen AI Max's Radeon 8050S / 8060S | gfx1151 | engine (alone), or the iGPU lane | measured on an 8060S |
 
-- The engine is built for gfx1100, gfx1201 and gfx1151. Other Radeons are not targets, such as RDNA2 and older or
-  gfx1200 (RX 9060).
+- The engine is built for gfx1100, gfx1201 and gfx1151. Their siblings - RX 7800 XT / 7700 XT (gfx1101), RX 7600
+  (gfx1102), the Radeon 890M (gfx1150) and RX 9060 (gfx1200) - run the same kernels and setup builds for them when it
+  finds one (v1.3.78; not validated on a real card yet - please report). RDNA2 and older are not targets.
 - The iGPU lane runs on the integrated gfx1103 and gfx1150-1153.
 - NVIDIA and AMD in one process (CUDA and HIP together) is not supported. On a PC with an NVIDIA GPU, the CUDA engine
   uses the Radeon iGPU as its lane (the "iGPU lane" in the [manual](../MANUAL.md)).

@@ -12,6 +12,7 @@
 //     with the last FFN's.
 #include "glm_fast_state.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/knobs.hpp"
 #include "strata/kernels/dsv41_fast.hpp"
 #include "strata/kernels/dsv4_fast.hpp"
 #include "strata/kernels/glm_fast.hpp"
@@ -350,8 +351,7 @@ bool Glm5Model::dsv41_bind(std::string& err) {
         }
     E->hist.assign((size_t) max_ctx_ + 1, kEngDead);
     {   // the raw row cache (a power of two of rows) and the read threads
-        const char* cm = getenv("STRATA_DS41_ENGRAM_CACHE_MB");
-        const uint64_t mb = cm != nullptr ? (uint64_t) std::max(0, std::atoi(cm)) : 256u;
+        const uint64_t mb = (uint64_t) strata::core::env_num("STRATA_DS41_ENGRAM_CACHE_MB", 256, 0, 65536);
         uint64_t n = 1;
         while (n * 2 * (uint64_t) E->row_bytes <= mb << 20) n *= 2;
         if (mb > 0 && n >= 1024) {
@@ -359,8 +359,8 @@ bool Glm5Model::dsv41_bind(std::string& err) {
             E->cache.resize(n * (uint64_t) E->row_bytes);
             E->cmask = n - 1;
         }
-        const char* tn = getenv("STRATA_DS41_ENGRAM_THREADS");
-        E->pool = std::make_unique<EngPool>(tn != nullptr ? std::max(0, std::atoi(tn)) : 15);
+        // (the reader threads live as long as the process: a bound, so a typo does not start hundreds)
+        E->pool = std::make_unique<EngPool>((int) strata::core::env_num("STRATA_DS41_ENGRAM_THREADS", 15, 0, 64));
         std::fprintf(stderr, "deepseek41: Engram row cache %.0f MB (%llu rows), %zu read threads\n",
                      (double) E->cache.size() / 1048576.0, (unsigned long long) (E->cmask ? E->cmask + 1 : 0),
                      E->pool->th.size() + 1);
@@ -607,7 +607,9 @@ void engram_async_loop(V41Engram* E) {
                                        dst + (size_t) k * kEngCols * kEngDim, e))
                 ok = false;
             std::atomic_thread_fence(std::memory_order_release);
-            std::atomic_ref<unsigned int>(flag[k]).store(seq, std::memory_order_release);   // (even on a failure)
+            // even on a failure: the layer's kernel spins on this flag (engram_wait) and must not hang the GPU; the
+            // failure reaches the host at the token's end (dsv41_engram_ok) and the token's answer is an error
+            std::atomic_ref<unsigned int>(flag[k]).store(seq, std::memory_order_release);
         }
         l.lock();
         if (!ok && !E->a_bad) { E->a_bad = true; E->a_err = e; }
@@ -640,11 +642,18 @@ void engram_pf_stop(V41Engram& E) {
     E.p_stop.store(false, std::memory_order_relaxed);
 }
 
-// waits for the background reader to be idle; its failure, if any, is this call's
+// waits for the background reader to be idle; its failure, if any, is this call's - and this call's only: the flag
+// is cleared here, so one transient read error (an EIO, a drive's hiccup) fails the token it belonged to and not
+// every V4.1 request after it (before, a_bad stayed set for the life of the process)
 bool engram_sync(V41Engram& E, std::string& err) {
     std::unique_lock<std::mutex> l(E.am);
     E.acv.wait(l, [&] { return !E.a_busy; });
-    if (E.a_bad) { err = E.a_err.empty() ? "deepseek41: Engram row read failed" : E.a_err; return false; }
+    if (E.a_bad) {
+        err = E.a_err.empty() ? "deepseek41: Engram row read failed" : E.a_err;
+        E.a_bad = false;
+        E.a_err.clear();
+        return false;
+    }
     return true;
 }
 
@@ -780,6 +789,14 @@ bool Glm5Model::dsv41_engram_window_add(int il, int t, float* R, std::string& er
     const int k = F->L[(size_t) il].eng;
     if (k < 0) { err = "deepseek41: layer " + std::to_string(il) + " has no Engram table"; return false; }
     return dsv41_engram_add(il, R, err, F->v41_pblk + (size_t) (t * 2 + k) * kEngCols * kEngDim);
+}
+
+// after a token's layers: the background reader's failure for this token, if any (its rows were never written, the
+// layer computed on stale ones) - the token's step fails with it, the reader's flag is clear again for the next one
+bool Glm5Model::dsv41_engram_ok(std::string& err) {
+    auto* E = (V41Engram*) v41_eng_;
+    if (E == nullptr || fast_ == nullptr || !fast_->v41_eng_async) return true;
+    return engram_sync(*E, err);
 }
 
 bool Glm5Model::dsv41_engram_add(int il, float* R, std::string& err, const float* rows) {

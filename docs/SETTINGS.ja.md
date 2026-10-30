@@ -179,9 +179,10 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 | `allow_shutdown` | `false`: `POST /api/shutdown`（エンジン暴走時などに別のプログラムからサーバーとエンジンを止める）を断る。既定は有効で、`api_key` を送れば可、キーが無ければこの PC からだけ可。Tailscale 越しなら `api_key` を設定する（[MANUAL](MANUAL.ja.md#使い方)） | `false` |
 | `fit_max_tokens` | `true`: `max_tokens` が残りのコンテキストを超えたら縮めて受ける（既定は 400 で断る） | `true` |
 | `mcp_servers` | チャット画面から使う MCP サーバー（Claude Desktop と同じ形式） | `{"name": {...}}` |
+| `installer` | セットアップが選んだもの（モデルと量子化。Monitor の表示名用）。セットアップが書き、判断には使わない | `{"quant": "UD-IQ2_XXS"}` |
 
 **画像（GLM-5.3-Flash のみ）**: `vision` に画像エンコーダーの設定が入ります（`exe`、`mmproj`、`model`、`gpu`、`resident`、
-`max_tokens`、`no_flash_attn`）。`./abyss.sh` が書くので、通常は触りません。
+`threads`、`max_tokens`、`no_flash_attn`）。`./abyss.sh` が書くので、通常は触りません。
 
 知らない項目は無視されます。ただし `sampling` の値が間違っていると、サーバーは起動しません（設定の書き間違いで答え方が
 黙って変わらないようにするためです）。
@@ -204,6 +205,6 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 | --- | --- | --- |
 | `Abyss/<設定ファイル名>.shared-settings.json` | チャット画面で決めた、他のアプリにも渡す既定値（`POST /settings`。temperature、無検閲化の入り切りなど） | 画面から変える。消すと既定に戻る |
 | `Abyss/.abyss-gpu-tune-<GPU 番号>.json`、`Abyss/abyss-gpu-tune.txt` | `--gpu-tune` の測定結果と、issue に貼る報告 | 触らない |
-| `~/.config/project-maya/calibration.json` | `--calibrate` の結果（PC・モデル・コンテキストごと） | 触らない |
+| `~/.config/project-maya/calibration.json` | `--calibrate` の結果（PC・モデル・コンテキスト・GPU の PCIe リンクとドライバごと。カードを別のスロットに移したりドライバを更新すると古い結果は使われず、1 行で知らせる） | 触らない |
 | `Abyss-tools/logs/last-model` | `abyss.sh start` で最後に起動したモデル名 | 触らない |
 | `Abyss-tools/abyss.sh`、`common.sh` | 起動・停止の道具。セットアップのたびに最新になる（古いものは `.bak`） | 触らない |
