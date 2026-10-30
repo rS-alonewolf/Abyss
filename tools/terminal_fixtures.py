@@ -477,8 +477,9 @@ class FakeServer:
                 path = self.path.split("?")[0]
                 outer.hits.append(self.path)
                 h = health(outer.scenario) or {}
-                if path == "/health":
-                    self._json(200, dict(h, service=outer.service, api_key=bool(outer.key)))
+                if path == "/health":                  # (the phase-2 server answers 503 while its engine loads)
+                    self._json(503 if outer.scenario == "starting" else 200,
+                               dict(h, service=outer.service, api_key=bool(outer.key)))
                 elif outer.scenario == "starting":     # (the phase-2 server before its engine is ready)
                     self.send_response(503)
                     self.send_header("Retry-After", "15")

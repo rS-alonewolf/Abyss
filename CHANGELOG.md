@@ -7,11 +7,18 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.81 - 2026-10-30
+
+- `/health` answers **503** (with `Retry-After: 5`) while the model loads, the body still `"status": "loading"` and how
+  far: a client that reads 200 as "ready" (a llama-swap health check, a script's wait loop) now waits for the engine.
+  Abyss Terminal reads the 503's body and shows the loading progress as before. 200 once the engine is ready, as
+  before v1.3.80.
+
 ## v1.3.80 - 2026-10-30
 
 Not yet run on a GPU: the engine's new STAT / INFO fields and the early bind pass the HIP compiler's syntax check and
 the host tests (serve 204, tools 263, Terminal 51); the live check on an engine (R9700 / RTX 5090) follows. `/health`
-answers 200 with `"status": "loading"` while the model loads.
+answers 200 with `"status": "loading"` while the model loads (503 from v1.3.81).
 
 **Abyss Terminal (phase 1): `./abyss.sh --terminal` watches and runs the server from a terminal - this PC's or
 another's - and closing it leaves the model serving ([MANUAL](docs/MANUAL.md#abyss-terminal-abysssh---terminal)).**

@@ -162,8 +162,15 @@ class Link:
         try:
             health = self._get("/health", auth=False)
         except urllib.error.HTTPError as e:
+            health = None
+            if e.code == 503:                          # (a loading server: 503 with "loading" and how far in the body)
+                try:
+                    health = json.loads(e.read().decode("utf-8", "replace"))
+                except (OSError, ValueError):
+                    health = None
             e.close()
-            return self._failed(f"/health answered {e.code}")
+            if not (isinstance(health, dict) and health.get("status") == "loading"):
+                return self._failed(f"/health answered {e.code}")
         except (OSError, ValueError) as e:
             return self._failed(getattr(e, "reason", None) or str(e))
         self.health = health if isinstance(health, dict) else {}

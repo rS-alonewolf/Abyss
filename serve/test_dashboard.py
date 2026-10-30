@@ -457,10 +457,12 @@ class EarlyBind(unittest.TestCase):
                           started=time.time() - 12)
         s, _, h = self.get("/health")
         self.assertEqual((s, h["status"], h["service"], h["model"], h["api_key"], h["config"]),
-                         (200, "loading", "abyss", "dsv41", True, "abyss-x.json"))
+                         (503, "loading", "abyss", "dsv41", True, "abyss-x.json"))
         self.assertEqual(h["load"]["stage"], "weights")
         self.assertIsNone(h["load"]["pct"])
         self.assertGreaterEqual(h["load"]["elapsed_s"], 12)
+        s, hd, _ = self.get("/health")
+        self.assertEqual(hd.get("Retry-After"), "5")   # (a "200 = ready" health check waits; Abyss Terminal reads the body)
         SV.load_line("glm fast: CUDA0 warming the expert tiers 50% (44.0 of 88.0 GB, 9 s)")
         SV.load_line("glm fast: CUDA1 warming the expert tiers 25% (3.0 of 12.0 GB, 2 s)")
         s, _, h = self.get("/health")

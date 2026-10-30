@@ -2467,10 +2467,12 @@ def loading_handler(httpd) -> type:
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
             if path == "/health":
-                self._json(200, {"status": "loading", "max_context": None, "model": facts.get("model"),
+                # 503 while loading (a client that reads 200 as "ready", e.g. a llama-swap health check, waits);
+                # the body still says "loading" and how far, for Abyss Terminal
+                self._json(503, {"status": "loading", "max_context": None, "model": facts.get("model"),
                                  "images": False, "api_key": bool(facts.get("api_key")), "defaults": {},
                                  "version": MAYA_VERSION, "mcp_tools": False, "service": "abyss",
-                                 "config": facts.get("config"), "load": load_progress()})
+                                 "config": facts.get("config"), "load": load_progress()}, retry=5)
                 return
             self._json(503, {"error": {"type": "overloaded_error", "message": "the model is still loading; "
                                        "GET /health says how far"}}, retry=15)
