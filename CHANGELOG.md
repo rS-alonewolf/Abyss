@@ -7,10 +7,11 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## Unreleased
+## v1.3.79 - 2026-10-30
 
 **Two items of the 2026-10-30 Strata/Maya review (no GPU needed; the ideas are Maya #626 and #419, the code is
-Abyss's own).**
+Abyss's own).** Host-side changes only (the server's parser and the setup's calibration store); the engine is the
+same as v1.3.78. Not yet seen on hardware: the PCIe link as an RTX 5090 on OCuLink reports it (this weekend).
 
 - Streamed tool calls: a call's body was one growing string and every new piece searched it from the start for the
   end tag (and the streamed value's end), so an agent's Write of a 200 KB file cost about a second of CPU at 8
