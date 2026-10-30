@@ -1,12 +1,30 @@
 #!/usr/bin/env python3
-"""Project Maya - set up and start GLM-5.3-Flash on your own GPU(s).
-CUDA: Linux; Windows (experimental). HIP: experimental gfx1100/gfx1201/gfx1151, Linux and Windows, text only.
+"""Abyss - set up and run big MoE models (GLM-5.3-Flash, DeepSeek V4 / V4.1, Qwen3.8-Flash-Next, Ornith) on your own
+GPU(s) + RAM + SSD.  CUDA: Linux; Windows (experimental).  HIP: gfx1100/gfx1201/gfx1151, Linux and Windows.
+DeepSeek V4 / V4.1, Qwen3.8 and Ornith are installed by ./setup-deepseek.sh (docs/MODELS.md); this file runs them all.
 
+Setup and start:
     ./abyss.sh                 the first run sets everything up and starts the dashboard; later runs just start it
     ./abyss.sh --setup         set up again (other GPUs, another context length, another model folder)
     ./abyss.sh --check         only check this PC
-    ./abyss.sh --terminal      Abyss Terminal: watch the server, start / stop / switch models (tools/abyss_terminal.py)
-    ./abyss.sh --backend hip --gpu 0 --check    check an RX 7900 XT / XTX with system ROCm 10
+    ./abyss.sh --config abyss-<name>.json      start another installed model (default: the last one used)
+    ./abyss.sh --backend hip --gpu 0 --check   check an AMD card with system ROCm 10
+
+Abyss Terminal (watch the server: speed, where a token's time goes, GPUs, SSDs, memory, requests; start / stop / switch):
+    ./abyss.sh --terminal                      this PC's server (l: the Speed / Devices layouts, ?: keys, q: quit)
+    ./abyss.sh --terminal --layout devices     open on the Devices layout (every GPU / SSD / CPU)
+    ./abyss.sh --terminal --url http://192.168.1.20:8082 --key-env ABYSS_KEY   a server on another PC
+    ./abyss.sh --terminal --demo r9700         recorded readings, no server (also: lowspec split multi4 multi8 multi10
+                                               loading starting down)
+    ./abyss.sh --terminal --once / --json      one reading as text / JSON, then exit
+
+Speed and tuning:
+    ./abyss.sh --bench                         a standard speed test (Abyss stopped): decode, prefill, the bottleneck,
+                                               a quality check; --deep finds the bottleneck, --full adds a 32k prompt
+    ./abyss.sh --calibrate                     tune the CPU lane for this PC (~10-15 minutes)
+    ./abyss.sh --gpu-tune                      measure the per-GPU kernel choices (about a minute a GPU)
+    ./abyss.sh --report                        write abyss-report.txt to attach to an issue (nothing is sent)
+    ./abyss.sh --repack / --rebuild            build the model's pack / the engine again
 
 On Windows START-ABYSS.bat takes the same options.  Both make the private Python environment (.venv) and run this
 file.  Its helpers (setup.py) do the PC checks, pip, llama.cpp's source and resumable downloads.
@@ -3176,7 +3194,7 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="with --terminal: print one reading and exit")
     ap.add_argument("--json", action="store_true", help="with --terminal: print one reading as JSON and exit")
     ap.add_argument("--demo", metavar="SCENARIO", help="with --terminal: recorded readings, no server (r9700, lowspec, "
-                                                       "split, multi4, multi8, multi10, loading, down)")
+                                                       "split, multi4, multi8, multi10, loading, starting, down)")
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
                                               "for --bench or --report (default: most recently used)")
     a = ap.parse_args()
