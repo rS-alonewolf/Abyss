@@ -2230,6 +2230,10 @@ def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
         answer_started = False                              # a malformed request's 400 only replaces an answer not begun
+        # TCP_NODELAY on every connection: a stream's small SSE pieces (one token each) leave as they are written - with
+        # Nagle's algorithm on, a piece waited for the client's ACK of the one before, up to 40 ms (the delayed ACK)
+        # on a slow link (Maya #626's idea); the whole answers are one write, nothing changes for them
+        disable_nagle_algorithm = True
 
         def log_message(self, fmt, *args):
             pass
