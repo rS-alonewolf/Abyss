@@ -7,12 +7,23 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## Unreleased
+## v1.3.82 - 2026-10-31
 
-Small VRAM (issue #23: an RTX A2000 Laptop 8 GB + 64 GB RAM, PCIe Gen4 x8). Not yet run on a GPU: the engine
-changes pass the HIP compiler's syntax check and the host tests; the check on an RTX 5090 capped to 8 GB
-(`STRATA_GLM_VRAM_GB=8`) with the reporter's two models follows, then the numbers here. One page for all of it:
+Small VRAM (issue #23: an RTX A2000 Laptop 8 GB + 64 GB RAM, PCIe Gen4 x8), and CUDA's VRAM reserve on big cards.
+Checked on an RTX 5090 given the reporter's pool (`STRATA_GLM_POOL_GB`): Ornith-1.5-122B IQ3_XXS-B with a 1.45 GB
+pool reads a prompt at **356 tok/s (2K) / 347 (8K) instead of 46** (token by token), decode 45.5 tok/s, KL 0.0073
+against a 16 GB run either way; GLM-5.3-Flash Maya-S-v2 with a 1.2 GB pool (4 slots a layer) **starts** where it was
+refused, decode 9.1 tok/s (SSD-bound), KL 0.039 (a 32 GB run: 0.036-0.044). Nothing changes on a 32 GB card's
+GLM-5.3-Flash run (decode 64.5 / 64.6 tok/s, 8K prompt 1113 / 1105, no new log lines). One page for all of it:
 [docs/SMALL-VRAM.md](docs/SMALL-VRAM.md) ([日本語](docs/SMALL-VRAM.ja.md)).
+
+- **CUDA keeps 1.5 GB of VRAM free beside the expert pool on cards over 12 GB** (`STRATA_GLM_RESERVE_MB`, as HIP
+  since v1.3.68; 700 MB before). An RTX 5090 running DeepSeek V4.1 UD-IQ2_XXS at `--max-context 65536` ran out of
+  VRAM: `--bench` stopped in the prompt attention (`dsv4_fast attend: out of memory`) and a coding run with the
+  DSpark drafter in its MMQ buffers. With 1.5 GB: `--bench` decode 23.1 tok/s, 8K prompt 357, KL 0.0086, and 8
+  coding tasks with DSpark at 64.9 tok/s, no out-of-memory. GLM-5.3-Flash on the 5090 loses 3 pool slots of 78 (decode
+  64.1 tok/s, 8K prompt 1099: within the run-to-run spread). A card of 12 GB or less keeps 700 MB: its pool is a few
+  slots a layer (below).
 
 - **The expert pool may hold fewer slots a layer than a route** (GLM-5.3-Flash / Ornith: 8). The floor is now the
   spares and one resident (4; `STRATA_GLM_POOL_FLOOR`): a miss lands in a spare or its own scratch slot and the CPU
@@ -24,14 +35,16 @@ changes pass the HIP compiler's syntax check and the host tests; the check on an
   spares and 2 (13 slots), so a pool of 9 (Ornith-1.5-122B IQ3_XXS-B on 8 GB) read the prompt token by token at
   16 tok/s. Such a pool now keeps 4 slots a layer while a prompt runs (`STRATA_GLM_PREFILL_KEEP`) and lends the
   rest - ~800 MB on Ornith, chunks of ~2,000 tokens; the decode's misses refill the tail after the prompt. The
-  "can lend no prompt chunk" line now says what the smallest chunk needs and what the pool can lend. Estimated for
-  the reporter's 2,048-token prompt: 150-400 tok/s (the experts stream once a chunk a layer over the x8 link).
+  "can lend no prompt chunk" line now says what the smallest chunk needs and what the pool can lend. Measured on
+  the 5090 with the reporter's pool (8 slots a layer, chunks of 768): 46 -> 356 tok/s. A pool at the floor (4) has
+  nothing to lend and still reads token by token.
 - **The CPU lane takes every RAM-tier expert when it is much faster than the link** (`STRATA_GLM_LANE_LEAN`, 4x):
   the measured split kept 1 of 8 on the link at 16.8 tok/s where the `--deep` sweep's share 0 ran 18.5 (both lanes
   read the same DRAM; the link copy sits on the GPU's stream). The lean takes effect once the pool has settled (the
   `:settle` switch of v1.3.70, automatically) and steps back when the VRAM hits fall, so a prompt's misses still
   refill the pool first (issue #14). Cards whose split already sends every expert to the CPU (Gen4 x4 / OCuLink)
   and cards whose link is close to the CPU (an R9700 on Gen5 x16, 0.311 vs 0.499 ms) are unchanged.
+- **bench/ref**: a quality reference for Ornith-1.5-122B IQ3_XXS-B (zephel01's 16G64G quant), so `--bench` checks it.
 - **Docs**: GLM-5.3-Flash Maya-S-v2 on an 8 GB card with its dense tensors at IQ4_XS (`tools/requant_dense.py
   --from=q6_k`: which tensors, 5.6 -> 3.6 GiB, the pack and config lines), in docs/SMALL-VRAM.md (EN + JA).
 

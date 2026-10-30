@@ -11,8 +11,20 @@ what the refusal and warning lines mean, and the one change that helps most on G
 Measured so far (issue #23, an RTX A2000 Laptop 8 GB, PCIe Gen4 x8, Ryzen 9 7940HX, 64 GB DDR5, Abyss v1.3.77):
 Ornith-1.5-122B IQ3_XXS-B decodes at 15.8 tokens/s and read its prompt at 16 tokens/s (token by token). GLM-5.3-Flash
 Maya-S-v2 did not start until its dense pack was re-quantized to IQ4_XS, then 4-4.7 tokens/s with a 512 GB SSD
-(disk-bound: the RAM tier holds 40 GB of its 96). The v1.3.82 changes below are not yet measured on that card; the
-numbers will follow in CHANGELOG.
+(disk-bound: the RAM tier holds 40 GB of its 96).
+
+Measured with v1.3.82 on an RTX 5090 given the reporter's pool (`STRATA_GLM_POOL_GB`, see the last section; PCIe Gen4
+x4, 94 GB RAM), `./abyss.sh --bench`:
+
+| | v1.3.81 behaviour | v1.3.82 |
+|---|---|---|
+| Ornith-1.5-122B IQ3_XXS-B, pool 1.45 GB (8 slots a layer) - prompt 2K / 8K | 46 tok/s (token by token) | **356 / 347 tok/s** (chunks of 768) |
+| the same - decode | 48.3 tok/s | 45.5 tok/s (run-to-run spread 42-49) |
+| the same - quality (KL vs a 16 GB run's reference) | 0.0073 | 0.0073 |
+| GLM-5.3-Flash Maya-S-v2 (Q6_K dense), pool 1.2 GB (4 slots a layer) | refused (`not enough VRAM`) | **starts**, decode 9.1 tok/s (SSD-bound, RAM tier 40 GB), KL 0.039 (a 32 GB run: 0.036-0.044) |
+
+A laptop card has a smaller x8 link and CPU, so expect less than these on the same pool; the ratio of the prompt
+numbers (x7.7) is the point.
 
 ## Contents
 
@@ -63,7 +75,7 @@ glm fast: CUDA0 layers [0,48) expert pool 1.45 GB, 9-9 slots/layer (432 total)
 
 Where the VRAM goes: the dense weights are the pack's attention / shared-expert / embedding tensors (the IQ4_XS pack
 below makes them ~2 GB smaller on GLM-5.3-Flash), state/KV grows with `--max-context` (`--kv q4_0` halves it), and the
-pool gets the rest less a reserve (`STRATA_GLM_RESERVE_MB`, 700 MB on CUDA).
+pool gets the rest less a reserve (`STRATA_GLM_RESERVE_MB`, 700 MB on a CUDA card of 12 GB or less).
 
 ```
 glm fast: not enough VRAM for the expert pool: 3 slots per layer, 4 at least (170 MB short; a whole route's 8 slots:
@@ -155,7 +167,8 @@ experts: the SSD reads bound the speed (44 reads a token, 176 ms, in issue #23).
 [zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF)
 (51.7 GB) runs on 8 GB + 64 GB without any re-quantizing: its dense weights take 5.17 GB, the pool 9 slots a layer,
 and the whole model fits the RAM tier (no SSD reads once warm). Issue #23's numbers on an RTX A2000 Laptop 8 GB:
-decode 15.8 tokens/s, prompt 16 tokens/s with v1.3.77. With v1.3.82 the prompt runs in chunks and the CPU lane takes
+decode 15.8 tokens/s, prompt 16 tokens/s with v1.3.77. With v1.3.82 the prompt runs in chunks (x7.7 on the same
+pool, the table at the top) and the CPU lane takes
 every RAM-tier expert once the pool settles (the share sweep's 18.5 tokens/s), so `STRATA_GLM_PCIE_SHARE=0` need not
 be set by hand. The config: `--max-context 8192` (the KV cache is small on this model; 16K fits too).
 
@@ -167,7 +180,7 @@ be set by hand. The config: `--max-context 8192` (the KV cache is small on this 
 | `STRATA_GLM_PREFILL_KEEP` | 4 | slots a layer the pool keeps while a prompt runs on a pool that could lend no chunk at the full keep (a route, the spares and 2). Larger keeps more experts resident through the prompt and gives the prompt a smaller chunk |
 | `STRATA_GLM_LANE_LEAN` | 4 | when the CPU lane does an expert this many times faster than the PCIe link, every RAM-tier expert goes to the CPU once the pool has settled. `0`: the measured split only, as before v1.3.82. `STRATA_GLM_PCIE_SHARE` / `_LATE` / `STRATA_GLM_CPU_PLAN` set by hand win |
 | `STRATA_GLM_VRAM_GB` | off | behave like a card with this many GB: the expert pool gets what such a card would have (the context, dense weights and state already held count). For trying this page's rules on a bigger card |
-| `STRATA_GLM_RESERVE_MB` | 700 (CUDA), 1536 (HIP) | VRAM left free beside the pool; issue #23 ran with 64 on CUDA, which gained ~0.6 GB of pool |
+| `STRATA_GLM_RESERVE_MB` | 700 (CUDA, 12 GB or less), 1536 (bigger CUDA cards, HIP) | VRAM left free beside the pool; issue #23 ran with 64 on CUDA, which gained ~0.6 GB of pool |
 
 ## Trying it on a bigger card
 
@@ -178,3 +191,9 @@ be at least what they take plus the reserve. The log's `VRAM cap` line says what
 ```
 glm fast: CUDA0 VRAM cap 8.0 GB: 5.72 GB already in use, 1.60 GB left for experts
 ```
+
+A big desktop card's CUDA context, MTP head and scratch take more than a laptop's (1.41 GB on an RTX 5090 with
+Ornith, against the ~1 GB the 8 GB reports imply), so under `STRATA_GLM_VRAM_GB=8` it gets a smaller pool than the
+real 8 GB card - 4 slots a layer on Ornith instead of 9, and a pool at the floor lends no prompt chunk. To repeat a
+report, give the pool its size instead: `STRATA_GLM_POOL_GB` = the `expert pool N GB` of the reporter's log (the
+table at the top used 1.45 for Ornith, 1.2 for GLM-5.3-Flash).

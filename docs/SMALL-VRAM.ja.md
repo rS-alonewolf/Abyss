@@ -11,7 +11,20 @@ IQ4_XS に軽くする（コマンド 1 本）— をまとめたものです。
 これまでの実測（issue #23、RTX A2000 Laptop 8 GB、PCIe Gen4 x8、Ryzen 9 7940HX、DDR5 64 GB、Abyss v1.3.77）:
 Ornith-1.5-122B IQ3_XXS-B は decode 15.8 tok/s、prompt は 16 tok/s（1 トークンずつ）。GLM-5.3-Flash Maya-S-v2 は
 dense pack を IQ4_XS に再量子化するまで起動せず、再量子化後は 512 GB SSD で 4〜4.7 tok/s（SSD 律速: RAM 層に
-96 GB のうち 40 GB）。下の v1.3.82 の変更は、まだそのカードでは測っていません。数値は CHANGELOG に追記します。
+96 GB のうち 40 GB）。
+
+v1.3.82 で、RTX 5090 に報告者と同じ大きさの置き場を与えて測った値（`STRATA_GLM_POOL_GB`、最後の節。PCIe Gen4 x4、
+メモリ 94 GB）、`./abyss.sh --bench`:
+
+| | v1.3.81 の動き | v1.3.82 |
+|---|---|---|
+| Ornith-1.5-122B IQ3_XXS-B、置き場 1.45 GB（層あたり 8 個）— prompt 2K / 8K | 46 tok/s（1 トークンずつ） | **356 / 347 tok/s**（768 トークンの chunk） |
+| 同 — decode | 48.3 tok/s | 45.5 tok/s（実行ごとの幅 42〜49） |
+| 同 — 品質（16 GB で作った参照との KL） | 0.0073 | 0.0073 |
+| GLM-5.3-Flash Maya-S-v2（dense Q6_K）、置き場 1.2 GB（層あたり 4 個） | 起動拒否（`not enough VRAM`） | **起動する**。decode 9.1 tok/s（SSD 律速、RAM 層 40 GB）、KL 0.039（32 GB での実行は 0.036〜0.044） |
+
+ノート PC のカードはリンク（x8）も CPU も違うので、同じ置き場でもこれより下がります。見てほしいのは prompt の比
+（7.7 倍）です。
 
 ## 目次
 
@@ -60,7 +73,7 @@ glm fast: CUDA0 layers [0,48) expert pool 1.45 GB, 9-9 slots/layer (432 total)
 
 VRAM の内訳です。dense weights は pack の attention / 共有エキスパート / 埋め込み（下の IQ4_XS pack で
 GLM-5.3-Flash は約 2 GB 小さくなります）、state/KV は `--max-context` で増え（`--kv q4_0` で半分以下）、置き場は
-残りから予約分（`STRATA_GLM_RESERVE_MB`、CUDA で 700 MB）を引いたものです。
+残りから予約分（`STRATA_GLM_RESERVE_MB`、12 GB 以下の CUDA カードで 700 MB）を引いたものです。
 
 ```
 glm fast: not enough VRAM for the expert pool: 3 slots per layer, 4 at least (170 MB short; a whole route's 8 slots:
@@ -150,7 +163,7 @@ cp -r $M/Maya-S-v2-IQ2_XXS/pack/tokenizer $M/Maya-S-v2-IQ2_XXS-iq4dense/pack/
 [zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF](https://huggingface.co/zephel01/Ornith-1.5-122B-IQ3_XXS-16G64G-GGUF)
 （51.7 GB）は再量子化なしで 8 GB + 64 GB で動きます。dense の重みは 5.17 GB、置き場は層あたり 9 個、モデル全体が
 RAM 層に入ります（温まれば SSD は読みません）。issue #23 の RTX A2000 Laptop 8 GB での数値: v1.3.77 で decode
-15.8 tok/s、prompt 16 tok/s。v1.3.82 では prompt がまとめて読まれ、置き場が落ち着いたら CPU レーンが RAM 層の
+15.8 tok/s、prompt 16 tok/s。v1.3.82 では prompt がまとめて読まれ（同じ置き場で 7.7 倍、冒頭の表）、置き場が落ち着いたら CPU レーンが RAM 層の
 エキスパートを全部受け持つ（分担掃引の 18.5 tok/s）ので、`STRATA_GLM_PCIE_SHARE=0` を手で書く必要はなくなります。
 設定は `--max-context 8192`（このモデルの KV キャッシュは小さく、16K も入ります）。
 
@@ -162,7 +175,7 @@ RAM 層に入ります（温まれば SSD は読みません）。issue #23 の 
 | `STRATA_GLM_PREFILL_KEEP` | 4 | 本来の残し（route + 予備 + 2）では chunk を貸せない置き場で、prompt の間に各層が残す枠数。大きくすると prompt 中も常駐が残る代わりに chunk が小さくなる |
 | `STRATA_GLM_LANE_LEAN` | 4 | CPU レーンがエキスパート 1 個を PCIe のこの倍数速くこなすなら、置き場が落ち着いた時点で RAM 層のエキスパートを全部 CPU に回す。`0`: v1.3.82 より前と同じ測った分担だけ。手で書いた `STRATA_GLM_PCIE_SHARE` / `_LATE` / `STRATA_GLM_CPU_PLAN` が優先 |
 | `STRATA_GLM_VRAM_GB` | オフ | この GB のカードのように振る舞う: 置き場はそのカードが持てる分だけ（すでに確保した文脈、dense、状態を数える）。このページの規則を大きいカードで試すためのもの |
-| `STRATA_GLM_RESERVE_MB` | 700（CUDA）、1536（HIP） | 置き場の横に空けておく VRAM。issue #23 は CUDA で 64 にして置き場が約 0.6 GB 増えた |
+| `STRATA_GLM_RESERVE_MB` | 700（12 GB 以下の CUDA）、1536（それより大きい CUDA、HIP） | 置き場の横に空けておく VRAM。issue #23 は CUDA で 64 にして置き場が約 0.6 GB 増えた |
 
 ## 大きいカードで試す
 
@@ -173,3 +186,8 @@ RAM 層に入ります（温まれば SSD は読みません）。issue #23 の 
 ```
 glm fast: CUDA0 VRAM cap 8.0 GB: 5.72 GB already in use, 1.60 GB left for experts
 ```
+
+大きいデスクトップのカードは CUDA の文脈・MTP・scratch がノート PC より大きく（RTX 5090 + Ornith で 1.41 GB、8 GB の
+報告から読める値は約 1 GB）、`STRATA_GLM_VRAM_GB=8` では本物の 8 GB カードより置き場が小さくなります — Ornith で
+層あたり 9 個のところが 4 個になり、床の置き場は prompt の chunk を貸せません。報告を再現するときは置き場の大きさを
+直接与えます: `STRATA_GLM_POOL_GB` = 報告者のログの `expert pool N GB`（冒頭の表は Ornith 1.45、GLM-5.3-Flash 1.2）。
