@@ -2793,6 +2793,33 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                                  "(STRATA_GLM_PCIE_SHARE_LATE)\n", dev_, ls, F->late_after);
         }
     }
+    // THE LEAN (issue #23): the split above hides the CPU lane behind the PCIe lane, and so keeps one expert of a route
+    // on the link whenever the CPU's whole route would take longer than that one copy.  On a box whose CPU does an
+    // expert much faster than the link, that one copy is dearer than it looks: both lanes read the same DRAM, and the
+    // copy's zero-copy kernel sits on the compute stream before the layer's experts (an RTX A2000 8 GB on Gen4 x8,
+    // Ryzen 9 7940HX: 0.055 ms on the CPU vs 0.282 over PCIe; the split kept 7 of 8 on the CPU at 16.8 tok/s, every
+    // one of them 18.5 - and an H100 reported 0.099 vs 0.448 the same way).  When the CPU is STRATA_GLM_LANE_LEAN (4)
+    // times faster, every RAM-tier expert goes to the CPU - once the pool has settled (the ":settle" switch below,
+    // issue #14: from the start, the lane's share alone would never refill the pool after a prompt), and back when
+    // the hit rate falls.  0 keeps the split; STRATA_GLM_PCIE_SHARE / _LATE / CPU_PLAN set by hand win.  A card
+    // whose split already sends every RAM-tier expert to the CPU (a Gen4 x4 / OCuLink link) is as before.
+    static const double lean = [] {
+        const char* v = getenv("STRATA_GLM_LANE_LEAN");
+        return v != nullptr ? std::max(0.0, std::atof(v)) : 4.0;
+    }();
+    if (lean > 0.0 && pv == nullptr && sv == nullptr && getenv("STRATA_GLM_PCIE_SHARE_LATE") == nullptr &&
+        c_ms * lean <= pd_ms) {
+        unsigned long long all_cpu = 0ull;
+        for (int f = 0; f <= plan_f(g); ++f) all_cpu |= (unsigned long long) f << (4 * f);
+        if (plan != all_cpu) {
+            F->cpu_plan_late = all_cpu;
+            F->settle = true;
+            std::fprintf(stderr, "glm fast: CUDA%d CPU lane: the CPU does an expert %.1fx faster than the link - every "
+                                 "RAM-tier expert goes to the CPU once the pool settles (windows of %d token steps), the "
+                                 "split below until then and when the VRAM hits fall (STRATA_GLM_LANE_LEAN=0 keeps the "
+                                 "split)\n", dev_, pd_ms / std::max(1e-6, c_ms), F->settle_win);
+        }
+    }
     F->md.cpu_seq = F->cpu_seq_d;
     F->md.cpu_ans = dp;
     // the route counts that pick the coldest RAM-tier experts for the host, seeded with the tiers' LFU counts
