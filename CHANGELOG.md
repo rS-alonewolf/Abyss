@@ -7,6 +7,41 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.87 - 2026-10-31
+
+Qwen3.8-Flash-Next with its MTP drafter decodes about 12% faster. RTX 5090 (PCIe Gen4 x4) with ISTA-DASLab GSQ-RCO
+IQ3_S, ctx 32K, the v1.3.86 and v1.3.87 builds alternated in one session (4 greedy answers of 256 tokens, twice):
+
+| | v1.3.86 | v1.3.87 |
+| --- | ---: | ---: |
+| `./abyss.sh --bench` decode (3 questions, MTP drafter on) | 116.1 tok/s | 128.5-129.5 tok/s |
+| 4 answers, drafter on (mean) | ~116 | ~130 |
+| token by token (`GEN spec=0`), the 4 answers' mean | ~106 | ~107 (unchanged) |
+| quality check (KL against bench/ref) | 0.0022 | 0.0022 |
+
+- **The MTP verify windows' hyper-connection mixes run in two launches instead of five, with the same bits**, as the
+  token path's since v1.3.86 (`hc4_fused_parity` now also checks windows of 1-8 columns byte for byte). The five
+  launches read every column's normed streams (40 KB each) once a row and they did not fit in L1: a window's 97 mixes
+  took 2.6 ms at 2 columns and 5.5 ms at 5; now 1.8 and 2.6. Drafter on +7.7%. `STRATA_Q4X_HC_FUSE=2` keeps the token
+  path fused and the windows on five launches (for A/B); off by default on HIP, as before.
+- **The MoE route kernel picks its top-k with the GPU's warp reductions** (NVIDIA, sm_80 and newer) and writes the
+  request to the CPU side a thread an entry. The same experts in the same order as before (checked against the old
+  selection over 64-512 experts, 1-16 picks, ties, -inf and +-0), so every model's output is unchanged; a route takes
+  ~45k -> ~36.5k GPU cycles. Qwen3.8: drafter on and token by token both +2%. Every model routes through this kernel
+  (GLM, DeepSeek V4 / V4.1, Ornith, Qwen3.8); HIP keeps the old selection.
+- **Qwen3.8 reads a verify window's PLE table rows while the drafter runs**: each window token's 16 rows are
+  prefetched into the row cache as soon as the drafter knows the token, so the window waits for its rows 0.1-0.25 ms
+  instead of 0.8-1.1 ms (in the engine a 4 KB SSD read takes ~0.3 ms, not 0.1, beside the CPU lane). Drafter on +3.1%.
+  `STRATA_Q4X_PLE_PREFETCH=0` turns it off. The window's read no longer starts a thread.
+- Other models (the route kernel change), on the 5090 against the v1.3.86 build:
+  GLM-5.3-Flash Maya-S-v2 IQ2_XXS (ctx 64K): decode 64.3 / 64.0 tok/s against 64.2, 8K prompt 1087 / 1091 against
+  1087, quality KL 0.039-0.040 against 0.049 (the same "slightly off" as v1.3.86's).
+  DeepSeek V4.1 UD-IQ2_XXS (ctx 64K, no DSpark): decode 22.9 / 20.7 tok/s against 21.6, 8K prompt 360 / 319 against
+  356 (SSD-bound: the second run met a slow SSD spell, 2.7 GB/s), KL 0.0081 / 0.0082 against 0.0080.
+  One drafter check of each model parted early (GLM at token 7, V4.1 at 0) and the next run of the same build did not
+  (52, 161); the v1.3.86 build did the same on GLM in its own check (7, then 22).
+- HIP is unchanged by default (it compiles); not checked on an AI PRO R9700 (not in the PC).
+
 ## v1.3.86 - 2026-10-31
 
 Qwen3.8-Flash-Next decodes about a third faster. RTX 5090 (PCIe Gen4 x4) with ISTA-DASLab GSQ-RCO IQ3_S, ctx 32K:
