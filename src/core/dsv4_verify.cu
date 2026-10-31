@@ -1659,6 +1659,13 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
             q35::attn_prep_rows(V->q35_qf, V->q35_k, V->q35_v, Ly.q_norm, Ly.k_norm, g.norm_eps, g.n_head, g.attn_head_kv, D,
                                 g.n_rot, g.rope_base, p0, T, Ly.kc, Ly.vc, V->q35_q, s);
             const float scale = 1.0f / std::sqrt((float) D);
+            // STRATA_Q4X_QSA_DECODE (on for CUDA, off on HIP): the QSA layer's keys and attention for the window's
+            // columns at once (below); the same bits
+#if defined(STRATA_USE_HIP)
+            static const bool rows_attn = [] { const char* v = getenv("STRATA_Q4X_QSA_DECODE"); return v != nullptr && std::atoi(v) != 0; }();
+#else
+            static const bool rows_attn = [] { const char* v = getenv("STRATA_Q4X_QSA_DECODE"); return v == nullptr || std::atoi(v) != 0; }();
+#endif
             if (Ly.q4_pooled != nullptr) {
                 // the indexer's raw keys (kept a layer for the rewind) and queries (BF16 rows against the float
                 // columns), the block keys a column
@@ -1668,9 +1675,13 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
                 ij[1] = {Ly.q4_iq.q, nullptr, V->x, V->q4_iq, nullptr, 1.0f, Ly.q4_iq.type, E, IH * ID};
                 if (!gf::mvn(ij, 2, T, s)) { err = "qwen4exp verify: the indexer projections"; return false; }
                 const k::QsaIndexerBuffers ib{Ly.q4_tail, Ly.q4_dead, Ly.q4_pooled, Ly.q4_bpos};
-                for (int t = 0; t < T; ++t)
-                    k::indexer_key_append(rawk + (size_t) t * ID, V->q4_steps + (size_t) t * 4 + k::kStepPos, 0,
-                                          Ly.q4_ikn, g.norm_eps, ib, sh, F->q4_cos, F->q4_sin, (void*) s);
+                if (rows_attn)   // (the window's keys in two launches, the same buffers)
+                    k::indexer_key_append_rows(rawk, ID, p0, T, 0, Ly.q4_ikn, g.norm_eps, ib, sh, F->q4_cos, F->q4_sin,
+                                               (void*) s);
+                else
+                    for (int t = 0; t < T; ++t)
+                        k::indexer_key_append(rawk + (size_t) t * ID, V->q4_steps + (size_t) t * 4 + k::kStepPos, 0,
+                                              Ly.q4_ikn, g.norm_eps, ib, sh, F->q4_cos, F->q4_sin, (void*) s);
                 bool any = false;
                 for (int t = 0; t < T && !any; ++t) any = k::qsa_selection_width(p0 + t + 1, sh) < p0 + t + 1;
                 if (any) {
@@ -1678,7 +1689,27 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
                     k::rope_neox_apply(V->q4_iq, V->q4_iq, (int64_t) T * IH, ID, g.n_rot, F->q4_cos, F->q4_sin, ipos, (void*) s);
                 }
             }
-            for (int t = 0; t < T; ++t) {
+            // the window's columns in one launch when they are all past 2,051 cells (one selection call for them all,
+            // then each column's cells read in place) or all below (every cell); a window across the bound: a column
+            // at a time
+            bool cols_done = false;
+            if (rows_attn && Ly.q4_pooled != nullptr && F->q4_pf_part != nullptr && T <= FastState::kQ4Grp) {
+                const bool sel_all = k::qsa_selection_width(p0 + 1, sh) < p0 + 1;
+                const bool dense_all = k::qsa_selection_width(p0 + T, sh) == p0 + T;
+                if (sel_all) {
+                    k::qsa_block_scores(Ly.q4_pooled, Ly.q4_dead, V->q4_iq, V->q4_steps, T, F->q4_max_blocks, sh,
+                                        F->q4_pf_scores, (void*) s);
+                    k::qsa_block_topk(F->q4_pf_scores, V->q4_steps, T, F->q4_max_blocks, F->q4_cap, sh, F->q4_pf_ids,
+                                      (void*) s);
+                    cols_done = q35::attn_decode_rows(V->q35_q, Ly.kc, Ly.vc, F->q4_pf_ids, F->q4_cap, V->q4_steps, T,
+                                                      F->q4_cap, g.n_head, g.attn_head_kv, D, scale, F->q4_pf_part,
+                                                      V->q35_ao, s);
+                } else if (dense_all) {
+                    cols_done = q35::attn_decode_rows(V->q35_q, Ly.kc, Ly.vc, nullptr, 0, V->q4_steps, T, (int) (p0 + T),
+                                                      g.n_head, g.attn_head_kv, D, scale, F->q4_pf_part, V->q35_ao, s);
+                }
+            }
+            for (int t = 0; t < T && !cols_done; ++t) {
                 const int64_t p = p0 + t;
                 const int w = Ly.q4_pooled != nullptr ? (int) k::qsa_selection_width(p + 1, sh) : (int) (p + 1);
                 float* ao = V->q35_ao + (size_t) t * HD;

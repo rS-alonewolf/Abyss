@@ -804,6 +804,14 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
                    g.rope_base, p, Ly.kc, Ly.vc, F->q35_q, s);
     namespace k = strata::kernels;
     int width = p + 1;
+    // STRATA_Q4X_QSA_DECODE (on for CUDA, off on HIP): the QSA layer's attention reads its cells in place, a few query
+    // heads a block (q35::attn_decode_rows), not a gathered copy and attn_decode; the same bits
+#if defined(STRATA_USE_HIP)
+    static const bool rows_attn = [] { const char* v = getenv("STRATA_Q4X_QSA_DECODE"); return v != nullptr && std::atoi(v) != 0; }();
+#else
+    static const bool rows_attn = [] { const char* v = getenv("STRATA_Q4X_QSA_DECODE"); return v == nullptr || std::atoi(v) != 0; }();
+#endif
+    bool done = false;
     if (qsa) {
         const k::QsaShapes sh = k::qsa_real_shapes();
         if (F->q4_step_at != p64) {   // the step record and the rows' positions, once a token
@@ -825,13 +833,22 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
             k::qsa_block_scores(Ly.q4_pooled, Ly.q4_dead, F->q4_iq, F->q4_step, 1, F->q4_max_blocks, sh, F->q4_scores,
                                 (void*) s);
             k::qsa_block_topk(F->q4_scores, F->q4_step, 1, F->q4_max_blocks, F->q4_cap, sh, F->q4_ids, (void*) s);
-            q35::gather_rows(Ly.kc, Ly.vc, F->q4_ids, width, KV, F->q4_ks, F->q4_vs, s);
+            if (!(rows_attn && q35::attn_decode_rows(F->q35_q, Ly.kc, Ly.vc, F->q4_ids, F->q4_cap, F->q4_step, 1, width,
+                                                     g.n_head, g.attn_head_kv, D, 1.0f / std::sqrt((float) D),
+                                                     F->q35_part, F->q35_ao, s)))
+                q35::gather_rows(Ly.kc, Ly.vc, F->q4_ids, width, KV, F->q4_ks, F->q4_vs, s);
+            else
+                done = true;
+        } else if (rows_attn && !dense &&
+                   q35::attn_decode_rows(F->q35_q, Ly.kc, Ly.vc, nullptr, 0, F->q4_step, 1, width, g.n_head,
+                                         g.attn_head_kv, D, 1.0f / std::sqrt((float) D), F->q35_part, F->q35_ao, s)) {
+            done = true;   // (the dense row: every cell, read in place the same way)
         }
     }
-    if (width < p + 1)
+    if (!done && width < p + 1)
         q35::attn_decode(F->q35_q, F->q4_ks, F->q4_vs, g.n_head, g.attn_head_kv, D, width, 1.0f / std::sqrt((float) D),
                          F->q35_part, F->q35_ao, s);
-    else
+    else if (!done)
         q35::attn_decode(F->q35_q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, p + 1, 1.0f / std::sqrt((float) D),
                          F->q35_part, F->q35_ao, s);
     if (dumps) {

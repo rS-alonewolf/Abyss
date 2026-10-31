@@ -3,8 +3,11 @@
 // GPU, synthetic, no model: Qwen3.8's shapes (k::qsa_real_shapes(): 24 heads, 2 KV heads, head_dim 256, top-k 2,048 +
 // 3), random K / V caches, queries and ascending selections; rows past the dense window (width 2,051) and short rows
 // (width < 2,051, the empty-chunk case).  And indexer_key_append_rows against indexer_key_append a cell.  The outputs must be the same bytes; then both are timed for a group of 64.
+// Also the decode shapes: the token path's 1 row and the MTP windows' 2-8 (every heads-a-block choice, timed), the dense
+// rows (ids null: every cell), and the window's selection for T columns in one call against T calls.
 // Usage: qsa_rows_parity [reps=50]
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/qwen35_fast.hpp"
 
 #include <cuda_runtime.h>
@@ -48,7 +51,8 @@ uint16_t f2h(float f) {   // round to nearest even FP16 (values here are small a
 }  // namespace
 
 // rows at positions pos0.., a cache of ctx cells; true: the same bytes
-bool run(int ctx, int64_t pos0, int rows, int reps, std::mt19937& rng) {
+// dense: the rows attend to every cell up to their own (no selection; old = attn_decode on the cache); hpw: heads a block
+bool run(int ctx, int64_t pos0, int rows, int reps, std::mt19937& rng, int hpw = 0, bool dense = false) {
     const k::QsaShapes sh = k::qsa_real_shapes();
     const int NH = (int) sh.n_head, NKV = (int) sh.n_head_kv, D = (int) sh.head_dim, KV = NKV * D, HD = NH * D;
     const int cap = (int) k::qsa_selection_width(k::kTopkMaxCells, sh);
@@ -88,13 +92,19 @@ bool run(int ctx, int64_t pos0, int rows, int reps, std::mt19937& rng) {
     cudaStream_t s = nullptr;
     const auto old_path = [&] {
         for (int r = 0; r < rows; ++r) {
+            if (dense) {
+                q35::attn_decode(dq + (size_t) r * HD, dkc, dvc, NH, NKV, D, width[r], scale, part_a, oa + (size_t) r * HD, s);
+                continue;
+            }
             q35::gather_rows(dkc, dvc, dids + (size_t) r * cap, width[r], KV, ks, vs, s);
             q35::attn_decode(dq + (size_t) r * HD, ks, vs, NH, NKV, D, width[r], scale, part_a, oa + (size_t) r * HD, s);
         }
     };
     bool launched = true;
     const auto new_path = [&] {
-        launched = q35::attn_decode_rows(dq, dkc, dvc, dids, cap, dst, rows, cap, NH, NKV, D, scale, part_b, ob, s);
+        launched = q35::attn_decode_rows(dq, dkc, dvc, dense ? nullptr : dids, cap, dst, rows,
+                                         dense ? *std::max_element(width.begin(), width.end()) : cap, NH, NKV, D, scale,
+                                         part_b, ob, s, hpw);
     };
     old_path();
     new_path();
@@ -109,8 +119,8 @@ bool run(int ctx, int64_t pos0, int rows, int reps, std::mt19937& rng) {
         if (std::memcmp(&ha[i], &hb[i], 4) != 0) ++diff;
         maxd = std::max(maxd, (double) std::fabs(ha[i] - hb[i]));
     }
-    std::printf("ctx %d, rows %d at %lld.. (widths %d..%d): %zu of %zu floats differ (max |d| %.3g) %s\n", ctx, rows,
-                (long long) pos0, width.front(), width.back(), diff, ha.size(), maxd, diff == 0 ? "SAME" : "DIFFERENT");
+    std::printf("%sctx %d, rows %d at %lld.. (widths %d..%d), hpw %d: %zu of %zu floats differ (max |d| %.3g) %s\n", dense ? "dense " : "", ctx, rows,
+                (long long) pos0, width.front(), width.back(), hpw, diff, ha.size(), maxd, diff == 0 ? "SAME" : "DIFFERENT");
     if (reps > 0) {
         const auto time = [&](auto&& f) {
             f();
@@ -121,7 +131,7 @@ bool run(int ctx, int64_t pos0, int rows, int reps, std::mt19937& rng) {
             return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
         };
         const double ta = time(old_path), tb = time(new_path);
-        std::printf("  a group: per-row %.1f us, batched %.1f us (%.1fx)\n", ta, tb, ta / tb);
+        std::printf("  per-row %.1f us, batched %.1f us (%.2fx)\n", ta, tb, ta / tb);
     }
     cudaFree(dkc); cudaFree(dvc); cudaFree(ks); cudaFree(vs); cudaFree(dq); cudaFree(dids); cudaFree(dst);
     cudaFree(oa); cudaFree(ob); cudaFree(part_a); cudaFree(part_b);
@@ -183,6 +193,42 @@ bool run_append(std::mt19937& rng) {
     return ok;
 }
 
+// the window's selection for T columns in one qsa_block_scores + qsa_block_topk against T one-column calls: the same ids
+bool run_select(int ctx, int64_t pos0, int T, std::mt19937& rng) {
+    const k::QsaShapes sh = k::qsa_real_shapes();
+    const int ID = (int) sh.idx_dim, IH = (int) sh.idx_n_head;
+    const int cap = (int) k::qsa_selection_width(k::kTopkMaxCells, sh), max_blocks = ctx / (int) sh.idx_block + 2;
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> pooled((size_t) max_blocks * ID), dead(ID), iq((size_t) T * IH * ID);
+    for (auto& x : pooled) x = nd(rng);
+    for (auto& x : dead) x = nd(rng);
+    for (auto& x : iq) x = nd(rng);
+    std::vector<int32_t> steps((size_t) T * 4);
+    for (int t = 0; t < T; ++t) k::qsa_step_fill(steps.data() + (size_t) t * 4, pos0 + t, sh);
+    float *dp = up(pooled), *dd = up(dead), *dq = up(iq), *sa, *sb;
+    int32_t *dst = up(steps), *ia, *ib;
+    ck(cudaMalloc(&sa, (size_t) T * max_blocks * 4), "m");
+    ck(cudaMalloc(&sb, (size_t) max_blocks * 4), "m");
+    ck(cudaMalloc(&ia, (size_t) T * cap * 4), "m");
+    ck(cudaMalloc(&ib, (size_t) T * cap * 4), "m");
+    ck(cudaMemset(ia, 0, (size_t) T * cap * 4), "set");
+    ck(cudaMemset(ib, 0, (size_t) T * cap * 4), "set");
+    k::qsa_block_scores(dp, dd, dq, dst, T, max_blocks, sh, sa, nullptr);
+    k::qsa_block_topk(sa, dst, T, max_blocks, cap, sh, ia, nullptr);
+    for (int t = 0; t < T; ++t) {
+        k::qsa_block_scores(dp, dd, dq + (size_t) t * IH * ID, dst + (size_t) t * 4, 1, max_blocks, sh, sb, nullptr);
+        k::qsa_block_topk(sb, dst + (size_t) t * 4, 1, max_blocks, cap, sh, ib + (size_t) t * cap, nullptr);
+    }
+    ck(cudaDeviceSynchronize(), "sync");
+    std::vector<int32_t> ha((size_t) T * cap), hb((size_t) T * cap);
+    ck(cudaMemcpy(ha.data(), ia, ha.size() * 4, cudaMemcpyDeviceToHost), "down");
+    ck(cudaMemcpy(hb.data(), ib, hb.size() * 4, cudaMemcpyDeviceToHost), "down");
+    const bool ok = ha == hb;
+    std::printf("selection, %d columns at %lld: %s\n", T, (long long) pos0, ok ? "SAME" : "DIFFERENT");
+    cudaFree(dp); cudaFree(dd); cudaFree(dq); cudaFree(sa); cudaFree(sb); cudaFree(dst); cudaFree(ia); cudaFree(ib);
+    return ok;
+}
+
 int main(int argc, char** argv) {
     const int reps = argc > 1 ? std::atoi(argv[1]) : 50;
     std::mt19937 rng(7);
@@ -193,6 +239,15 @@ int main(int argc, char** argv) {
     ok = run(32768, 12345, 37, 0, rng) && ok;      // a short group
     ok = run(4096, 1990, 64, 0, rng) && ok;        // widths below 2,051: rows end in empty chunks
     ok = run(4096, 3, 20, 0, rng) && ok;           // tiny widths
+    // the token path (1 row) and the MTP verify windows (2-8 rows): every heads-a-block choice, timed
+    for (int rows : {1, 2, 3, 5, 8})
+        for (int hpw : {1, 2, 3, 4, 6}) ok = run(16384, 9000, rows, reps * 4, rng, hpw) && ok;
+    for (int rows : {1, 4, 8}) ok = run(16384, 9000, rows, reps * 4, rng, 0) && ok;
+    // the dense rows (below 2,051 cells: every cell, no selection)
+    for (int rows : {1, 5}) ok = run(4096, 1200, rows, reps * 4, rng, 0, true) && ok;
+    for (int rows : {1, 8}) ok = run(4096, 2042, rows, 0, rng, 2, true) && ok;
+    ok = run(4096, 0, 3, 0, rng, 1, true) && ok;
+    for (int T : {1, 3, 8}) ok = run_select(16384, 9000 + T, T, rng) && ok;
     std::printf("%s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

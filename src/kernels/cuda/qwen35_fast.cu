@@ -225,7 +225,7 @@ __global__ void __launch_bounds__(kWarps * 32) attn_part_ids_kernel(const float*
     const int g = h0 / (n_head / n_head_kv);
     const int n_pos = steps[(size_t) r * 4 + 3];
     const int t0 = c * kChunk, t1 = min(n_pos, t0 + kChunk);
-    const int32_t* id = ids + (size_t) r * ld_ids;
+    const int32_t* id = ids != nullptr ? ids + (size_t) r * ld_ids : nullptr;   // null: the cells 0 .. n_pos - 1
     const float* qr = q + (size_t) r * n_head * kD;
     float qv[HPW][8], m[HPW], l[HPW], acc[HPW][8];
 #pragma unroll
@@ -238,24 +238,46 @@ __global__ void __launch_bounds__(kWarps * 32) attn_part_ids_kernel(const float*
         m[j] = -INFINITY;
         l[j] = 0.0f;
     }
-    for (int t = t0 + warp; t < t1; t += kWarps) {
-        const size_t row = ((size_t) id[t] * n_head_kv + g) * kD + lane * 8;
-        const uint4 kw = *(const uint4*) (kc + row);
-        const uint4 vw = *(const uint4*) (vc + row);
-        const uint16_t* kh = (const uint16_t*) &kw;
-        const uint16_t* vh = (const uint16_t*) &vw;
+    // kU of the warp's keys at a time: their ids and K / V rows loaded first, their dots next (independent), then the
+    // softmax steps in key order - the loads and dots overlap, each key's arithmetic and the order stay attn_part's
+    constexpr int kU = 8;
+    for (int tb = t0 + warp; tb < t1; tb += kWarps * kU) {
+        uint4 kw[kU], vw[kU];
 #pragma unroll
-        for (int j = 0; j < HPW; ++j) {
-            float dot = 0.0f;
+        for (int u = 0; u < kU; ++u) {
+            const int t = tb + u * kWarps;
+            if (t < t1) {
+                const size_t row = ((size_t) (id != nullptr ? id[t] : t) * n_head_kv + g) * kD + lane * 8;
+                kw[u] = *(const uint4*) (kc + row);
+                vw[u] = *(const uint4*) (vc + row);
+            }
+        }
+        float sc[kU][HPW];
 #pragma unroll
-            for (int i = 0; i < 8; ++i) dot += qv[j][i] * h2f(kh[i]);
-            const float sc = warp_sum(dot);
-            const float mn = fmaxf(m[j], sc);
-            const float a = expf(m[j] - mn), pr = expf(sc - mn);
-            l[j] = l[j] * a + pr;
+        for (int u = 0; u < kU; ++u) {
+            if (tb + u * kWarps >= t1) break;
+            const uint16_t* kh = (const uint16_t*) &kw[u];
 #pragma unroll
-            for (int i = 0; i < 8; ++i) acc[j][i] = acc[j][i] * a + pr * h2f(vh[i]);
-            m[j] = mn;
+            for (int j = 0; j < HPW; ++j) {
+                float dot = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) dot += qv[j][i] * h2f(kh[i]);
+                sc[u][j] = warp_sum(dot);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kU; ++u) {
+            if (tb + u * kWarps >= t1) break;
+            const uint16_t* vh = (const uint16_t*) &vw[u];
+#pragma unroll
+            for (int j = 0; j < HPW; ++j) {
+                const float mn = fmaxf(m[j], sc[u][j]);
+                const float a = expf(m[j] - mn), pr = expf(sc[u][j] - mn);
+                l[j] = l[j] * a + pr;
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[j][i] = acc[j][i] * a + pr * h2f(vh[i]);
+                m[j] = mn;
+            }
         }
     }
 #pragma unroll
@@ -1440,9 +1462,19 @@ void attn_decode(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
 size_t attn_rows_part_floats(int rows, int n_head, int head_dim, int max_ids) {
     return (size_t) rows * n_head * (size_t) ((max_ids + kChunk - 1) / kChunk) * ((size_t) head_dim + 2);
 }
+static int rows_hpw(int G, int rows, int n_chunks) {
+    static const int env = [] { const char* v = getenv("STRATA_Q35_ROWS_HPW"); return v ? std::atoi(v) : 0; }();
+    // RTX 5090, 24 / 2 heads, 2,051 cells (qsa_rows_parity): a row 2 (1.2x gather + attn_decode; 6: 0.8x), 2-5 rows
+    // 4 (2.1-4.4x), more 6 (5.3x at 8, 6.5x at 64)
+    int want = env > 0 ? env : rows <= 1 ? 2 : rows <= 5 ? 4 : 6;
+    (void) n_chunks;
+    for (; want > 1; --want)
+        if (want != 5 && G % want == 0) break;
+    return want;
+}
 bool attn_decode_rows(const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* ids, int ld_ids,
                       const int32_t* steps, int rows, int max_ids, int n_head, int n_head_kv, int head_dim, float scale,
-                      float* part, float* out, cudaStream_t s) {
+                      float* part, float* out, cudaStream_t s, int hpw) {
     if (rows <= 0) return true;
     if (head_dim != kD || max_ids <= 0 || n_head_kv <= 0 || n_head % n_head_kv != 0) return false;
     // attn_decode's own kernel for this shape: attn_split takes G % 8 == 0 (G <= 64) unless STRATA_Q35_ATTN=1, and
@@ -1451,7 +1483,8 @@ bool attn_decode_rows(const float* q, const uint16_t* kc, const uint16_t* vc, co
     const int G = n_head / n_head_kv;
     if (mode != 1 && G % 8 == 0 && G <= 64) return false;
     const int n_chunks = (max_ids + kChunk - 1) / kChunk;
-    const int hpw = G % 6 == 0 ? 6 : G % 4 == 0 ? 4 : G % 3 == 0 ? 3 : G % 2 == 0 ? 2 : 1;
+    // heads a block: more share a K / V row load, fewer give more blocks (a token's single row: 1 = attn_part's grid)
+    if (hpw <= 0 || G % hpw != 0 || hpw == 5 || hpw > 6) hpw = rows_hpw(G, rows, n_chunks);
     const dim3 grid((unsigned) (n_head / hpw), (unsigned) n_chunks, (unsigned) rows);
     switch (hpw) {
 #define Q35_IDS(n) case n: attn_part_ids_kernel<n><<<grid, kWarps * 32, 0, s>>>(q, kc, vc, ids, ld_ids, steps, n_head, n_head_kv, scale, part, n_chunks); break;
