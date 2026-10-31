@@ -716,39 +716,57 @@ bool Glm5Model::fast_qwen35_gdn(int il, std::string& err) {
         q35_dump(s, "k_conv", il, F->q35_h + (size_t) HK * S, (int64_t) HK * S);
         q35_dump(s, "v_conv", il, F->q35_h + (size_t) 2 * HK * S, (int64_t) HV * S);
     }
-    // the q and k heads L2-normed, q scaled, the gates (softplus(alpha + dt) * A, sigmoid(beta)) in one launch
-    // (the gate lands over alpha: F->q35_ab [0, HV), beta's sigmoid over beta: [HV, 2 HV))
-    q35::gdn_prep_gates(F->q35_h, 1, C, HK, S, g.norm_eps, F->q35_ab, F->q35_ab + HV, Ly.dt_bias, Ly.ssm_a, HV, s);
-    if (dumps) {
-        q35_dump(s, "q_conv_predelta", il, F->q35_h, (int64_t) HK * S);
-        q35_dump(s, "k_conv_predelta", il, F->q35_h + (size_t) HK * S, (int64_t) HK * S);
-    }
-    // 3. the recurrence (the state in place), the gated norm, the output projection
-    if (dumps) {
-        q35_dump(s, "gate", il, F->q35_ab, HV);
-        q35_dump(s, "beta_sigmoid", il, F->q35_ab + HV, HV);
-    }
-    // the recurrence: the prompt path's scan over one row (a block a value head, the state column in registers: the
-    // state read and written once, 8 MB a layer) - gdn.hpp's two-pass kernel behind STRATA_Q35_GDN_STEP=1 (the A/B)
     static const bool old_step = getenv("STRATA_Q35_GDN_STEP") != nullptr;
-    if (old_step) {
-        strata::kernels::GdnShapes sh;
-        sh.S = S;
-        sh.h_k = HK;
-        sh.h_v = HV;
-        strata::kernels::gdn_step(Ly.gdn_state, F->q35_h, F->q35_h + (size_t) HK * S, F->q35_h + (size_t) 2 * HK * S,
-                                  F->q35_ab, F->q35_ab + HV, F->q35_o, sh, (void*) s);
+    // qwen4exp: the heads' L2 norm, the gates, the recurrence, the output norm and y's q8_1 in one launch
+    // (q35::gdn_core, the same bits as the launches below - gdn_core_parity).  STRATA_Q4X_GDN_FUSE=0: those launches.
+    // Off by default with HIP (unmeasured there): STRATA_Q4X_GDN_FUSE=1 there
+    static const bool gdn_fuse = [] {
+        const char* v = getenv("STRATA_Q4X_GDN_FUSE");
+#if defined(STRATA_USE_HIP)
+        return v != nullptr && std::atoi(v) != 0;
+#else
+        return v == nullptr || std::atoi(v) != 0;
+#endif
+    }();
+    if (g.q4x && gdn_fuse && !old_step && !dumps && S == 128) {
+        q35::gdn_core(Ly.gdn_state, F->q35_h, 1, C, F->q35_ab, F->q35_ab + HV, S, HK, HV, true, g.norm_eps, Ly.dt_bias,
+                      Ly.ssm_a, F->q35_z, Ly.ssm_norm, g.norm_eps, F->q35_y, F->q35_yq, s);
+        if (F->prof_on) F->mark("q35_gdn");
     } else {
-        q35::gdn_scan(Ly.gdn_state, F->q35_h, 1, C, F->q35_ab, F->q35_ab + HV, S, HK, HV, F->q35_o, s);
+        // the q and k heads L2-normed, q scaled, the gates (softplus(alpha + dt) * A, sigmoid(beta)) in one launch
+        // (the gate lands over alpha: F->q35_ab [0, HV), beta's sigmoid over beta: [HV, 2 HV))
+        q35::gdn_prep_gates(F->q35_h, 1, C, HK, S, g.norm_eps, F->q35_ab, F->q35_ab + HV, Ly.dt_bias, Ly.ssm_a, HV, s);
+        if (dumps) {
+            q35_dump(s, "q_conv_predelta", il, F->q35_h, (int64_t) HK * S);
+            q35_dump(s, "k_conv_predelta", il, F->q35_h + (size_t) HK * S, (int64_t) HK * S);
+        }
+        // 3. the recurrence (the state in place), the gated norm, the output projection
+        if (dumps) {
+            q35_dump(s, "gate", il, F->q35_ab, HV);
+            q35_dump(s, "beta_sigmoid", il, F->q35_ab + HV, HV);
+        }
+        // the recurrence: the prompt path's scan over one row (a block a value head, the state column in registers: the
+        // state read and written once, 8 MB a layer) - gdn.hpp's two-pass kernel behind STRATA_Q35_GDN_STEP=1 (the A/B)
+        if (old_step) {
+            strata::kernels::GdnShapes sh;
+            sh.S = S;
+            sh.h_k = HK;
+            sh.h_v = HV;
+            strata::kernels::gdn_step(Ly.gdn_state, F->q35_h, F->q35_h + (size_t) HK * S,
+                                      F->q35_h + (size_t) 2 * HK * S, F->q35_ab, F->q35_ab + HV, F->q35_o, sh,
+                                      (void*) s);
+        } else {
+            q35::gdn_scan(Ly.gdn_state, F->q35_h, 1, C, F->q35_ab, F->q35_ab + HV, S, HK, HV, F->q35_o, s);
+        }
+        if (dumps) q35_dump(s, "gdn_o", il, F->q35_o, V);
+        if (g.q4x)   // (qwen4exp: a sigmoid output gate)
+            strata::kernels::gdn_out_norm(F->q35_o, F->q35_z, Ly.ssm_norm, F->q35_y, HV, S, g.norm_eps, (void*) s);
+        else
+            strata::kernels::gdn_out_norm_silu(F->q35_o, F->q35_z, Ly.ssm_norm, F->q35_y, HV, S, g.norm_eps, (void*) s);
+        if (F->prof_on) F->mark("q35_gdn");
+        if (dumps) q35_dump(s, "final_output", il, F->q35_y, V);
+        gf::quantize_q8_1(F->q35_y, F->q35_yq, V, s);
     }
-    if (dumps) q35_dump(s, "gdn_o", il, F->q35_o, V);
-    if (g.q4x)   // (qwen4exp: a sigmoid output gate)
-        strata::kernels::gdn_out_norm(F->q35_o, F->q35_z, Ly.ssm_norm, F->q35_y, HV, S, g.norm_eps, (void*) s);
-    else
-        strata::kernels::gdn_out_norm_silu(F->q35_o, F->q35_z, Ly.ssm_norm, F->q35_y, HV, S, g.norm_eps, (void*) s);
-    if (F->prof_on) F->mark("q35_gdn");
-    if (dumps) q35_dump(s, "final_output", il, F->q35_y, V);
-    gf::quantize_q8_1(F->q35_y, F->q35_yq, V, s);
     gf::MvJob o = {Ly.ssm_o.q, F->q35_yq, F->q35_y, F->mixer, nullptr, 1.0f, Ly.ssm_o.type, V, E};
     if (!gf::mv(&o, 1, s)) { err = "qwen35moe: ssm_out"; return false; }
     if (F->prof_on) F->mark("q35_gdn_out");

@@ -65,6 +65,13 @@ void conv_silu_step(float* conv_state, const float* x, const float* kW, int C, i
 /// conv rows (stride C), gate / beta [T][h_v]; o [T][h_v * S].  S == 128.
 void gdn_scan(float* state, const float* h, int T, int C, const float* gate, const float* beta, int S, int h_k, int h_v,
               float* o, cudaStream_t s);
+/// gdn_scan with the launches around it in one, the same bits (gdn_core_parity): prep - h holds the conv's raw rows
+/// and gate / beta the raw alpha / beta, the heads' L2 norm and the gates computed in the kernel (gdn_prep_gates', not
+/// written back); without prep they are gdn_prep_gates' outputs.  Then the output norm with the sigmoid gate
+/// (gdn_out_norm's, z / ssm_norm / out_eps) into y [T][h_v][S] and y's q8_1 (yq, may be null).  S 128.
+void gdn_core(float* state, const float* h, int T, int C, const float* gate, const float* beta, int S, int h_k, int h_v,
+              bool prep, float eps, const float* dt_bias, const float* ssm_a, const float* z, const float* ssm_norm,
+              float out_eps, float* y, void* yq, cudaStream_t s);
 /// attn_prep over T rows at positions p0 + t: q_full [T][n_head][2 * head_dim], k / v [T][n_head_kv][head_dim] ->
 /// q [T][n_head][head_dim] and the caches' rows p0 .. p0 + T - 1.
 void attn_prep_rows(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,

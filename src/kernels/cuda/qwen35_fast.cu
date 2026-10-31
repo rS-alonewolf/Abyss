@@ -382,6 +382,87 @@ __global__ void __launch_bounds__(S) gdn_scan_kernel(float* __restrict__ state, 
 #pragma unroll
     for (int i = 0; i < S; ++i) col[(size_t) i * stride] = st[i];
 }
+// gdn_scan_kernel with the launches around it (gdn_core): prep (raw rows: the q / k heads' L2 norm and the gates computed
+// here - gdn_prep_gates_kernel's arithmetic, each block its own copy, nothing written back), the recurrence, then the
+// output norm with the sigmoid gate (gdn.cu's gdn_out_norm_kernel<false>: one warp's sums in its order) and the q8_1
+// of y (quantize_q8_1's) - one launch for four or five, the same bits.  A block a v head, S = 128 threads
+template <int S>
+__global__ void __launch_bounds__(S) gdn_core_kernel(float* __restrict__ state, const float* __restrict__ h, int T, int C,
+                                                     const float* __restrict__ gate, const float* __restrict__ beta,
+                                                     int h_k, int h_v, bool prep, float eps, float qscale,
+                                                     const float* __restrict__ dt, const float* __restrict__ A,
+                                                     const float* __restrict__ z, const float* __restrict__ ssm_norm,
+                                                     float out_eps, float* __restrict__ y, Q81* __restrict__ yq) {
+    __shared__ float ks[S], qs[S], os[S];
+    __shared__ double sh[2][4];
+    __shared__ float s_inv;
+    const int hv = blockIdx.x, j = threadIdx.x, src = hv % h_k;   // (MODULO head pairing, as gdn_step)
+    const size_t stride = (size_t) h_v * S;
+    float* col = state + (size_t) hv * S + j;
+    float st[S];
+#pragma unroll
+    for (int i = 0; i < S; ++i) st[i] = col[(size_t) i * stride];
+    for (int t = 0; t < T; ++t) {
+        const float* row = h + (size_t) t * C;
+        float qv = row[src * S + j], kv = row[(h_k + src) * S + j];
+        float g = gate[(size_t) t * h_v + hv], b = beta[(size_t) t * h_v + hv];
+        if (prep) {   // (gdn_prep_gates_kernel: a double sum a head - a warp's xor tree, then the 4 warps in order)
+            double aq = (double) qv * (double) qv, ak = (double) kv * (double) kv;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                aq += __shfl_xor_sync(0xffffffffu, aq, o);
+                ak += __shfl_xor_sync(0xffffffffu, ak, o);
+            }
+            __syncthreads();   // (the previous row's readers of sh)
+            if ((j & 31) == 0) {
+                sh[0][j >> 5] = aq;
+                sh[1][j >> 5] = ak;
+            }
+            __syncthreads();
+            const double sq = sh[0][0] + sh[0][1] + sh[0][2] + sh[0][3];
+            const double sk2 = sh[1][0] + sh[1][1] + sh[1][2] + sh[1][3];
+            qv = qv * ((float) (1.0 / sqrt(sq + (double) eps)) * qscale);
+            kv = kv * ((float) (1.0 / sqrt(sk2 + (double) eps)) * 1.0f);
+            g = softplus_f(g + dt[hv]) * A[hv];
+            b = sigmoid_f(b);
+        }
+        __syncthreads();
+        qs[j] = qv;
+        ks[j] = kv;
+        __syncthreads();
+        const float dec = expf(g);
+        const float v = row[(2 * h_k + hv) * S + j];
+        float sk = 0.0f;
+#pragma unroll
+        for (int i = 0; i < S; ++i) {
+            st[i] *= dec;
+            sk += st[i] * ks[i];
+        }
+        const float d = (v - sk) * b;
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < S; ++i) {
+            st[i] += ks[i] * d;
+            dot += st[i] * qs[i];
+        }
+        // the output norm of this (row, head): warp 0's lanes sum o[l], o[l + 32], .. in double, then shfl_down
+        os[j] = dot;
+        __syncthreads();
+        if (j < 32) {
+            double acc = 0.0;
+            for (int i = j; i < S; i += 32) acc += (double) os[i] * (double) os[i];
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xFFFFFFFFu, acc, off);
+            if (j == 0) s_inv = (float) (1.0 / sqrt(acc / (double) S + (double) out_eps));
+        }
+        __syncthreads();
+        const size_t at = ((size_t) t * h_v + hv) * S + j;
+        const float yv = os[j] * s_inv * ssm_norm[j] * sigmoid_f(z[at]);
+        y[at] = yv;
+        if (yq != nullptr) q81_store_warp(yv, yq + at / 32, j & 31);
+    }
+#pragma unroll
+    for (int i = 0; i < S; ++i) col[(size_t) i * stride] = st[i];
+}
 // attn_prep_kernel over rows: grid (n_head + n_head_kv, T), row t at position p0 + t
 __global__ void __launch_bounds__(kD) attn_prep_rows_kernel(const float* __restrict__ qf, const float* __restrict__ k,
                                                             const float* __restrict__ v, const float* __restrict__ q_norm,
@@ -1349,6 +1430,18 @@ void gdn_scan(float* state, const float* h, int T, int C, const float* gate, con
     }
     gdn_scan_kernel<128><<<h_v, 128, 0, s>>>(state, h, T, C, gate, beta, h_k, h_v, o);
     check("gdn_scan");
+}
+void gdn_core(float* state, const float* h, int T, int C, const float* gate, const float* beta, int S, int h_k, int h_v,
+              bool prep, float eps, const float* dt_bias, const float* ssm_a, const float* z, const float* ssm_norm,
+              float out_eps, float* y, void* yq, cudaStream_t s) {
+    if (T <= 0 || h_v <= 0) return;
+    if (S != 128 || h_k <= 0 || h_v % h_k != 0) {
+        std::fprintf(stderr, "qwen35 gdn_core: S %d, heads %d / %d\n", S, h_k, h_v);
+        return;
+    }
+    gdn_core_kernel<128><<<h_v, 128, 0, s>>>(state, h, T, C, gate, beta, h_k, h_v, prep, eps, 1.0f / std::sqrt((float) S),
+                                             dt_bias, ssm_a, z, ssm_norm, out_eps, y, (Q81*) yq);
+    check("gdn_core");
 }
 void attn_prep_rows(const float* q_full, const float* k, const float* v, const float* q_norm, const float* k_norm,
                     float eps, int n_head, int n_head_kv, int head_dim, int n_rot, float rope_base, int64_t p0, int T,

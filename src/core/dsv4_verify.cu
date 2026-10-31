@@ -1625,10 +1625,27 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
             q35::conv_rows(qkv, T, C, Ly.conv1d, g.d_conv, Ly.gdn_conv, rws, s);
             q35::gdn_prep_gates(rws, T, C, HK, Sd, g.norm_eps, alpha, beta, Ly.dt_bias, Ly.ssm_a, HV, s);
             if (prof) F->mark("q4w_gdn_conv");
-            q35::gdn_scan(Ly.gdn_state, rws, T, C, alpha, beta, Sd, HK, HV, V->q35_o, s);
-            if (prof) F->mark("q4w_gdn_scan");
-            k::gdn_out_norm(V->q35_o, V->q35_z, Ly.ssm_norm, V->q35_y, (int64_t) T * HV, Sd, g.norm_eps, (void*) s);
-            gf::quantize_q8_1(V->q35_y, V->q35_yq, T * Vd, s);
+            // the recurrence, the output norm and y's q8_1 in one launch (q35::gdn_core after the prep above - the rows,
+            // gates and betas stay for the rewind's replay; the same bits, gdn_core_parity).  STRATA_Q4X_GDN_FUSE=0: the
+            // three launches.  Off by default with HIP, as the token path's
+            static const bool gdn_fuse = [] {
+                const char* v = getenv("STRATA_Q4X_GDN_FUSE");
+#if defined(STRATA_USE_HIP)
+                return v != nullptr && std::atoi(v) != 0;
+#else
+                return v == nullptr || std::atoi(v) != 0;
+#endif
+            }();
+            if (gdn_fuse && Sd == 128) {
+                q35::gdn_core(Ly.gdn_state, rws, T, C, alpha, beta, Sd, HK, HV, false, g.norm_eps, nullptr, nullptr,
+                              V->q35_z, Ly.ssm_norm, g.norm_eps, V->q35_y, V->q35_yq, s);
+                if (prof) F->mark("q4w_gdn_scan");
+            } else {
+                q35::gdn_scan(Ly.gdn_state, rws, T, C, alpha, beta, Sd, HK, HV, V->q35_o, s);
+                if (prof) F->mark("q4w_gdn_scan");
+                k::gdn_out_norm(V->q35_o, V->q35_z, Ly.ssm_norm, V->q35_y, (int64_t) T * HV, Sd, g.norm_eps, (void*) s);
+                gf::quantize_q8_1(V->q35_y, V->q35_yq, T * Vd, s);
+            }
             gf::MvJob o = {Ly.ssm_o.q, V->q35_yq, V->q35_y, V->mixer, nullptr, 1.0f, Ly.ssm_o.type, Vd, E};
             if (!gf::mvn(&o, 1, T, s)) { err = "qwen4exp verify: ssm_out"; return false; }
             if (prof) F->mark("q4w_gdn");
