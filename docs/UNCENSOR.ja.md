@@ -18,6 +18,7 @@
 - [有効にする](#有効にする)
 - [自分のモデル用にファイルを作る](#自分のモデル用にファイルを作る)
 - [ファイルを確かめる](#ファイルを確かめる)
+- [自分の依頼文を足す](#自分の依頼文を足す)
 - [実測](#実測)
 - [制限](#制限)
 - [以前からある方法](#以前からある方法)
@@ -129,6 +130,7 @@ KL 0、CPU レーンの件数も同じ）。**オンでも遅くなりません�
 | `--check N` | 24 | その次の質問を、候補を試すのに使う数 |
 | `--exclude FILE ...` | – | 評価に使う質問を除く（1 行 1 問のテキスト、または `"prompt"` を持つ JSON lines） |
 | `--harmful mix\|advbench` | mix | AdvBench だけだと、GLM に弱い拒否（海賊版、医療、詐欺）が残る |
+| `--cyber N` | 0 | マルウェアや不正アクセスの質問を N 問、有害側に必ず入れる（ForbiddenQuestions の Malware カテゴリと、AdvBench / MaliciousInstruct の cyber 系の言葉。JailbreakBench からは取らない）。編集のあとでもマルウェアの拒否が残るときに使う。Qwen3.8 では、この拒否が別の方向だった |
 | `--data DIR` | `Abyss-data/datasets/safety` | セットの置き場所 |
 
 どの質問を選ぶかは毎回同じです。データセットは信頼できないデータとして扱い、この道具は `python -I` で動かしてください。
@@ -188,6 +190,48 @@ STRATA_GLM_SCORE_REF=ref.bin STRATA_GLM_ABL=model.abl     # ファイルあり: 
 
 **拒否**: `prompts.txt` に入っていない質問を、`"uncensor": false` と `true` で、greedy で聞きます。答えの書き出しを読んで
 判定してください。無害な質問の数も数えてください。良い編集は、断りすぎ（無害な質問を断ること）も減らします。
+
+## 自分の依頼文を足す
+
+**使うとき。** `--abl-build` のあと、ほかは答えるのに、ある種類の依頼だけ拒否が残るとき。拒否は種類ごとに別の方向に
+乗っていることがあり、作成は、依頼文に出てくる方向しか見つけません。Qwen3.8-Flash-Next（ISTA IQ3_S）では、最初の
+ファイルで Malware / Hacking の拒否が残りました（JailbreakBench の 5 問中 4 問）。cyber 系の依頼文を足し、方向を 1 本
+増やして作り直すと消えました。
+
+| 作成 | JBB の拒否 | Malware / Hacking | XSTest の過剰拒否 | 数学 | 文章の KL（en / ja / code / md） |
+| --- | :---: | :---: | :---: | :---: | --- |
+| 標準の mix、`--abl-rank 3` | 11.1% | 5 問中 4 問 | 0.8% | 44 / 50 | 0.028 / 0.015 / 0.046 / 0.029 |
+| `--cyber 30`、`--abl-rank 4` | 1.2% | 5 問中 0 問 | 0.0%（50 問） | 43 / 50 | 0.027 / 0.015 / 0.057 / 0.033 |
+
+（JailbreakBench のテスト 81 問、数学 50 問を 512 トークンまで、greedy。拒否は答え全体で判定。`--cyber 30` だけで
+rank 3 のままだと、マルウェアの拒否は残りました。消したのは 4 本目の方向、18 層です。）
+
+**`--cyber N`** は、マルウェアや不正アクセスの依頼文を N 問、有害側に必ず入れます。ForbiddenQuestions の Malware
+カテゴリと、AdvBench / MaliciousInstruct の cyber 系の言葉から取ります（139 問。JailbreakBench からは取りません）。
+
+**`--extra-harmful FILE`** は、自分の依頼文を同じように有害側に必ず入れます。Abyss は中身を配っていません。モデルが
+まだ拒否する種類の依頼を、自分で書いてください。ファイルの形:
+
+```
+# 1 行に 1 つ、UTF-8。空行と # で始まる行は読み飛ばします
+example prompt 1
+example prompt 2
+{"prompt": "example prompt 3"}
+```
+
+足した依頼文は先頭に入り、`--train` + `--check` に切り詰めても残ります（残りは標準の mix で埋めます）。
+`--extra-n N` で多くても N 問だけ使います。`--exclude` はそのまま効きます。使った数はツールが表示します。そのあと、
+方向を 1 本増やして、いつもどおり作ります:
+
+```sh
+.venv/bin/python -I tools/abl_prompts.py --pack <pack> --out prompts.txt --cyber 30 --extra-harmful my.txt
+build/strata --glm-pack <pack> --max-context 4096 --abl-build model.abl --abl-prompts prompts.txt \
+  --abl-gen 32 --abl-rank 4 --abl-range 0.3,0.9 --abl-candidates 9 --abl-max-kl 1.0
+```
+
+**確かめ方**は[ファイルを確かめる](#ファイルを確かめる)と同じです。作成に使っていない依頼文で拒否を数え、長い答え
+（数学）と文章の KL が悪くなっていないかを見ます。足すファイルは、テストに使う依頼文と分けてください。作成に使った
+依頼文では、編集の効き目はわかりません。
 
 ## 実測
 

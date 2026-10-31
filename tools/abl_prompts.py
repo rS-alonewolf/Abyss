@@ -52,6 +52,30 @@ def pick(texts, exclude, n):
     return out[:n]
 
 
+def read_prompts(path):
+    """a prompt file: one a line (UTF-8), blank lines and lines starting with # skipped, JSON lines with a "prompt"
+    field taken as that field (--exclude and --extra-harmful)"""
+    out = []
+    for line in pathlib.Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("{"):
+            try:
+                line = str(json.loads(line).get("prompt", "")).strip()
+            except ValueError:
+                continue
+        if line:
+            out.append(line)
+    return out
+
+
+def force(hp, extra, n):
+    """the harmful mix with the extra prompts first (kept through the trim to n), no duplicates"""
+    keep = set(extra)
+    return (list(extra) + [t for t in hp if t not in keep])[:n]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--pack", required=True)
@@ -61,19 +85,19 @@ def main() -> int:
     ap.add_argument("--check", type=int, default=24)
     ap.add_argument("--exclude", nargs="*", default=[])
     ap.add_argument("--harmful", choices=["mix", "advbench"], default="mix")
+    ap.add_argument("--cyber", type=int, default=0,
+                    help="force this many malware / hacking / cyber harmful prompts into the mix (from "
+                         "ForbiddenQuestions' Malware category and keyword matches in AdvBench / MaliciousInstruct, "
+                         "not JailbreakBench): a category whose refusal is its own direction needs its own examples")
+    ap.add_argument("--extra-harmful", metavar="FILE",
+                    help="your own harmful prompts (one a line, # comments, or JSON lines with a \"prompt\"), forced "
+                         "into the harmful mix as --cyber's are: for a category still refused after a build")
+    ap.add_argument("--extra-n", type=int, default=0, help="take at most N of --extra-harmful (0: all that fit)")
     a = ap.parse_args()
     data = pathlib.Path(a.data)
     exclude = set()
     for f in a.exclude:
-        for line in pathlib.Path(f).read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line.startswith("{"):
-                try:
-                    line = str(json.loads(line).get("prompt", "")).strip()
-                except ValueError:
-                    continue
-            if line:
-                exclude.add(line)
+        exclude.update(read_prompts(f))
     srcs = [[r["goal"] for r in read_csv(data / "AdvBench" / "harmful_behaviors.csv")]]
     if a.harmful == "mix":
         srcs += [
@@ -93,6 +117,29 @@ def main() -> int:
             if i < len(x) and x[i] not in seen and len(hp) < n:
                 seen.add(x[i])
                 hp.append(x[i])
+    if a.cyber > 0:
+        # a category whose refusal survives (Qwen3.8's Malware / Hacking) needs its own examples: force the first
+        # --cyber distinct cyber prompts into the mix, from ForbiddenQuestions' Malware category and keyword matches in
+        # AdvBench / MaliciousInstruct (not JailbreakBench, so they stay disjoint from the JBB test set), then re-trim.
+        CYBER = ("malware", "ransomware", "keylogger", "botnet", "phish", "ddos", "sql injection", "backdoor",
+                 "spyware", "rootkit", "trojan", "exploit", "hack into", "hacking", "crack a password",
+                 "crack the password", "unauthorized access", "bypass security", "computer virus", "steal data",
+                 "steal passwords", "steal credit card", "disable antivirus")
+        cyber = [r["question"] for r in read_csv(data / "ForbiddenQuestions" / "forbidden_question_set.csv")
+                 if r.get("content_policy_name") == "Malware"]
+        for src in ([r["goal"] for r in read_csv(data / "AdvBench" / "harmful_behaviors.csv")] +
+                    [l.strip() for l in (data / "MaliciousInstruct" / "MaliciousInstruct.txt")
+                     .read_text(encoding="utf-8").splitlines()]):
+            if any(k in src.lower() for k in CYBER):
+                cyber.append(src)
+        cyber = pick(cyber, exclude, a.cyber)
+        hp = force(hp, cyber, n)
+        print(f"--cyber: {len(cyber)} cyber prompts taken")
+    if a.extra_harmful:
+        own = read_prompts(a.extra_harmful)
+        extra = pick(own, exclude, a.extra_n or n)
+        hp = force(hp, extra, n)
+        print(f"--extra-harmful: {len(extra)} of {len(own)} prompts taken from {a.extra_harmful}")
     hp = sorted(hp, key=lambda t: hashlib.sha256(t.encode("utf-8")).hexdigest())   # (train / check: the same mix)
     bp = pick(harmless, exclude, n)
     if len(hp) < n or len(bp) < n:

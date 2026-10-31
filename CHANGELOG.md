@@ -7,6 +7,14 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## Unreleased
+
+- `tools/abl_prompts.py --cyber N` and `--extra-harmful FILE [--extra-n N]`: force malware / hacking prompts, or your
+  own (one a line, `#` comments, JSON lines with a `"prompt"`), into the build's harmful side, for a kind of request
+  still refused after `--abl-build`. Qwen3.8 ISTA IQ3_S: `--cyber 30 --abl-rank 4` took JailbreakBench refusals from
+  11.1% to 1.2% (Malware / Hacking 4 of 5 -> 0), math 43 / 50, text KL 0.027-0.057. docs/UNCENSOR: "Adding your own
+  prompts".
+
 ## v1.3.84 - 2026-10-31
 
 `--abl-build` and `--uncensor` now work on **Qwen3.8-Flash-Next** (qwen4exp, the fast path). Before, the build

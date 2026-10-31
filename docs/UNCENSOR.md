@@ -15,6 +15,7 @@ The edit removes refusals. It adds no knowledge, and what the model then writes 
 - [Turning it on](#turning-it-on)
 - [Making the file for your model](#making-the-file-for-your-model)
 - [Checking a file](#checking-a-file)
+- [Adding your own prompts](#adding-your-own-prompts)
 - [Measured](#measured)
 - [Limits](#limits)
 - [Older ways](#older-ways)
@@ -117,6 +118,7 @@ prompts). Get them from their own pages into `Abyss-data/datasets/safety` (its `
 | `--check N` | 24 | the next ones, for trying the candidates |
 | `--exclude FILE ...` | – | drop prompts an evaluation uses (lines of text, or JSON lines with a `"prompt"`) |
 | `--harmful mix\|advbench` | mix | AdvBench alone leaves the softer refusals (piracy, medicine, fraud) in GLM |
+| `--cyber N` | 0 | force N malware / hacking prompts into the harmful mix (ForbiddenQuestions' Malware category and cyber keywords in AdvBench / MaliciousInstruct, none from JailbreakBench). Use it when the malware refusals survive the edit: on Qwen3.8 they were a direction of their own |
 | `--data DIR` | `Abyss-data/datasets/safety` | where the sets are |
 
 The picks are the same on every run. The datasets are untrusted data: run the tool with `python -I`.
@@ -176,6 +178,48 @@ STRATA_GLM_SCORE_REF=ref.bin STRATA_GLM_ABL=model.abl     # with it: "vs ref: KL
 
 **Refusals** - ask held-out prompts (not the ones in `prompts.txt`) with `"uncensor": false` and `true`, greedy, and
 read the answers' openings. Count the harmless prompts too: a good edit also lowers over-refusal.
+
+## Adding your own prompts
+
+**When.** After `--abl-build`, one kind of request is still refused while the rest are answered. Each kind of refusal
+can sit on a direction of its own, and the build only finds the directions its prompts show it. On Qwen3.8-Flash-Next
+(ISTA IQ3_S) the first file left Malware / Hacking refused (4 of 5 JailbreakBench items); building again with more
+cyber prompts and one more direction fixed it:
+
+| build | JBB refused | Malware / Hacking | XSTest over-refusal | math | text KL (en / ja / code / md) |
+| --- | :---: | :---: | :---: | :---: | --- |
+| default mix, `--abl-rank 3` | 11.1% | 4 of 5 | 0.8% | 44 / 50 | 0.028 / 0.015 / 0.046 / 0.029 |
+| `--cyber 30`, `--abl-rank 4` | 1.2% | 0 of 5 | 0.0% (50 prompts) | 43 / 50 | 0.027 / 0.015 / 0.057 / 0.033 |
+
+(81 JailbreakBench test prompts, 50 math problems at 512 tokens, greedy, refusals read on the whole answer. With
+`--cyber 30` alone at rank 3 the malware refusals stayed: the fourth direction, layer 18, is the one that cleared them.)
+
+**`--cyber N`** forces N malware / hacking prompts into the harmful side: ForbiddenQuestions' Malware category and
+cyber keywords in AdvBench / MaliciousInstruct (139 prompts; none from JailbreakBench).
+
+**`--extra-harmful FILE`** forces your own prompts into the harmful side the same way. Abyss ships none: you write
+them for the kind of request your model still refuses. The file:
+
+```
+# one prompt a line, UTF-8; blank lines and lines starting with # are skipped
+example prompt 1
+example prompt 2
+{"prompt": "example prompt 3"}
+```
+
+They go first and stay through the trim to `--train` + `--check` (the default mix fills the rest); `--extra-n N`
+takes at most N of them, `--exclude` still applies, and the tool prints how many it took. Then build as usual, with
+one more direction:
+
+```sh
+.venv/bin/python -I tools/abl_prompts.py --pack <pack> --out prompts.txt --cyber 30 --extra-harmful my.txt
+build/strata --glm-pack <pack> --max-context 4096 --abl-build model.abl --abl-prompts prompts.txt \
+  --abl-gen 32 --abl-rank 4 --abl-range 0.3,0.9 --abl-candidates 9 --abl-max-kl 1.0
+```
+
+**Check** as in [Checking a file](#checking-a-file): the refusals on held-out prompts, and that long answers (math)
+and the text KL did not get worse. Keep your file apart from whatever you test with - a prompt the build saw says
+nothing about the edit.
 
 ## Measured
 
