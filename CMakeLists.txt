@@ -277,6 +277,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(qsa_prompt_attn_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
+  # qwen4exp's hyper-connection mix in two launches (q35::hc4_fused) vs the five it replaces: the same bytes (GPU,
+  # synthetic, no model); with the tests, or alone with -DSTRATA_PARITY_HC4=ON
+  if(STRATA_BUILD_TESTS OR STRATA_PARITY_HC4)
+    add_executable(hc4_fused_parity src/kernels/hc4_fused_parity.cpp)
+    target_include_directories(hc4_fused_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(hc4_fused_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  endif()
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.

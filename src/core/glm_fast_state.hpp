@@ -426,6 +426,7 @@ struct Glm5Model::FastState {
     // each lives until its combine, the FFN's into the next layer)
     float *q4_xn = nullptr, *q4_lo = nullptr, *q4_gate = nullptr, *q4_inj[2] = {nullptr, nullptr};
     void *q4_xnq = nullptr, *q4_loq = nullptr;
+    float* q4_sc = nullptr;   // (q35::hc4_fused's stream scales)
     const float* q4_head[1] = {nullptr};                         // output_hc_norm
     // qwen4exp's per-layer embedding (layer 1, qwen35_fast_path.cu q4x_ple_*): the table on the SSD, the tokens by
     // position (the n-gram hash reads the two before), the gathered rows (pinned / device / q8_1), the projections,

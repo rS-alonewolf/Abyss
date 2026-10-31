@@ -199,6 +199,7 @@ bool Glm5Model::qwen35_alloc(std::string& err) {
         F->q4_lo = (float*) take(LR * 4);
         F->q4_loq = take(LR / 32 * 36);
         F->q4_gate = (float*) take(HE * 4);
+        F->q4_sc = (float*) take(64);
         F->q4_inj[0] = (float*) take(64);
         F->q4_inj[1] = (float*) take(64);
     }
@@ -807,6 +808,36 @@ bool Glm5Model::fast_qwen35_attn(int il, int64_t p64, std::string& err) {
 // inj_out = inject . xn (nullptr: the head's mixer has none)
 bool Glm5Model::q4x_mix(const float* norm, const WSlot& down, const WSlot& up, const WSlot* inject, const float* out,
                         const float* inj_prev, float* inj_out, float* x, void* xq, std::string& err) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaStream_t s = F->cs;
+    const int E = g.n_embd, HE = g.hc * E, LR = g.hc_lr;
+    // the five launches below in two (q35::hc4_fused: the same bits as CUDA's five - hc4_fused_parity).  RTX 5090,
+    // Qwen3.8 ISTA IQ3_S: the mixes 2.98 -> 2.21 ms a token (STRATA_GLM_PROF), token by token ~+8%.
+    // STRATA_Q4X_HC_FUSE=0: the five.  Off by default with HIP (unmeasured there, and HIP's mv takes down + inject in
+    // one mixed launch, 4 waves a row - another order of sums than the fused kernels'): STRATA_Q4X_HC_FUSE=1 there
+    static const bool fuse = [] {
+        const char* v = getenv("STRATA_Q4X_HC_FUSE");
+#if defined(STRATA_USE_HIP)
+        return v != nullptr && std::atoi(v) != 0;
+#else
+        return v == nullptr || std::atoi(v) != 0;
+#endif
+    }();
+    const bool fused = fuse && xq != nullptr &&
+                       q35::hc4_fused_ok(E, g.hc, LR, down.type, up.type, inject != nullptr ? inject->type : -1);
+    if (fused) {
+        q35::hc4_fused(state_, out, inj_prev, norm, g.norm_eps, E, g.hc, LR, down.q, inject != nullptr ? inject->q : nullptr,
+                       up.q, F->q4_lo, inj_out, F->q4_sc, F->q4_xn, F->q4_gate, x, xq, s,
+                       inject != nullptr && inject->type == gf::kTypeF32);
+        return true;
+    }
+    return q4x_mix5(norm, down, up, inject, out, inj_prev, inj_out, x, xq, err);
+}
+
+// q4x_mix in five launches (the reference hc4_fused matches)
+bool Glm5Model::q4x_mix5(const float* norm, const WSlot& down, const WSlot& up, const WSlot* inject, const float* out,
+                         const float* inj_prev, float* inj_out, float* x, void* xq, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;

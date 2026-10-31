@@ -539,6 +539,8 @@ public:
     bool q35_snap_copy(bool restore);
     bool q4x_mix(const float* norm, const WSlot& down, const WSlot& up, const WSlot* inject, const float* out,
                  const float* inj_prev, float* inj_out, float* x, void* xq, std::string& err);
+    bool q4x_mix5(const float* norm, const WSlot& down, const WSlot& up, const WSlot* inject, const float* out,
+                  const float* inj_prev, float* inj_out, float* x, void* xq, std::string& err);
     bool fast_q4x_layers(int64_t p, std::string& err);
     const Glm5Model* verify_tail() const;
     // the conversation snapshot's deepseek4 state: every layer's window ring and compressor rings (the compressed

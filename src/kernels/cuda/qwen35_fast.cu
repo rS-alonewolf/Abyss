@@ -953,7 +953,194 @@ __global__ void hc4_mix_kernel(const float* __restrict__ xn, const float* __rest
     mixed[(size_t) t * n_embd + e] = m;
     if (xq != nullptr) q81_store_warp(m, xq + ((size_t) t * n_embd + e) / 32, threadIdx.x & 31);
 }
+// ---- qwen4exp's hyper-connection mix in two launches (hc4_fused): the arithmetic of hc4_combine_norm_kernel,
+// glm_fast's BF16 row dot (row_dot_bf16 / mv_kernel: a warp a row, 8 weights a lane a step, then the warp's sum),
+// silu_scale_kernel and hc4_mix_kernel, expression for expression - the outputs are the same bits
+constexpr int kHcMaxHE = 10240;
+__device__ __forceinline__ float hc_bf16_dot8(const uint4 w, const float4 a, const float4 b) {
+    return __uint_as_float(w.x << 16) * a.x + __uint_as_float(w.x & 0xffff0000u) * a.y +
+           __uint_as_float(w.y << 16) * a.z + __uint_as_float(w.y & 0xffff0000u) * a.w +
+           __uint_as_float(w.z << 16) * b.x + __uint_as_float(w.z & 0xffff0000u) * b.y +
+           __uint_as_float(w.w << 16) * b.z + __uint_as_float(w.w & 0xffff0000u) * b.w;
+}
+// a: block b - the hc streams' combine (R + out * 2 sigmoid(inj_prev / hc), not written back) and grouped norm into
+// shared memory (each stream as hc4_combine_norm_kernel's block: 256 threads, the same partial sums), then its 8 warps'
+// rows of down (lr rows) and inject (hc rows after them): y = the row's dot + 0 (mv's alpha 1, no bias)
+__global__ void __launch_bounds__(256) hc4_fused_a_kernel(const float* __restrict__ R, const float* __restrict__ out,
+                                                          const float* __restrict__ inj_prev,
+                                                          const float* __restrict__ gamma, float eps, int n_embd,
+                                                          int hc, const uint16_t* __restrict__ down, int lr,
+                                                          const void* __restrict__ inject, bool inj_f32,
+                                                          float* __restrict__ lo, float* __restrict__ inj_out,
+                                                          float* __restrict__ sc_out) {
+    __shared__ __align__(16) float xs[kHcMaxHE];
+    __shared__ float sh[4][8];
+    __shared__ float scs[4];
+    // the four streams at once (hc == 4): each thread's partial sum of a stream runs over the same elements in the same
+    // order as hc4_combine_norm_kernel's thread, and the four block sums take block_sum256's tree - two barriers
+    // instead of eight, and the four streams' reads in flight together
+    float ss[4] = {0.0f, 0.0f, 0.0f, 0.0f}, w[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (out != nullptr)
+        for (int c = 0; c < 4; ++c) w[c] = 2.0f * sigmoid_f(inj_prev[c] / (float) hc);
+    for (int e = threadIdx.x; e < n_embd; e += 256) {
+        const float o = out != nullptr ? out[e] : 0.0f;
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const float r = R[(size_t) c * n_embd + e];
+            if (out != nullptr) {
+                const float v = r + o * w[c];
+                xs[c * n_embd + e] = v;
+                ss[c] += v * v;
+            } else {
+                xs[c * n_embd + e] = r;
+                ss[c] += r * r;
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        const float v = warp_sum(ss[c]);
+        if ((threadIdx.x & 31) == 0) sh[c][threadIdx.x >> 5] = v;
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            float t = threadIdx.x < 8 ? sh[c][threadIdx.x] : 0.0f;
+            t = warp_sum(t);
+            if (threadIdx.x == 0) {
+                const float sc = rsqrtf(t / (float) n_embd + eps);
+                scs[c] = sc;
+                if (blockIdx.x == 0) sc_out[c] = sc;
+            }
+        }
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_embd; e += 256) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) xs[c * n_embd + e] = xs[c * n_embd + e] * scs[c] * gamma[(size_t) c * n_embd + e];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, row = blockIdx.x * 8 + (threadIdx.x >> 5), n_in = hc * n_embd;
+    const uint16_t* wr;
+    float* y;
+    if (row < lr) {
+        wr = down + (size_t) row * n_in;
+        y = lo + row;
+    } else if (inject != nullptr && row < lr + hc) {
+        y = inj_out + (row - lr);
+        if (inj_f32) {   // (the injects are widened to F32 at load: row_dot_f32's sum)
+            const float4* r4 = (const float4*) ((const float*) inject + (size_t) (row - lr) * n_in);
+            const float4* x4 = (const float4*) xs;
+            float s = 0.0f;
+            for (int k = lane; k < n_in / 4; k += 32) {
+                const float4 a = r4[k], b = x4[k];
+                s += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
+            s = warp_sum(s);
+            if (lane == 0) *y = s + 0.0f;
+            return;
+        }
+        wr = (const uint16_t*) inject + (size_t) (row - lr) * n_in;
+    } else {
+        return;
+    }
+    const uint4* r8 = (const uint4*) wr;
+    const float4* x4 = (const float4*) xs;
+    float s = 0.0f;
+#pragma unroll 8
+    for (int k = lane; k < n_in / 8; k += 32) {
+        const uint4 w = r8[k];
+        const float4 a = x4[2 * k], b = x4[2 * k + 1];
+        s += hc_bf16_dot8(w, a, b);
+    }
+    s = warp_sum(s);
+    if (lane == 0) *y = s + 0.0f;
+}
+// b: block b - columns e0 = 32 b .. e0 + 31: silu(lo / hc) into shared memory, the up rows c * n_embd + e of those
+// columns (16 warps x 8 rows), then warp 0: R's combine written, xn, the mix over the streams and its q8_1
+__global__ void __launch_bounds__(512) hc4_fused_b_kernel(float* __restrict__ R, const float* __restrict__ out,
+                                                          const float* __restrict__ inj_prev,
+                                                          const float* __restrict__ gamma, int n_embd, int hc,
+                                                          const uint16_t* __restrict__ up, int lr,
+                                                          const float* __restrict__ lo, float a,
+                                                          const float* __restrict__ sc, float* __restrict__ xn,
+                                                          float* __restrict__ gate, float* __restrict__ mixed,
+                                                          Q81* __restrict__ xq) {
+    __shared__ __align__(16) float ls[512];
+    __shared__ float gs[4 * 32];
+    for (int i = threadIdx.x; i < lr; i += 512) {
+        const float v = lo[i] * a;
+        ls[i] = v / (1.0f + expf(-v));
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, e0 = blockIdx.x * 32;
+    const float4* x4 = (const float4*) ls;
+    // the warp's 8 rows' weights loaded first (lr <= 512: at most two 16-byte pieces a lane a row), then each row's
+    // sum in mv's order (piece k = lane, then lane + 32)
+    const int nk = lr / 8;
+    uint4 w0[8], w1[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int rl = warp * 8 + j;
+        const bool ok = (rl >> 5) < hc;
+        const uint4* r8 = (const uint4*) (up + (size_t) ((ok ? rl >> 5 : 0) * n_embd + e0 + (rl & 31)) * lr);
+        w0[j] = ok && lane < nk ? r8[lane] : make_uint4(0, 0, 0, 0);
+        w1[j] = ok && lane + 32 < nk ? r8[lane + 32] : make_uint4(0, 0, 0, 0);
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int rl = warp * 8 + j;   // stream rl / 32, column e0 + rl % 32
+        if ((rl >> 5) >= hc) break;
+        const int row = (rl >> 5) * n_embd + e0 + (rl & 31);
+        float s = 0.0f;
+        if (lane < nk) s += hc_bf16_dot8(w0[j], x4[2 * lane], x4[2 * lane + 1]);
+        if (lane + 32 < nk) s += hc_bf16_dot8(w1[j], x4[2 * (lane + 32)], x4[2 * (lane + 32) + 1]);
+        s = warp_sum(s);
+        if (lane == 0) {
+            const float gv = s + 0.0f;
+            gs[rl] = gv;
+            gate[row] = gv;
+        }
+    }
+    __syncthreads();
+    if (warp != 0) return;
+    const int e = e0 + lane;
+    float m = 0.0f;
+    for (int c = 0; c < hc; ++c) {
+        float* r = R + (size_t) c * n_embd;
+        float v = r[e];
+        if (out != nullptr) {
+            const float w = 2.0f * sigmoid_f(inj_prev[c] / (float) hc);
+            v = r[e] + out[e] * w;
+            r[e] = v;
+        }
+        const float xv = v * sc[c] * gamma[(size_t) c * n_embd + e];
+        xn[(size_t) c * n_embd + e] = xv;
+        m += xv * sigmoid_f(gs[c * 32 + lane]);
+    }
+    m = m / (float) hc;
+    mixed[e] = m;
+    if (xq != nullptr) q81_store_warp(m, xq + e / 32, lane);
+}
 }  // namespace
+
+bool hc4_fused_ok(int n_embd, int hc, int lr, int down_type, int up_type, int inject_type) {
+    constexpr int kBF16 = 30;   // (ggml's GGML_TYPE_BF16, glm_fast's kTypeBF16)
+    return hc == 4 && n_embd % 256 == 0 && hc * n_embd <= kHcMaxHE && lr % 8 == 0 && lr > 0 && lr <= 512 &&
+           down_type == kBF16 && up_type == kBF16 && (inject_type < 0 || inject_type == kBF16 || inject_type == 0);
+}
+void hc4_fused(float* R, const float* out, const float* inj_prev, const float* gamma, float eps, int n_embd, int hc,
+               int lr, const void* down, const void* inject, const void* up, float* lo, float* inj_out, float* sc,
+               float* xn, float* gate, float* x, void* xq, cudaStream_t s, bool inject_f32) {
+    const int rows = lr + (inject != nullptr ? hc : 0);
+    hc4_fused_a_kernel<<<(rows + 7) / 8, 256, 0, s>>>(R, out, inj_prev, gamma, eps, n_embd, hc, (const uint16_t*) down,
+                                                      lr, inject, inject_f32, lo, inj_out, sc);
+    check("hc4_fused_a");
+    hc4_fused_b_kernel<<<n_embd / 32, 512, 0, s>>>(R, out, inj_prev, gamma, n_embd, hc, (const uint16_t*) up, lr, lo,
+                                                   1.0f / (float) hc, sc, xn, gate, x, (Q81*) xq);
+    check("hc4_fused_b");
+}
 
 void silu(float* x, int n, cudaStream_t s) {
     if (n <= 0) return;
