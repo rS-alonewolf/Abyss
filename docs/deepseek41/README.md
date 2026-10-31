@@ -280,7 +280,7 @@ The hybrid shard set is shard 1 = the dense and Engram tensors fetched from Luce
 
 Measured and left off: `STRATA_GLM_AHEAD` (the predicted reads were 22% useful and crowded the SSD; v1.3.36 lets a
 demand read wait on an in-flight lookahead read inside the streamed fetch, `STRATA_GLM_AHEAD_MERGE`, which saves 2%,
-but with a 3.4 GB/s SSD 37.4 ms a token still loses to 34.9 without lookahead - to be re-measured on a faster NVMe),
+but with a 3.4 GB/s SSD 37.4 ms a token still loses to 34.9 without lookahead; re-measured 2026-11-01 on the Lexar NM790 (~6 GB/s) with the iGPU lane and DSpark, swe-bench 3 tasks: off 47.9 / 49.3 tok/s, `AHEAD=1` 40.0 / 42.1, `AHEAD=1 AHEAD_TOP=4` 42.6 / 46.0, `AHEAD=2 AHEAD_TOP=4` 39.5 / 40.2 - fewer disk reads a token, but longer waits: still off),
 `STRATA_GLM_SEED_PRIOR=1` and `STRATA_GLM_DEMOTE_TIES=1` (46.8 -> 48.5 / 46.1 ms with more RAM re-reads),
 `STRATA_GLM_DISK_ADAPT=1`, `STRATA_GLM_DEFER=1` (-4% at KL 0.15 -> 0.28 on one sequence).
 
