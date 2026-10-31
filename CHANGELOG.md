@@ -7,13 +7,19 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## Unreleased
+## v1.3.84 - 2026-10-31
 
-- `--abl-build` and `--uncensor` on **Qwen3.8-Flash-Next** (qwen4exp, the fast path): the build now captures the
-  residual on that path (before, it measured zeros there and its file did nothing), and the per-layer embedding (PLE)
-  rows are edited as a residual write on the token path, the prompt path and the verify window, as V4.1's Engram.
-  Off without a file; with a file, `"uncensor": false` per request still gives the unedited model. ISTA-DASLab GSQ-RCO
-  IQ3_S on the RTX 5090: layers 39+43+36, rank 3, 31 KB; harmful check answers refusing 23 -> 3 of 24.
+`--abl-build` and `--uncensor` now work on **Qwen3.8-Flash-Next** (qwen4exp, the fast path). Before, the build
+measured zeros on that path and its file did nothing.
+
+- The build captures the residual on the fast path (at each layer's entry and after the head mix, as the other models).
+- The per-layer embedding (PLE) rows are edited as a residual write on the token path, the prompt path and the verify
+  window, as V4.1's Engram. Off without a file; with a file, `"uncensor": false` per request still gives the unedited
+  model.
+- ISTA-DASLab GSQ-RCO IQ3_S on the RTX 5090, layers 39+43+36, rank 3 (31 KB): harmful check answers refusing 23 -> 3
+  of 24. Capability set (120 items, greedy) with the edit vs without: math 45/50 vs 42/50, code 30/30, Japanese 10/10,
+  multiple choice 20/20 on both, MMLU-500 84.4% vs 84.8% (McNemar p 0.75). A full comparison with downloaded
+  uncensored releases is still running.
 
 ## v1.3.83 - 2026-10-31
 
