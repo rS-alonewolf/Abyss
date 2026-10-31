@@ -206,6 +206,94 @@ __global__ void __launch_bounds__(kWarps * 32) attn_part_kernel(const float* __r
     }
 }
 
+// attn_part_kernel for many rows at once, each over ITS OWN selected cells: row r attends to kc / vc rows
+// ids[r * ld_ids + j], j < steps[r * 4 + 3] (the QSA selection, read in place: no gathered copy).  grid (n_head / HPW,
+// n_chunks, rows), 128 threads: a block takes HPW heads of one KV group, so a K / V row loaded once serves them all;
+// per head the arithmetic is attn_part_kernel's step for step (the same warp / position split, dot order, online
+// softmax and 4-warp merge), so the partials are bit-identical to gather_rows + attn_part_kernel's.  A chunk past a
+// row's width writes the empty partial (max -inf, sum 0), which attn_merge_kernel adds as exact zeros.
+template <int HPW>
+__global__ void __launch_bounds__(kWarps * 32) attn_part_ids_kernel(const float* __restrict__ q, const uint16_t* __restrict__ kc,
+                                                                    const uint16_t* __restrict__ vc,
+                                                                    const int32_t* __restrict__ ids, int ld_ids,
+                                                                    const int32_t* __restrict__ steps, int n_head,
+                                                                    int n_head_kv, float scale, float* __restrict__ part,
+                                                                    int n_chunks) {
+    __shared__ float sm[kWarps][HPW], sl[kWarps][HPW];
+    __shared__ float sacc[kWarps][HPW][kD];
+    const int h0 = blockIdx.x * HPW, c = blockIdx.y, r = blockIdx.z, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = h0 / (n_head / n_head_kv);
+    const int n_pos = steps[(size_t) r * 4 + 3];
+    const int t0 = c * kChunk, t1 = min(n_pos, t0 + kChunk);
+    const int32_t* id = ids + (size_t) r * ld_ids;
+    const float* qr = q + (size_t) r * n_head * kD;
+    float qv[HPW][8], m[HPW], l[HPW], acc[HPW][8];
+#pragma unroll
+    for (int j = 0; j < HPW; ++j) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            qv[j][i] = qr[(size_t) (h0 + j) * kD + lane * 8 + i] * scale;
+            acc[j][i] = 0.0f;
+        }
+        m[j] = -INFINITY;
+        l[j] = 0.0f;
+    }
+    for (int t = t0 + warp; t < t1; t += kWarps) {
+        const size_t row = ((size_t) id[t] * n_head_kv + g) * kD + lane * 8;
+        const uint4 kw = *(const uint4*) (kc + row);
+        const uint4 vw = *(const uint4*) (vc + row);
+        const uint16_t* kh = (const uint16_t*) &kw;
+        const uint16_t* vh = (const uint16_t*) &vw;
+#pragma unroll
+        for (int j = 0; j < HPW; ++j) {
+            float dot = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) dot += qv[j][i] * h2f(kh[i]);
+            const float sc = warp_sum(dot);
+            const float mn = fmaxf(m[j], sc);
+            const float a = expf(m[j] - mn), pr = expf(sc - mn);
+            l[j] = l[j] * a + pr;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[j][i] = acc[j][i] * a + pr * h2f(vh[i]);
+            m[j] = mn;
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < HPW; ++j) {
+        if (lane == 0) {
+            sm[warp][j] = m[j];
+            sl[warp][j] = l[j];
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sacc[warp][j][lane * 8 + i] = acc[j][i];
+    }
+    __syncthreads();
+    // the 4 warps' merge, a head per warp in turn (attn_part_kernel's warp-0 merge, the same order)
+    for (int j = warp; j < HPW; j += kWarps) {
+        float M = sm[0][j];
+#pragma unroll
+        for (int w = 1; w < kWarps; ++w) M = fmaxf(M, sm[w][j]);
+        float L = 0.0f, f[kWarps];
+#pragma unroll
+        for (int w = 0; w < kWarps; ++w) {
+            f[w] = sm[w][j] == -INFINITY ? 0.0f : expf(sm[w][j] - M);
+            L += sl[w][j] * f[w];
+        }
+        float* out = part + (((size_t) r * n_head + h0 + j) * n_chunks + c) * (kD + 2);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            float o = 0.0f;
+#pragma unroll
+            for (int w = 0; w < kWarps; ++w) o += sacc[w][j][lane * 8 + i] * f[w];
+            out[lane * 8 + i] = o;
+        }
+        if (lane == 0) {
+            out[kD] = M;
+            out[kD + 1] = L;
+        }
+    }
+}
+
 // grid (n_head, rows), 256 threads (a dim each): the chunks' partials merged (part and out row-major: [row][head])
 __global__ void __launch_bounds__(kD) attn_merge_kernel(const float* __restrict__ part, int n_chunks, float* __restrict__ out) {
     const int h = blockIdx.y * gridDim.x + blockIdx.x, d = threadIdx.x;
@@ -1348,6 +1436,32 @@ void attn_decode(const float* q, const uint16_t* kc, const uint16_t* vc, int n_h
                                                                                             n_pos, scale, part, n_chunks);
     attn_merge_kernel<<<n_head, kD, 0, s>>>(part, n_chunks, out);
     check("attn_decode");
+}
+size_t attn_rows_part_floats(int rows, int n_head, int head_dim, int max_ids) {
+    return (size_t) rows * n_head * (size_t) ((max_ids + kChunk - 1) / kChunk) * ((size_t) head_dim + 2);
+}
+bool attn_decode_rows(const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* ids, int ld_ids,
+                      const int32_t* steps, int rows, int max_ids, int n_head, int n_head_kv, int head_dim, float scale,
+                      float* part, float* out, cudaStream_t s) {
+    if (rows <= 0) return true;
+    if (head_dim != kD || max_ids <= 0 || n_head_kv <= 0 || n_head % n_head_kv != 0) return false;
+    // attn_decode's own kernel for this shape: attn_split takes G % 8 == 0 (G <= 64) unless STRATA_Q35_ATTN=1, and
+    // the rows here must match attn_decode bit for bit, so those shapes stay on the caller's per-row path
+    static const int mode = [] { const char* v = getenv("STRATA_Q35_ATTN"); return v ? std::atoi(v) : 0; }();
+    const int G = n_head / n_head_kv;
+    if (mode != 1 && G % 8 == 0 && G <= 64) return false;
+    const int n_chunks = (max_ids + kChunk - 1) / kChunk;
+    const int hpw = G % 6 == 0 ? 6 : G % 4 == 0 ? 4 : G % 3 == 0 ? 3 : G % 2 == 0 ? 2 : 1;
+    const dim3 grid((unsigned) (n_head / hpw), (unsigned) n_chunks, (unsigned) rows);
+    switch (hpw) {
+#define Q35_IDS(n) case n: attn_part_ids_kernel<n><<<grid, kWarps * 32, 0, s>>>(q, kc, vc, ids, ld_ids, steps, n_head, n_head_kv, scale, part, n_chunks); break;
+        Q35_IDS(1) Q35_IDS(2) Q35_IDS(3) Q35_IDS(4) Q35_IDS(6)
+#undef Q35_IDS
+        default: return false;
+    }
+    attn_merge_kernel<<<dim3((unsigned) n_head, (unsigned) rows), kD, 0, s>>>(part, n_chunks, out);
+    check("attn_decode_rows");
+    return true;
 }
 void attn_gate(float* o, const float* q_full, int n_head, int head_dim, cudaStream_t s) {
     if (head_dim != kD) return;

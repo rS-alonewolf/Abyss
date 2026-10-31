@@ -287,6 +287,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(gdn_core_parity src/kernels/gdn_core_parity.cpp)
     target_include_directories(gdn_core_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(gdn_core_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    # qwen4exp's QSA prompt attention, a group of rows in one launch (q35::attn_decode_rows) vs gather_rows +
+    # attn_decode a row: the same bytes
+    add_executable(qsa_rows_parity src/kernels/qsa_rows_parity.cpp)
+    target_include_directories(qsa_rows_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(qsa_rows_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)

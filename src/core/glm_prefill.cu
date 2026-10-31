@@ -2174,9 +2174,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         cudaMemcpyAsync(Q.ipos, hs.data() + (size_t) tn * 4, (size_t) tn * IH * sizeof(int32_t), cudaMemcpyHostToDevice, s);
         sgemm_bf16((const uint16_t*) Ly.q4_ik.q, ID, E, xs, E, Q.kraw, ID, tn, 1.0f);
         const k::QsaIndexerBuffers ib{Ly.q4_tail, Ly.q4_dead, Ly.q4_pooled, Ly.q4_bpos};
-        for (int t = 0; t < tn; ++t)
-            k::indexer_key_append(Q.kraw + (size_t) t * ID, Q.steps + (size_t) t * 4 + k::kStepPos, 0, Ly.q4_ikn,
-                                  g.norm_eps, ib, sh, F->q4_cos, F->q4_sin, (void*) s);
+        // STRATA_Q4X_QSA_BATCH (default on for CUDA, off on HIP): the sub-batch's indexer keys in two launches, not
+        // one a row, and below a group's attention in one launch, not two a row; the same bytes either way
+#if defined(STRATA_USE_HIP)
+        static const bool qsa_batch = [] { const char* v = getenv("STRATA_Q4X_QSA_BATCH"); return v != nullptr && std::atoi(v) != 0; }();
+#else
+        static const bool qsa_batch = [] { const char* v = getenv("STRATA_Q4X_QSA_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+#endif
+        if (qsa_batch)
+            k::indexer_key_append_rows(Q.kraw, ID, pt0, tn, 0, Ly.q4_ikn, g.norm_eps, ib, sh, F->q4_cos, F->q4_sin,
+                                       (void*) s);
+        else
+            for (int t = 0; t < tn; ++t)
+                k::indexer_key_append(Q.kraw + (size_t) t * ID, Q.steps + (size_t) t * 4 + k::kStepPos, 0, Ly.q4_ikn,
+                                      g.norm_eps, ib, sh, F->q4_cos, F->q4_sin, (void*) s);
         const int64_t wmax = sh.idx_top_k + sh.idx_block - 1;   // the rows below see every cell
         const int nd = (int) std::max<int64_t>(0, std::min<int64_t>(tn, wmax - pt0));
         if (nd > 0) q35::attn_prompt(q, Ly.kc, Ly.vc, g.n_head, g.attn_head_kv, D, pt0, nd, scale, ao, s);
@@ -2194,6 +2205,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             k::qsa_block_scores(Ly.q4_pooled, Ly.q4_dead, iq + (size_t) r0 * IH * ID, st, ng, F->q4_max_blocks, sh,
                                 F->q4_pf_scores, (void*) s);
             k::qsa_block_topk(F->q4_pf_scores, st, ng, F->q4_max_blocks, F->q4_cap, sh, F->q4_pf_ids, (void*) s);
+            // the group's rows at once, each over its own selection read in place (else a row at a time through a
+            // gathered copy)
+            if (qsa_batch && F->q4_pf_part != nullptr &&
+                q35::attn_decode_rows(q + (size_t) (nd + r0) * HDq, Ly.kc, Ly.vc, F->q4_pf_ids, F->q4_cap, st, ng,
+                                      F->q4_cap, g.n_head, g.attn_head_kv, D, scale, F->q4_pf_part,
+                                      ao + (size_t) (nd + r0) * HDq, s))
+                continue;
             for (int j = 0; j < ng; ++j) {
                 const int t = nd + r0 + j;
                 const int w = (int) k::qsa_selection_width(pt0 + t + 1, sh);

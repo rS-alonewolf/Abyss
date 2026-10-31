@@ -33,6 +33,14 @@ size_t attn_part_floats(int n_head, int head_dim, int max_ctx);
 /// part), then merged.  head_dim 256.
 void attn_decode(const float* q, const uint16_t* kc, const uint16_t* vc, int n_head, int n_head_kv, int head_dim,
                  int n_pos, float scale, float* part, float* out, cudaStream_t s);
+/// attn_decode for `rows` rows at once, each over its own cells: row r's query q[r] ([n_head][head_dim]) attends to the
+/// cache rows ids[r * ld_ids + j], j < steps[r * 4 + 3] (<= max_ids; a QSA step record a row, device), read in place,
+/// into out[r]; bit-identical to gather_rows + attn_decode per row.  part: attn_rows_part_floats(rows, ..) floats.
+/// false (nothing launched): a shape attn_decode runs another kernel for; the caller keeps its per-row path.
+size_t attn_rows_part_floats(int rows, int n_head, int head_dim, int max_ids);
+bool attn_decode_rows(const float* q, const uint16_t* kc, const uint16_t* vc, const int32_t* ids, int ld_ids,
+                      const int32_t* steps, int rows, int max_ids, int n_head, int n_head_kv, int head_dim, float scale,
+                      float* part, float* out, cudaStream_t s);
 /// o[h][d] *= sigmoid(q_full[h][head_dim + d]) (the q projection's gate half), in place.
 void attn_gate(float* o, const float* q_full, int n_head, int head_dim, cudaStream_t s);
 /// x[i] *= sigmoid(g[0]), i < n (the shared expert's gate).

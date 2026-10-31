@@ -271,6 +271,9 @@ bool Glm5Model::q4x_qsa_setup(std::string& err) {
     dm(&F->q4_pos, 256);
     dm(&F->q4_pf_scores, (size_t) FastState::kQ4Grp * F->q4_max_blocks * 4);
     dm(&F->q4_pf_ids, (size_t) FastState::kQ4Grp * F->q4_cap * 4);
+#if !defined(STRATA_USE_HIP)
+    dm(&F->q4_pf_part, q35::attn_rows_part_floats(FastState::kQ4Grp, g.n_head, g.head_dim, F->q4_cap) * 4);
+#endif
     ok = ok && cudaHostAlloc((void**) &F->q4_step_h, 64, cudaHostAllocDefault) == cudaSuccess &&
          cudaHostAlloc((void**) &F->q4_pos_h, 256, cudaHostAllocDefault) == cudaSuccess;
     if (!ok) {

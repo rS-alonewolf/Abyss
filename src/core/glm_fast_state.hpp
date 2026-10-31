@@ -453,6 +453,7 @@ struct Glm5Model::FastState {
     static constexpr int kQ4Grp = 64;
     float* q4_pf_scores = nullptr;
     int32_t* q4_pf_ids = nullptr;
+    float* q4_pf_part = nullptr;                                 // ... their attention partials (CUDA)
     float* ple_pf_h = nullptr;
     size_t ple_pf_n = 0;
     WSlot q4_head_w[2];                                          // output_hc_down, output_hc_up

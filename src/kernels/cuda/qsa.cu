@@ -233,6 +233,68 @@ __global__ void indexer_key_append_kernel(const float* __restrict__ raw, const i
     }
 }
 
+// ---- indexer_key_append for n consecutive cells pos0 .. pos0 + n - 1 at once (raw rows ld floats apart), in two
+// launches that leave the buffers exactly as n single appends do.  1: a block per block that COMPLETES in the run -
+// the pooled row, the same arithmetic as the single kernel's completion (the mean in cell order; a cell before pos0
+// comes from the tail, which only launch 2 writes).  2: one block - the spare key (pos0 == 0), the tail rows the run
+// leaves (each slot's last cell), the spare slot after the last completed block and block_pos.
+__global__ void indexer_pool_rows_kernel(const float* __restrict__ raw, int ld, int pos0, int b0, int pos_base,
+                                         const float* __restrict__ w_k_norm, float eps, const float* __restrict__ tail,
+                                         float* __restrict__ pooled, int idx_dim, int r, int n_rot,
+                                         const float* __restrict__ cos_tab, const float* __restrict__ sin_tab,
+                                         const int32_t* __restrict__ mtab) {
+    extern __shared__ double s_mean[];   // idx_dim doubles
+    const int d = threadIdx.x;
+    const int b = b0 + (int) blockIdx.x, c0 = b * r;
+    const auto cell = [&](int c) {
+        return c >= pos0 ? raw[(size_t) (c - pos0) * ld + d] : tail[(size_t) (c % r) * idx_dim + d];
+    };
+    double m = 0.0;
+    for (int j = 0; j < r - 1; ++j) m = __dadd_rn(m, (double) cell(c0 + j));
+    m = __dadd_rn(m, (double) cell(c0 + r - 1));
+    m = m / (double) r;
+    s_mean[d] = m;
+    __syncthreads();
+    double ss = 0.0;
+    for (int i = 0; i < idx_dim; ++i) ss = __dadd_rn(ss, __dmul_rn(s_mean[i], s_mean[i]));
+    const double inv = __ddiv_rn(1.0, __dsqrt_rn(ss / (double) idx_dim + (double) eps));
+    pooled[(size_t) b * idx_dim + d] = (float) (m * inv * (double) w_k_norm[d]);
+    __syncthreads();
+    const int half = n_rot / 2;
+    if (d < half) {
+        float* row = pooled + (size_t) b * idx_dim;
+        const size_t toff = (size_t) mrope_pos(mtab, pos_base + b * r, d) * half;
+        rope_neox_pair(row[d], row[half + d], cos_tab[toff + d], sin_tab[toff + d], row[d], row[half + d]);
+    }
+}
+__global__ void indexer_tail_rows_kernel(const float* __restrict__ raw, int ld, int pos0, int n, int pos_base,
+                                         const float* __restrict__ w_k_norm, float eps, float* __restrict__ tail,
+                                         float* __restrict__ dead, float* __restrict__ pooled,
+                                         int32_t* __restrict__ block_pos, int idx_dim, int r) {
+    const int d = threadIdx.x, pend = pos0 + n;
+    const int n_done = pend / r - pos0 / r;   // blocks completed in the run
+    if (pos0 == 0) {   // the single kernel's pos == 0 branch, the same order
+        double ss = 0.0;
+        for (int i = 0; i < idx_dim; ++i) {
+            const double v = (double) raw[i];
+            ss = __dadd_rn(ss, __dmul_rn(v, v));
+        }
+        const double inv = __ddiv_rn(1.0, __dsqrt_rn(ss / (double) idx_dim + (double) eps));
+        dead[d] = (float) ((double) raw[d] * inv * (double) w_k_norm[d]);
+        if (n_done == 0) pooled[d] = dead[d];   // (block 0 overwrites it when it completes)
+    }
+    // each tail slot's last cell in the run (a slot r - 1 cell is never stored)
+    for (int sl = 0; sl < r - 1; ++sl) {
+        int c = (pend - 1) - (((pend - 1) % r) - sl + r) % r;   // the last cell <= pend - 1 with c % r == sl
+        if (c >= pos0) tail[(size_t) sl * idx_dim + d] = raw[(size_t) (c - pos0) * ld + d];
+    }
+    if (n_done > 0) {
+        const int bl = pend / r - 1;
+        pooled[(size_t) (bl + 1) * idx_dim + d] = dead[d];
+        if (d == 0) *block_pos = (int32_t) (pos_base + bl * r);
+    }
+}
+
 // ================= 3. qsa_index =================
 
 /// One warp per indexer head, one block per pooled row; thread 0 sums the relu'd dots IN HEAD ORDER and maps
@@ -726,6 +788,28 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
         (int) s.idx_block, (int) s.n_rot, cos_tab, sin_tab, mrope_table());
     check_launch("indexer_key_append");
     if (stream == nullptr) check_sync("indexer_key_append");
+}
+
+void indexer_key_append_rows(const float* raw, int64_t ld, int64_t pos0, int64_t n, int32_t pos_base,
+                             const float* w_k_norm, float eps, const QsaIndexerBuffers& b, const QsaShapes& s,
+                             const float* cos_tab, const float* sin_tab, void* stream) {
+    validate(s, "indexer_key_append_rows");
+    if (pos0 < 0 || n < 0 || pos0 + n > INT32_MAX) fail("indexer_key_append_rows: positions out of range");
+    if (b.tail == nullptr || b.dead == nullptr || b.pooled == nullptr || b.block_pos == nullptr)
+        fail("indexer_key_append_rows: the indexer buffers are not all set (tail/dead/pooled/block_pos)");
+    if (n == 0) return;
+    const int r = (int) s.idx_block, threads = (int) s.idx_dim;
+    const size_t smem = (size_t) s.idx_dim * sizeof(double);
+    const int64_t b0 = pos0 / r, n_done = (pos0 + n) / r - b0;
+    cudaStream_t st = (cudaStream_t) stream;
+    if (n_done > 0)
+        indexer_pool_rows_kernel<<<(unsigned) n_done, threads, smem, st>>>(
+            raw, (int) ld, (int) pos0, (int) b0, (int) pos_base, w_k_norm, eps, b.tail, b.pooled, (int) s.idx_dim, r,
+            (int) s.n_rot, cos_tab, sin_tab, mrope_table());
+    indexer_tail_rows_kernel<<<1, threads, 0, st>>>(raw, (int) ld, (int) pos0, (int) n, (int) pos_base, w_k_norm, eps,
+                                                     b.tail, b.dead, b.pooled, b.block_pos, (int) s.idx_dim, r);
+    check_launch("indexer_key_append_rows");
+    if (stream == nullptr) check_sync("indexer_key_append_rows");
 }
 
 void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const float* bias, const QsaShapes& s,

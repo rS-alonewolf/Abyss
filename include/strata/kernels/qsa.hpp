@@ -245,6 +245,12 @@ struct QsaIndexerBuffers {
 void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_base, const float* w_k_norm,
                         float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
                         const float* sin_tab, void* stream);
+/// `indexer_key_append` for the n consecutive cells pos0 .. pos0 + n - 1 (raw row i, ld floats apart, is cell
+/// pos0 + i) in two launches, not n: the buffers end exactly as n single appends leave them (the prompt path's;
+/// host positions, so not capturable).
+void indexer_key_append_rows(const float* raw, int64_t ld, int64_t pos0, int64_t n, int32_t pos_base,
+                             const float* w_k_norm, float eps, const QsaIndexerBuffers& b, const QsaShapes& s,
+                             const float* cos_tab, const float* sin_tab, void* stream);
 
 /// Per-CELL indexer scores, `n_kv = pos + 1` of them, fp32.
 ///
