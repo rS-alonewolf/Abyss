@@ -117,5 +117,14 @@ bool hc4_fused_ok(int n_embd, int hc, int lr, int down_type, int up_type, int in
 void hc4_fused(float* R, const float* out, const float* inj_prev, const float* gamma, float eps, int n_embd, int hc,
                int lr, const void* down, const void* inject, const void* up, float* lo, float* inj_out, float* sc,
                float* xn, float* gate, float* x, void* xq, cudaStream_t s, bool inject_f32 = false);
+/// the same over a window's T columns (1..8; R [T][hc][n_embd], out [T][n_embd], inj_prev / inj_out [T][inj_stride /
+/// hc], lo [T][lr], sc 4 T floats, xn / gate [T][hc][n_embd], x [T][n_embd]): bit-identical to q4x_mix_cols' five
+/// launches (hc4_combine_norm over the columns, mvn down + inject, silu_scale, mvn up, hc4_mix) - a: hc4_fused's a with
+/// a grid row a column, b: every column's up rows from one load of the weights (hc4_fused is this with T = 1)
+bool hc4_fused_cols_ok(int n_embd, int hc, int lr, int T, int down_type, int up_type, int inject_type);
+void hc4_fused_cols(float* R, const float* out, const float* inj_prev, int inj_stride, const float* gamma, float eps,
+                    int n_embd, int hc, int lr, int T, const void* down, const void* inject, const void* up, float* lo,
+                    float* inj_out, float* sc, float* xn, float* gate, float* x, void* xq, cudaStream_t s,
+                    bool inject_f32 = false);
 
 }  // namespace strata::kernels::q35

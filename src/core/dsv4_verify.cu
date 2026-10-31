@@ -153,7 +153,7 @@ struct VerifyBuf {
     // the PLE's embedding rows, keys, values, postops scratch (q4_ple_qn ends as the rows the conv history takes - the
     // rewind replays the kept ones onto the history kept before the window, q4_ple_snap); the QSA indexer's raw keys,
     // queries, step records and query positions (and their pinned source)
-    float *q4_xn = nullptr, *q4_lo = nullptr, *q4_gate = nullptr, *q4_inj[2] = {nullptr, nullptr};
+    float *q4_xn = nullptr, *q4_lo = nullptr, *q4_gate = nullptr, *q4_inj[2] = {nullptr, nullptr}, *q4_sc = nullptr;
     void *q4_xnq = nullptr, *q4_loq = nullptr, *q4_embq = nullptr;
     float *q4_emb = nullptr, *q4_key = nullptr, *q4_val = nullptr, *q4_qn = nullptr, *q4_gated = nullptr,
           *q4_g4 = nullptr, *q4_ple_snap = nullptr, *q4_iraw = nullptr, *q4_iq = nullptr;
@@ -253,7 +253,7 @@ bool Glm5Model::verify_alloc(std::string& err) {
     if (ok && g.q4x) {
         const size_t HE = (size_t) g.hc * E, LR = (size_t) g.hc_lr, ID = (size_t) g.idx_key, IH = (size_t) g.idx_heads;
         f(V->q4_xn, HE); b(V->q4_xnq, HE / 32 * kQ8); f(V->q4_lo, LR); b(V->q4_loq, (LR + 31) / 32 * kQ8);
-        f(V->q4_gate, HE); f(V->q4_inj[0], 4); f(V->q4_inj[1], 4);
+        f(V->q4_gate, HE); f(V->q4_inj[0], 4); f(V->q4_inj[1], 4); f(V->q4_sc, 4);
         f(V->q4_emb, E); b(V->q4_embq, E / 32 * kQ8); f(V->q4_key, HE); f(V->q4_val, E); f(V->q4_qn, HE);
         f(V->q4_gated, HE); f(V->q4_g4, 4); f(V->q4_iraw, ID); f(V->q4_iq, IH * ID);
         ok = ok && cudaMalloc((void**) &V->q4_ple_snap, (size_t) strata::kernels::NG_HIST * HE * sizeof(float)) == cudaSuccess &&
@@ -1447,6 +1447,24 @@ bool Glm5Model::q4x_mix_cols(float* R, int T, const float* norm, const WSlot& do
     const Glm5Geometry& g = g_;
     cudaStream_t s = fast_->cs;
     const int E = g.n_embd, HE = g.hc * E, LR = g.hc_lr;
+    // the five launches below in two (q35::hc4_fused_cols: the same bits as CUDA's five - hc4_fused_parity, T 1..8),
+    // as the token path's q4x_mix.  RTX 5090, Qwen3.8 ISTA IQ3_S: a window's 97 mixes 2.6 -> 1.8 ms (2 columns),
+    // 5.5 -> 2.6 ms (5) - mvn's T columns of xn did not fit in L1.  STRATA_Q4X_HC_FUSE=0: the five; 2: the token
+    // path's fused, the windows' five (A/B).  Off by default with HIP, as the token path's
+    static const bool fuse = [] {
+        const char* v = getenv("STRATA_Q4X_HC_FUSE");
+#if defined(STRATA_USE_HIP)
+        return v != nullptr && std::atoi(v) == 1;
+#else
+        return v == nullptr || (std::atoi(v) != 0 && std::atoi(v) != 2);
+#endif
+    }();
+    if (fuse && q35::hc4_fused_cols_ok(E, g.hc, LR, T, down.type, up.type, inject != nullptr ? inject->type : -1)) {
+        q35::hc4_fused_cols(R, out, inj_prev, g.hc, norm, g.norm_eps, E, g.hc, LR, T, down.q,
+                            inject != nullptr ? inject->q : nullptr, up.q, V->q4_lo, inj_out, V->q4_sc, V->q4_xn,
+                            V->q4_gate, x, xq, s, inject != nullptr && inject->type == gf::kTypeF32);
+        return true;
+    }
     q35::hc4_combine_norm(R, out, inj_prev, g.hc, norm, g.norm_eps, E, g.hc, T, V->q4_xn, s, V->q4_xnq);
     gf::MvJob j[2];
     j[0] = {down.q, V->q4_xnq, V->q4_xn, V->q4_lo, nullptr, 1.0f, down.type, HE, LR};

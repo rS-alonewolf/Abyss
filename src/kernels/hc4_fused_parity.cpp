@@ -95,6 +95,54 @@ int main(int argc, char** argv) {
                     ++bad;
                 }
         }
+    // the window's T columns: q4x_mix_cols' five launches (mvn) against hc4_fused_cols, T = 1..8
+    const int TM = 8;
+    std::vector<float> RW0 = rnd((size_t) TM * HE, 1.0f), outw = rnd((size_t) TM * E, 0.5f), injw = rnd((size_t) TM * HC, 1.0f);
+    float *RW = up(RW0), *outW = up(outw), *injpW = up(injw);
+    float *xnW, *loW, *gateW, *xW, *injW, *scW;
+    void *xnqW, *loqW, *xqW;
+    ck(cudaMalloc(&xnW, (size_t) TM * HE * 4), "m"); ck(cudaMalloc(&loW, (size_t) TM * LR * 4), "m");
+    ck(cudaMalloc(&gateW, (size_t) TM * HE * 4), "m"); ck(cudaMalloc(&xW, (size_t) TM * E * 4), "m");
+    ck(cudaMalloc(&injW, TM * 64), "m"); ck(cudaMalloc(&scW, TM * 64), "m");
+    ck(cudaMalloc(&xnqW, (size_t) TM * HE / 32 * 36), "m"); ck(cudaMalloc(&loqW, (size_t) TM * LR / 32 * 36), "m");
+    ck(cudaMalloc(&xqW, (size_t) TM * E / 32 * 36), "m");
+    const auto five_c = [&](int T, bool with_out, int itype) {
+        const void* iw = itype == 0 ? (const void*) iWf : (const void*) iWb;
+        q35::hc4_combine_norm(RW, with_out ? outW : nullptr, injpW, HC, gamma, eps, E, HC, T, xnW, s, xnqW);
+        gf::MvJob j[2];
+        j[0] = {dW, xnqW, xnW, loW, nullptr, 1.0f, gf::kTypeBF16, HE, LR};
+        j[1] = {iw, xnqW, xnW, injW, nullptr, 1.0f, itype, HE, HC};
+        gf::mvn(j, itype >= 0 ? 2 : 1, T, s);
+        q35::silu_scale(loW, T * LR, 1.0f / (float) HC, s, loqW);
+        gf::MvJob u = {uW, loqW, loW, gateW, nullptr, 1.0f, gf::kTypeBF16, LR, HE};
+        gf::mvn(&u, 1, T, s);
+        q35::hc4_mix(xnW, gateW, E, HC, T, xW, s, xqW);
+    };
+    const auto two_c = [&](int T, bool with_out, int itype) {
+        const void* iw = itype < 0 ? nullptr : itype == 0 ? (const void*) iWf : (const void*) iWb;
+        q35::hc4_fused_cols(RW, with_out ? outW : nullptr, injpW, HC, gamma, eps, E, HC, LR, T, dW, iw, uW, loW, injW,
+                            scW, xnW, gateW, xW, xqW, s, itype == 0);
+    };
+    for (int T = 1; T <= TM; ++T)
+        for (int with_out = 0; with_out < 2; ++with_out)
+            for (int itype : {gf::kTypeF32, gf::kTypeBF16, -1}) {
+                std::vector<uint8_t> res[2][6];
+                for (int v = 0; v < 2; ++v) {
+                    ck(cudaMemcpy(RW, RW0.data(), (size_t) TM * HE * 4, cudaMemcpyHostToDevice), "R");
+                    ck(cudaMemset(injW, 0, TM * 64), "inj");
+                    v == 0 ? five_c(T, with_out, itype) : two_c(T, with_out, itype);
+                    ck(cudaStreamSynchronize(s), "run");
+                    res[v][0] = down(RW, (size_t) T * HE); res[v][1] = down(injW, (size_t) T * HC);
+                    res[v][2] = down(xnW, (size_t) T * HE); res[v][3] = down(gateW, (size_t) T * HE);
+                    res[v][4] = down(xW, (size_t) T * E); res[v][5] = down((uint8_t*) xqW, (size_t) T * E / 32 * 36);
+                }
+                const char* names[6] = {"R", "inject", "xn", "gate", "mix", "mix q8_1"};
+                for (int k = 0; k < 6; ++k)
+                    if (res[0][k] != res[1][k]) {
+                        std::printf("T=%d out=%d inject type %d: %s differs\n", T, with_out, itype, names[k]);
+                        ++bad;
+                    }
+            }
     // a token's 97 mixes, each way, each mix its own weights (1.3 GB: read from memory, not L2, as in the engine)
     std::vector<uint16_t*> dWs(97), uWs(97);
     for (int m = 0; m < 97; ++m) {
@@ -117,6 +165,21 @@ int main(int argc, char** argv) {
         std::printf("%s: %.3f ms a token's 97 mixes (%.1f us a mix)\n", v == 0 ? "five launches" : "hc4_fused", ms,
                     ms * 1000.0 / 97.0);
     }
+    for (int T = 2; T <= 6; ++T)
+        for (int v = 0; v < 2; ++v) {
+            ck(cudaStreamSynchronize(s), "sync");
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int r = 0; r < reps; ++r)
+                for (int m = 0; m < 97; ++m) {
+                    dW = dWs[m];
+                    uW = uWs[m];
+                    v == 0 ? five_c(T, true, gf::kTypeF32) : two_c(T, true, gf::kTypeF32);
+                }
+            ck(cudaStreamSynchronize(s), "sync");
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+            std::printf("T=%d %s: %.3f ms a window's 97 mixes (%.1f us a mix)\n", T,
+                        v == 0 ? "five launches (mvn)" : "hc4_fused_cols", ms, ms * 1000.0 / 97.0);
+        }
     std::printf(bad == 0 ? "hc4_fused parity: OK (every output the same bytes)\n" : "hc4_fused parity: %d outputs differ\n", bad);
     return bad == 0 ? 0 : 1;
 }

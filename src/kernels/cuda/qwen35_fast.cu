@@ -972,8 +972,17 @@ __global__ void __launch_bounds__(256) hc4_fused_a_kernel(const float* __restric
                                                           int hc, const uint16_t* __restrict__ down, int lr,
                                                           const void* __restrict__ inject, bool inj_f32,
                                                           float* __restrict__ lo, float* __restrict__ inj_out,
-                                                          float* __restrict__ sc_out) {
+                                                          float* __restrict__ sc_out, int inj_stride) {
     __shared__ __align__(16) float xs[kHcMaxHE];
+    {   // column blockIdx.y of a window (hc4_fused_cols; the token path's grid has one row)
+        const int t = blockIdx.y;
+        R += (size_t) t * hc * n_embd;
+        if (out != nullptr) out += (size_t) t * n_embd;
+        inj_prev += (size_t) t * inj_stride;
+        lo += (size_t) t * lr;
+        if (inj_out != nullptr) inj_out += (size_t) t * hc;
+        sc_out += (size_t) t * 4;
+    }
     __shared__ float sh[4][8];
     __shared__ float scs[4];
     // the four streams at once (hc == 4): each thread's partial sum of a stream runs over the same elements in the same
@@ -1057,27 +1066,30 @@ __global__ void __launch_bounds__(256) hc4_fused_a_kernel(const float* __restric
     s = warp_sum(s);
     if (lane == 0) *y = s + 0.0f;
 }
-// b: block b - columns e0 = 32 b .. e0 + 31: silu(lo / hc) into shared memory, the up rows c * n_embd + e of those
-// columns (16 warps x 8 rows), then warp 0: R's combine written, xn, the mix over the streams and its q8_1
-__global__ void __launch_bounds__(512) hc4_fused_b_kernel(float* __restrict__ R, const float* __restrict__ out,
-                                                          const float* __restrict__ inj_prev,
-                                                          const float* __restrict__ gamma, int n_embd, int hc,
-                                                          const uint16_t* __restrict__ up, int lr,
-                                                          const float* __restrict__ lo, float a,
-                                                          const float* __restrict__ sc, float* __restrict__ xn,
-                                                          float* __restrict__ gate, float* __restrict__ mixed,
-                                                          Q81* __restrict__ xq) {
-    __shared__ __align__(16) float ls[512];
-    __shared__ float gs[4 * 32];
-    for (int i = threadIdx.x; i < lr; i += 512) {
+// ---- the window's hyper-connection mix over T columns in two launches (hc4_fused_cols): q4x_mix_cols' five launches
+// (hc4_combine_norm over the columns, mvn down + inject, silu_scale, mvn up, hc4_mix), each column's sums in
+// mvn_kernel_f's order (the same as mv's: a warp a row, 8 weights a lane a step, then the warp's sum) - the same bits
+// a: hc4_fused_a_kernel with a column a grid row (blockIdx.y; two columns a block in 80 KB of shared memory measured
+// slower: 14 against 9-10 us a launch, fewer blocks in flight)
+// b: block b - embedding columns e0 = 32 b .. e0 + 31 of every window column: silu(lo / hc) of the T columns into
+// shared memory, each warp's 8 up rows loaded once and summed against every column (mv's order), then warp t: column
+// t's R combine written, xn, the mix over the streams and its q8_1
+__global__ void __launch_bounds__(512) hc4_fused_cols_b_kernel(float* __restrict__ R, const float* __restrict__ out,
+                                                               const float* __restrict__ inj_prev, int inj_stride,
+                                                               const float* __restrict__ gamma, int n_embd, int hc,
+                                                               int T, const uint16_t* __restrict__ up, int lr,
+                                                               const float* __restrict__ lo, float a,
+                                                               const float* __restrict__ sc, float* __restrict__ xn,
+                                                               float* __restrict__ gate, float* __restrict__ mixed,
+                                                               Q81* __restrict__ xq) {
+    __shared__ __align__(16) float ls[8 * 512];
+    __shared__ float gs[8 * 4 * 32];
+    for (int i = threadIdx.x; i < T * lr; i += 512) {   // (silu_scale_kernel's expression)
         const float v = lo[i] * a;
-        ls[i] = v / (1.0f + expf(-v));
+        ls[(i / lr) * 512 + i % lr] = v / (1.0f + expf(-v));
     }
     __syncthreads();
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, e0 = blockIdx.x * 32;
-    const float4* x4 = (const float4*) ls;
-    // the warp's 8 rows' weights loaded first (lr <= 512: at most two 16-byte pieces a lane a row), then each row's
-    // sum in mv's order (piece k = lane, then lane + 32)
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, e0 = blockIdx.x * 32, HE = hc * n_embd;
     const int nk = lr / 8;
     uint4 w0[8], w1[8];
 #pragma unroll
@@ -1088,40 +1100,66 @@ __global__ void __launch_bounds__(512) hc4_fused_b_kernel(float* __restrict__ R,
         w0[j] = ok && lane < nk ? r8[lane] : make_uint4(0, 0, 0, 0);
         w1[j] = ok && lane + 32 < nk ? r8[lane + 32] : make_uint4(0, 0, 0, 0);
     }
+    // (hc == 4: the 16 warps' 8 rows are the 128 rows of the 32 columns' 4 streams)
+    for (int t = 0; t < T; ++t) {
+        const float4* x4 = (const float4*) (ls + t * 512);
+        float v[8];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const int rl = warp * 8 + j;   // stream rl / 32, column e0 + rl % 32
-        if ((rl >> 5) >= hc) break;
-        const int row = (rl >> 5) * n_embd + e0 + (rl & 31);
-        float s = 0.0f;
-        if (lane < nk) s += hc_bf16_dot8(w0[j], x4[2 * lane], x4[2 * lane + 1]);
-        if (lane + 32 < nk) s += hc_bf16_dot8(w1[j], x4[2 * (lane + 32)], x4[2 * (lane + 32) + 1]);
-        s = warp_sum(s);
-        if (lane == 0) {
-            const float gv = s + 0.0f;
-            gs[rl] = gv;
-            gate[row] = gv;
+        for (int j = 0; j < 8; ++j) {
+            float s = 0.0f;
+            if (lane < nk) s += hc_bf16_dot8(w0[j], x4[2 * lane], x4[2 * lane + 1]);
+            if (lane + 32 < nk) s += hc_bf16_dot8(w1[j], x4[2 * (lane + 32)], x4[2 * (lane + 32) + 1]);
+            v[j] = s;
+        }
+        // the 8 rows' warp sums as a reduce-scatter: each xor step of warp_sum's butterfly (v + the partner's v) on
+        // the half of the rows a lane keeps - every row's sum the same pairs in the same order, 9 shuffles, not 40
+        const bool h4 = (lane & 16) != 0, h3 = (lane & 8) != 0, h2 = (lane & 4) != 0;
+        float u[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float r = __shfl_xor_sync(0xffffffffu, h4 ? v[i] : v[4 + i], 16);
+            u[i] = (h4 ? v[4 + i] : v[i]) + r;
+        }
+        float q[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const float r = __shfl_xor_sync(0xffffffffu, h3 ? u[i] : u[2 + i], 8);
+            q[i] = (h3 ? u[2 + i] : u[i]) + r;
+        }
+        float z;
+        {
+            const float r = __shfl_xor_sync(0xffffffffu, h2 ? q[0] : q[1], 4);
+            z = (h2 ? q[1] : q[0]) + r;
+        }
+        z += __shfl_xor_sync(0xffffffffu, z, 2);
+        z += __shfl_xor_sync(0xffffffffu, z, 1);
+        if ((lane & 3) == 0) {
+            const int j = (h4 ? 4 : 0) + (h3 ? 2 : 0) + (h2 ? 1 : 0), rl = warp * 8 + j;
+            const int row = (rl >> 5) * n_embd + e0 + (rl & 31);
+            const float gv = z + 0.0f;
+            gs[t * 128 + rl] = gv;
+            gate[(size_t) t * HE + row] = gv;
         }
     }
     __syncthreads();
-    if (warp != 0) return;
-    const int e = e0 + lane;
+    if (warp >= T) return;
+    const int t = warp, e = e0 + lane;
     float m = 0.0f;
     for (int c = 0; c < hc; ++c) {
-        float* r = R + (size_t) c * n_embd;
+        float* r = R + (size_t) t * HE + (size_t) c * n_embd;
         float v = r[e];
         if (out != nullptr) {
-            const float w = 2.0f * sigmoid_f(inj_prev[c] / (float) hc);
-            v = r[e] + out[e] * w;
+            const float w = 2.0f * sigmoid_f(inj_prev[(size_t) t * inj_stride + c] / (float) hc);
+            v = r[e] + out[(size_t) t * n_embd + e] * w;
             r[e] = v;
         }
-        const float xv = v * sc[c] * gamma[(size_t) c * n_embd + e];
-        xn[(size_t) c * n_embd + e] = xv;
-        m += xv * sigmoid_f(gs[c * 32 + lane]);
+        const float xv = v * sc[(size_t) t * 4 + c] * gamma[(size_t) c * n_embd + e];
+        xn[(size_t) t * HE + (size_t) c * n_embd + e] = xv;
+        m += xv * sigmoid_f(gs[t * 128 + c * 32 + lane]);
     }
     m = m / (float) hc;
-    mixed[e] = m;
-    if (xq != nullptr) q81_store_warp(m, xq + e / 32, lane);
+    mixed[(size_t) t * n_embd + e] = m;
+    if (xq != nullptr) q81_store_warp(m, xq + ((size_t) t * n_embd + e) / 32, lane);
 }
 }  // namespace
 
@@ -1133,13 +1171,26 @@ bool hc4_fused_ok(int n_embd, int hc, int lr, int down_type, int up_type, int in
 void hc4_fused(float* R, const float* out, const float* inj_prev, const float* gamma, float eps, int n_embd, int hc,
                int lr, const void* down, const void* inject, const void* up, float* lo, float* inj_out, float* sc,
                float* xn, float* gate, float* x, void* xq, cudaStream_t s, bool inject_f32) {
+    hc4_fused_cols(R, out, inj_prev, hc, gamma, eps, n_embd, hc, lr, 1, down, inject, up, lo, inj_out, sc, xn, gate, x,
+                   xq, s, inject_f32);
+}
+bool hc4_fused_cols_ok(int n_embd, int hc, int lr, int T, int down_type, int up_type, int inject_type) {
+    return T >= 1 && T <= 8 && hc4_fused_ok(n_embd, hc, lr, down_type, up_type, inject_type);
+}
+void hc4_fused_cols(float* R, const float* out, const float* inj_prev, int inj_stride, const float* gamma, float eps,
+                    int n_embd, int hc, int lr, int T, const void* down, const void* inject, const void* up, float* lo,
+                    float* inj_out, float* sc, float* xn, float* gate, float* x, void* xq, cudaStream_t s,
+                    bool inject_f32) {
+    if (T <= 0) return;
     const int rows = lr + (inject != nullptr ? hc : 0);
-    hc4_fused_a_kernel<<<(rows + 7) / 8, 256, 0, s>>>(R, out, inj_prev, gamma, eps, n_embd, hc, (const uint16_t*) down,
-                                                      lr, inject, inject_f32, lo, inj_out, sc);
-    check("hc4_fused_a");
-    hc4_fused_b_kernel<<<n_embd / 32, 512, 0, s>>>(R, out, inj_prev, gamma, n_embd, hc, (const uint16_t*) up, lr, lo,
-                                                   1.0f / (float) hc, sc, xn, gate, x, (Q81*) xq);
-    check("hc4_fused_b");
+    hc4_fused_a_kernel<<<dim3((unsigned) ((rows + 7) / 8), (unsigned) T), 256, 0, s>>>(
+        R, out, inj_prev, gamma, eps, n_embd, hc, (const uint16_t*) down, lr, inject, inject_f32, lo, inj_out, sc,
+        inj_stride);
+    check("hc4_fused_cols_a");
+    hc4_fused_cols_b_kernel<<<n_embd / 32, 512, 0, s>>>(R, out, inj_prev, inj_stride, gamma, n_embd, hc, T,
+                                                        (const uint16_t*) up, lr, lo, 1.0f / (float) hc, sc, xn, gate,
+                                                        x, (Q81*) xq);
+    check("hc4_fused_cols_b");
 }
 
 void silu(float* x, int n, cudaStream_t s) {
