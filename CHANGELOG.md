@@ -38,8 +38,10 @@ IQ3_S, ctx 32K, the v1.3.86 and v1.3.87 builds alternated in one session (4 gree
   1087, quality KL 0.039-0.040 against 0.049 (the same "slightly off" as v1.3.86's).
   DeepSeek V4.1 UD-IQ2_XXS (ctx 64K, no DSpark): decode 22.9 / 20.7 tok/s against 21.6, 8K prompt 360 / 319 against
   356 (SSD-bound: the second run met a slow SSD spell, 2.7 GB/s), KL 0.0081 / 0.0082 against 0.0080.
-  One drafter check of each model parted early (GLM at token 7, V4.1 at 0) and the next run of the same build did not
-  (52, 161); the v1.3.86 build did the same on GLM in its own check (7, then 22).
+  `--bench`'s drafter check sometimes parts at the first tokens on both builds (a near-tie that moves with where the
+  experts sit): with expert swaps pinned, V4.1 parted at token 0 in 1 of 3 runs on this build and 1 of 3 on v1.3.86's,
+  GLM at token 7 in 2 of 3 here and 1 of 4 on v1.3.86's. The route kernel's whole output (request block, window column
+  blocks, canaries) is byte-identical to v1.3.86's in a parity test at k = 6 / 8 / 10 and 1-6 window columns.
 - HIP is unchanged by default (it compiles); not checked on an AI PRO R9700 (not in the PC).
 
 ## v1.3.86 - 2026-10-31
