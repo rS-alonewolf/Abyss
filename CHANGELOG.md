@@ -7,6 +7,35 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.88 - 2026-11-01
+
+Qwen3.8-Flash-Next reads long prompts much faster: RTX 5090 (PCIe Gen4 x4), ISTA-DASLab GSQ-RCO IQ3_S, the v1.3.87
+and v1.3.88 builds alternated (`./abyss.sh --bench --full`, ctx 65536):
+
+| prompt | v1.3.87 | v1.3.88 |
+| --- | ---: | ---: |
+| 2K tokens | 1061-1120 tok/s | 1145-1202 tok/s (+5%) |
+| 8K tokens | 1477-1561 tok/s | 2240-2376 tok/s (+52%) |
+| 32K tokens | 1702-1720 tok/s | 3002-3027 tok/s (+76%) |
+
+A 45.5K-token prompt (needle test) 26-29 s -> 14-17 s, the needle found 3 of 3 on both. Decode unchanged; quality KL
+0.0022 as before.
+
+- **The prompt's sparse attention (the 12 QSA layers, rows past 2,051 cells) runs 64 rows a launch** instead of a
+  gather and an attention launch a row and a layer, each row reading its own selected cells straight from the KV cache,
+  one block the six heads of a KV group (one K / V read for six heads). The same bits as before (`qsa_rows_parity`:
+  8K / 32K contexts, 4-2,051-cell selections). The indexer's block keys are appended a sub-batch at a time in two
+  launches instead of one a token (the same bytes). The stage took 2,000 ms of a 12K-token run, now 346.
+  `STRATA_Q4X_QSA_BATCH=0` is the old way; off by default on HIP (it compiles; not run on an AMD card).
+- **The delta-net middle (q/k norm, gates, recurrence, output norm, q8_1) runs in one launch** on the token path and
+  three in one in the verify windows, the same bits (`gdn_core_parity`). About -0.09 ms a token; the decode speed
+  moved within the noise. `STRATA_Q4X_GDN_FUSE=0` is the old way; off by default on HIP.
+- **`--bench`'s drafter check no longer calls a near-tie "TOO EARLY"**: when the answers with and without the drafter
+  part within the first 12 tokens, the token path scores both tokens after the same start (LOGP); within 1 nat is an
+  early near-tie (fine), farther apart is still TOO EARLY. On the 5090 the parts measured 0.01-0.13 nats apart, a
+  wrong token 18-28 nats below.
+- Not checked on an AI PRO R9700 (not in the PC).
+
 ## v1.3.87 - 2026-10-31
 
 Qwen3.8-Flash-Next with its MTP drafter decodes about 12% faster. RTX 5090 (PCIe Gen4 x4) with ISTA-DASLab GSQ-RCO
