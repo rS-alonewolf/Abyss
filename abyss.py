@@ -2513,7 +2513,8 @@ def first_difference(a: list, b: list) -> int | None:
     return next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), None if len(a) == len(b) else min(len(a), len(b)))
 
 
-SPEC_EARLY = 12   # the drafter check: parting before this many tokens is a bug (late parts: near-ties)
+SPEC_EARLY = 12   # the drafter check: parting before this many tokens is looked at closer (late parts: near-ties)
+SPEC_TIE = 1.0    # ... and is fine when the token path scores both tokens within this many nats (a near-tie)
 
 
 BENCH_TOPICS = [
@@ -2923,10 +2924,32 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
         f = gen(chat(BENCH_TOPICS[0]), 256, "spec=0 ")
         spec_diff = None if f[0] != "DONE" or first is None else first_difference(first, last_toks)
         spec_bad = spec_diff is not None and spec_diff < SPEC_EARLY
+        tie = ""
+        if spec_bad and spec_diff < min(len(first), len(last_toks)):
+            # an early part can still be a near-tie: which experts sit in VRAM and which run on the CPU lane moves
+            # the sums a little, so the first tokens can flip on both builds alike (2026-10-31: GLM at token 7 on
+            # v1.3.86 and v1.3.87, V4.1 at 0).  The token path scores both tokens after the same start: within
+            # SPEC_TIE nats is a near-tie; a wrong drafter or window picks a token the model does not rate
+            head = chat(BENCH_TOPICS[0]) + [int(t) for t in first[:spec_diff]]
+            lps = []
+            for t in (first[spec_diff], last_toks[spec_diff]):
+                ids = head + [int(t)]
+                p.stdin.write(f"LOGP {len(head)} " + ",".join(map(str, ids)) + "\n")
+                p.stdin.flush()
+                line = p.stdout.readline()
+                if not line:
+                    fail("the engine stopped during the benchmark", f"its log: {log_path}")
+                if line.startswith("LP "):
+                    lps.append(float(line.split()[1]))
+            if len(lps) == 2:
+                gap = abs(lps[0] - lps[1])
+                spec_bad = gap >= SPEC_TIE
+                tie = f", the two tokens {gap:.2f} nats apart"
         spec_txt = ("not checked" if f[0] != "DONE" or first is None else
                     f"same {len(first)} tokens with and without speculative decoding" if spec_diff is None else
-                    f"the same first {spec_diff} of {len(first)} tokens with and without speculative decoding" +
-                    (" - TOO EARLY" if spec_bad else " (a late near-tie: fine)"))
+                    f"the same first {spec_diff} of {len(first)} tokens with and without speculative decoding" + tie +
+                    (" - TOO EARLY" if spec_bad else
+                     " (an early near-tie: fine)" if spec_diff < SPEC_EARLY else " (a late near-tie: fine)"))
         say(f"  drafter check: {spec_txt}")
         if lens:                                            # warm-up: the first prompt after a start is slower
             gen(doc[-lens[0]:], 1)                          # (cold caches, issue #8); its opening is not reused below
