@@ -132,6 +132,15 @@ public:
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
+    /// gather_batch in two halves, for a caller with other work between them: issue_batch queues the reads (one batch
+    /// in flight a table, apart from the single-token issue), collect_batch waits and dequantizes into `out`.
+    bool issue_batch(const uint32_t* rows, size_t n_tokens);
+    bool collect_batch(float* out, std::string& err);
+    /// Direct mode: read these rows into the row cache ahead of their gather (fire and forget - a later issue / gather
+    /// of a row still in flight reads it again); reap_prefetches waits for the ones issued so far and drops their
+    /// tickets.  The mapped mode does nothing.
+    void prefetch(const uint32_t* rows, size_t n);
+    void reap_prefetches();
 
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);

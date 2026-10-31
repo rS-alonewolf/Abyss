@@ -1508,16 +1508,22 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
         cudaMemcpyAsync(V->q35_csnap + (size_t) li * conv_n, Ly.gdn_conv, conv_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
         ++li;
     }
-    // the window's PLE rows: hashed on the host (ple_toks carries the history), read in one request on a thread while
-    // the device runs layer 0 (joined before layer 1's launches; STRATA_Q4X_PLE_SYNC=1 reads them here)
+    // the window's PLE rows: hashed on the host (ple_toks carries the history), queued as one request (the reader's
+    // worker reads them) while the device runs layer 0, collected before layer 1's launches (STRATA_Q4X_PLE_SYNC=1:
+    // collected here).  The drafter's steps prefetched the rows of the window's tokens it knew (q35_mtp_draft): those
+    // come from the row cache
     static const bool ple_sync = getenv("STRATA_Q4X_PLE_SYNC") != nullptr && std::atoi(getenv("STRATA_Q4X_PLE_SYNC")) != 0;
-    std::thread ple_rd;
-    bool ple_ok = true;
-    std::string ple_err;
-    struct Join {   // (an early return still joins the reader)
-        std::thread& t;
-        ~Join() { if (t.joinable()) t.join(); }
-    } ple_join{ple_rd};
+    bool ple_wait = false;
+    struct Collect {   // (an early return still collects the batch: one batch in flight a table)
+        k::PleTable* t;
+        bool& on;
+        float* dst;
+        ~Collect() {
+            std::string e;
+            if (on) (void) t->collect_batch(dst, e);
+            if (t != nullptr) t->reap_prefetches();
+        }
+    } ple_join{F->ple.get(), ple_wait, F->ple_pf_h};
     V->q4_ple_on = F->ple != nullptr && l0_ <= F->ple_il && F->ple_il < l1_;
     if (V->q4_ple_on) {
         if (F->ple_issued) {
@@ -1548,14 +1554,13 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
             F->ple_pf_n = (size_t) TM * E;
         }
         // (the buffer's last H2D copy, an earlier window's, finished: the previous window was waited for)
-        std::vector<uint32_t> rv(rows, rows + (size_t) k::PLE_N_HEADS * T);
-        float* dst = F->ple_pf_h;
-        k::PleTable* tab = F->ple.get();
-        const auto rd = [tab, dst, T, rv = std::move(rv), &ple_ok, &ple_err] {
-            ple_ok = tab->gather_batch(rv.data(), (size_t) T, dst, ple_err);
-        };
-        if (ple_sync) rd();
-        else ple_rd = std::thread(rd);
+        ple_join.dst = F->ple_pf_h;
+        if (!F->ple->issue_batch(rows, (size_t) T)) { err = "qwen4exp verify: the PLE rows could not be issued"; return false; }
+        ple_wait = true;
+        if (ple_sync) {
+            ple_wait = false;
+            if (!F->ple->collect_batch(F->ple_pf_h, err)) { err = "qwen4exp verify: PLE: " + err; return false; }
+        }
         cudaMemcpyAsync(V->q4_ple_snap, F->ple_hist, (size_t) k::NG_HIST * HE * sizeof(float), cudaMemcpyDeviceToDevice, s);
     }
     // the columns' QSA step records and query positions
@@ -1585,8 +1590,11 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
             if (prev_out != nullptr)
                 q35::hc4_combine_norm(V->R, prev_out, V->q4_inj[1], g.hc, Ly.hc4[0].norm, g.norm_eps, E, g.hc, T, V->q4_xn, s);
             prev_out = nullptr;
-            if (ple_rd.joinable()) ple_rd.join();
-            if (!ple_ok) { err = "qwen4exp verify: PLE: " + ple_err; return false; }
+            if (ple_wait) {
+                ple_wait = false;
+                if (!F->ple->collect_batch(F->ple_pf_h, err)) { err = "qwen4exp verify: PLE: " + err; return false; }
+            }
+            F->ple->reap_prefetches();
             cudaMemcpyAsync(V->q4_emb, F->ple_pf_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, s);
             gf::quantize_q8_1(V->q4_emb, V->q4_embq, T * E, s);
             gf::MvJob j[2];

@@ -121,6 +121,16 @@ struct PleTable::Impl {
     bool pending = false;
     uint32_t rows[PLE_N_HEADS] = {};
     uint8_t raw[PLE_N_HEADS * PLE_ROW_BYTES] = {};
+    // issue_batch / collect_batch's one batch in flight, and the prefetches' tickets with their landing buffers
+    bool batch_pending = false;
+    strata::ngram::PleReader::Ticket batch_ticket;
+    std::vector<uint32_t> batch_rows;
+    std::vector<uint8_t> batch_raw;
+    struct Prefetch {
+        strata::ngram::PleReader::Ticket ticket;
+        std::vector<uint8_t> raw;
+    };
+    std::vector<Prefetch> prefetches;
 };
 
 PleTable::PleTable() : impl_(new Impl) {}
@@ -200,8 +210,10 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
 }
 
 void PleTable::close() {
-    impl_->reader.close();
+    impl_->reader.close();   // (drains the reads in flight before their buffers below go)
     impl_->pending = false;
+    impl_->batch_pending = false;
+    impl_->prefetches.clear();
     impl_->mode = PleIo::Mmap;
     delete impl_->file;
     impl_->file = nullptr;
@@ -287,6 +299,47 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
     }
     for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
     return true;
+}
+
+bool PleTable::issue_batch(const uint32_t* rows, size_t n_tokens) {
+    if (impl_->batch_pending) return false;
+    const size_t n = n_tokens * (size_t) PLE_N_HEADS;
+    impl_->batch_rows.assign(rows, rows + n);
+    impl_->batch_pending = true;
+    if (impl_->mode == PleIo::Direct) {
+        impl_->batch_raw.resize(n * PLE_ROW_BYTES);
+        impl_->batch_ticket = impl_->reader.issue(impl_->batch_rows.data(), n, impl_->batch_raw.data());
+    }
+    return true;
+}
+
+bool PleTable::collect_batch(float* out, std::string& err) {
+    if (!impl_->batch_pending) { err = "PleTable::collect_batch without issue_batch"; return false; }
+    impl_->batch_pending = false;
+    const size_t n = impl_->batch_rows.size();
+    if (impl_->mode == PleIo::Direct) {
+        if (!impl_->reader.collect(impl_->batch_ticket, err)) return false;
+        for (size_t i = 0; i < n; ++i)
+            iq4nl_dequant_row(impl_->batch_raw.data() + i * PLE_ROW_BYTES, out + i * PLE_HEAD_DIM);
+        impl_->bytes_read += (uint64_t) n * PLE_ROW_BYTES;
+        return true;
+    }
+    for (size_t i = 0; i < n; ++i) read_row(impl_->batch_rows[i], out + i * PLE_HEAD_DIM);
+    return true;
+}
+
+void PleTable::prefetch(const uint32_t* rows, size_t n) {
+    if (impl_->mode != PleIo::Direct || n == 0) return;
+    Impl::Prefetch f;
+    f.raw.resize(n * PLE_ROW_BYTES);
+    f.ticket = impl_->reader.issue(rows, n, f.raw.data());
+    impl_->prefetches.push_back(std::move(f));
+}
+
+void PleTable::reap_prefetches() {
+    std::string err;
+    for (Impl::Prefetch& f : impl_->prefetches) (void) impl_->reader.collect(f.ticket, err);   // (a failed read: the
+    impl_->prefetches.clear();                                                                 // gather reads it again)
 }
 
 void PleTable::set_injected_delay_us(double us) { impl_->reader.set_injected_delay_us(us); }

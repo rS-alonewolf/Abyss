@@ -624,7 +624,28 @@ bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::stri
     const int64_t p = q35_pend_pos_;
     if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "qwen35 mtp draft", err)) return false;   // (tok_in_h)
     F->tok_in_h[0] = y;
+    // qwen4exp's PLE: the verify window [y, drafts..] at position() reads each column's 16 table rows before its layer
+    // 1 (an SSD read each, ~0.3 ms in the engine).  The rows of y and of each draft are prefetched into the row cache
+    // as soon as the token is known - a draft step later (~1 ms) they are there; the window reads only the last
+    // draft's.  STRATA_Q4X_PLE_PREFETCH=0: off
+    static const bool ple_pf_env = [] {
+        const char* v = getenv("STRATA_Q4X_PLE_PREFETCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const bool ple_pf = ple_pf_env && g_.q4x && F->ple != nullptr && l0_ <= F->ple_il && F->ple_il < l1_ &&
+                        (size_t) (pos_ + kmax + 1) <= F->ple_toks.size();
+    int32_t pf_tok[8] = {pos_ >= 2 ? F->ple_toks[(size_t) (pos_ - 2)] : -1, pos_ >= 1 ? F->ple_toks[(size_t) (pos_ - 1)] : -1,
+                         y, -1, -1, -1, -1, -1};
+    const auto ple_prefetch = [&](int t) {   // column t's rows: its token pf_tok[t + 2] after pf_tok[t], pf_tok[t + 1]
+        namespace kn = strata::kernels;
+        static const kn::PleConsts consts = kn::ple_artifact_consts();
+        uint32_t rows[kn::PLE_N_HEADS];
+        kn::ngram_rows(&pf_tok[t + 2], &pf_tok[t], 1, consts, rows);
+        F->ple->prefetch(rows, kn::PLE_N_HEADS);
+    };
+    if (ple_pf) ple_prefetch(0);
     int n = 0;
+    int toks[5];
     for (int k = 0; k < kmax; ++k) {
         if (!q35_mtp_step(p + k, k == 0 ? F->tok_in_d : g_.q4x ? F->q35_mt_tok + (k - 1) : F->mtp_tok,
                           k == 0 ? F->q35_pend_h : g_.q4x ? q4x_mtp_residual() : F->head_x,
@@ -634,8 +655,12 @@ bool Glm5Model::q35_mtp_draft(int32_t y, int32_t* drafts, float* conf, std::stri
         conf[k] = F->q35_mt_conf_h[0];
         n = k + 1;
         if (conf[k] < stop_below) break;
+        if (ple_pf && k + 1 < kmax) {   // (a kept draft with a step after it: the window may hold it)
+            cudaMemcpy(&toks[k], F->q35_mt_tok + k, sizeof(int), cudaMemcpyDeviceToHost);
+            pf_tok[k + 3] = toks[k];
+            ple_prefetch(k + 1);
+        }
     }
-    int toks[5];
     cudaMemcpy(toks, F->q35_mt_tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost);
     if (!F->route_ok(err)) return false;
     for (int k = 0; k < n; ++k) drafts[k] = toks[k];
