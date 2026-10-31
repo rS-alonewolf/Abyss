@@ -7,6 +7,36 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.86 - 2026-10-31
+
+Qwen3.8-Flash-Next decodes about a third faster. RTX 5090 (PCIe Gen4 x4) with ISTA-DASLab GSQ-RCO IQ3_S, ctx 32K:
+
+| | v1.3.85 | v1.3.86 |
+| --- | ---: | ---: |
+| `./abyss.sh --bench` decode (3 questions, MTP drafter on) | 87.6 tok/s | 116.1 tok/s |
+| 2 prose answers, drafter on (256 tokens, greedy) | ~84 / ~80 | ~114 / ~111 |
+| 2 code answers, drafter on | ~88 / ~98 | ~118 / ~128 |
+| token by token (`GEN spec=0`), the 4 answers' mean | ~79 | ~106 |
+| VRAM hits | 60-77% | 80-94% |
+| CPU lane | 217 experts a token (6.0 ms) | 109 (3.1 ms) |
+| quality check (KL against bench/ref) | 0.0019 | 0.0022 |
+
+- **A routing profile for Qwen3.8 ships with Abyss** (`data/expert_counts/qwen38-flash-next.txt`: 36 prompts of
+  prose, code, math and Japanese, 8.2M routes). Its packs have no profile of their own, so the experts went into VRAM
+  in id order (experts 0-249 of every layer). The server now points `STRATA_GLM_PRIOR` at the shipped profile for a
+  Qwen3.8 pack (any quant, matched by its tensors) without an `expert_counts.txt`: the experts warm in its order, and
+  each layer gets a VRAM share by its routing (205-322 slots instead of 250 each). A pack's own profile still wins.
+- **Qwen3.8 swaps experts between RAM and VRAM sooner**: up to 16 moves a token boundary, a swap at 2 x the resident's
+  count + 8 (others keep 8 and 4 x + 16, tuned for DeepSeek V4's 8 MB experts; Qwen3.8's are ~2 MB, ~0.3 ms a copy).
+  The swap rule alone: ~88 -> ~100 tok/s drafter on; the profile alone ~115; both ~118.
+- **Qwen3.8's hyper-connection mixes (97 a token) run in two launches instead of five, with the same bits**
+  (`hc4_fused_parity`, `-DSTRATA_PARITY_HC4=ON`, compares every output byte for byte). The mixes take 2.98 -> 2.21 ms a
+  token; token by token ~+8%. The verify windows still use the five launches. Off by default on HIP (HIP sums the
+  down and inject rows in another order); `STRATA_Q4X_HC_FUSE=0` / `1` switches it.
+- The KL moves from 0.0019 to 0.0022 because the CPU now computes other experts than before (CPU and GPU round
+  differently), as between two runs. Other models are unchanged: GLM-5.3-Flash Maya-S-v2 on the 5090, decode 64.1
+  tok/s, 8K prompt 1090, as the v1.3.85 build (63.2 / 1100). Not checked on an AI PRO R9700 (not in the PC).
+
 ## v1.3.85 - 2026-10-31
 
 - `tools/abl_prompts.py --cyber N` and `--extra-harmful FILE [--extra-n N]`: force malware / hacking prompts, or your
