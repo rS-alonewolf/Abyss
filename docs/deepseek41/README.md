@@ -68,6 +68,10 @@ replaced UD-IQ2_XXS / UD-IQ1_M / UD-IQ1_S with new quants, clearly better at the
   0.199, 40 tok/s on swe-bench with the DSpark drafter on 32 GB + 96 GB).
 - UD-IQ1_S and ISTA run but are not recommended: past KL 0.25 the loss shows in the text (our line for a pick).
 - swe-bench rows: the everyday settings + the DSpark drafter (`--dspark`, threshold 0.6), iGPU lane off, 8 tasks.
+- **Keep the iGPU lane on** when the box has one (the default; `STRATA_GLM_IGPU=0` turns it off): it computes RAM-tier
+  experts beside the CPU lane, which is what a verify window waits on. RTX 5090 (OCuLink Gen4 x4) + Radeon 8060S lane,
+  UD-IQ2_XXS (new), everyday settings + the DSpark drafter, swe-bench 3 tasks (t010 / t021 / t030), 2026-11-01:
+  lane off 37.9 / 37.6 tok/s, **lane on 50.5 / 46.6 tok/s (+25-33%)**.
 - ISTA's new layout keeps the Engram table in shard 6 under another name; point a symlink named like shard 6 at
   `Engram-IQ4_NL.gguf` before packing.
 - Download the measured files with `--revision 85f81fb970add013033f25e94006713ca2c0aaf2` (files made before 10-28 are
@@ -126,7 +130,7 @@ and texts as below (AI PRO R9700 + 8060S lane, 60 GB RAM tier, Lexar NM790 SSD, 
 (`deepseek41-dflash-draft`, 4.9 GB) proposes up to five tokens; the model verifies them, so it does not change what is
 sampled. `STRATA_DS4_DSPARK=<file> STRATA_DS4_DSPARK_CHAIN=0.6` in the config's `env`. swe-bench 8 tasks on UD-IQ1_S:
 40.4 -> 46.7 tok/s (+16%, 4 runs, Lexar NM790); on the old ~3.4 GB/s SSD it measured no gain, since a verify window's
-columns wait on the disk. Its 1.67 GB of VRAM (dense 0.46 GB, 48 / 40 / 24 expert slots a stage) come out of the expert pool.
+columns wait on the disk. With an iGPU, leave its lane on: the windows are CPU-lane bound and the lane takes part of that work (+25-33% above). Its 1.67 GB of VRAM (dense 0.46 GB, 48 / 40 / 24 expert slots a stage) come out of the expert pool.
 
 **Uncensoring**: the run-time `--uncensor` (an `--abl-build` file or mrfakename's edit via `tools/abl_export.py`) and
 the `--abl` overlay are described and measured in [UNCENSOR.md](../UNCENSOR.md).
