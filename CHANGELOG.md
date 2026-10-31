@@ -7,6 +7,31 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.89 - 2026-11-01
+
+DeepSeek V4.1 Flash 1017 with the DSpark drafter and an iGPU lane: the lane takes a verify window's columns in one
+call. RTX 5090 (PCIe Gen4 x4) + Radeon 8060S lane, unsloth UD-IQ2_XXS, the everyday settings + DSpark, swe-bench 3
+tasks, the v1.3.88 and v1.3.89 builds alternated 4 times each:
+
+| | v1.3.88 | v1.3.89 |
+| --- | ---: | ---: |
+| swe-bench decode | 46.3-50.0 tok/s (mean 48.6) | 49.8-53.0 tok/s (mean 51.0) |
+| the lane, an expert | 60-62 us | 54-57 us |
+| a token, the same task | | -3-5% |
+
+- **The iGPU lane computes a window's columns in one call**, each of its experts read once for all the columns that
+  route to it (a window's columns share ~20% of their lane experts) instead of a lane call a column. The same bits as
+  before (14,000 columns checked against the one-column call, 0 differ); 0 crashes in 8 runs.
+  `STRATA_GLM_IGPU_COLS=0` is the old way, `ABYSS_IGPU_COLS_UNION=0` keeps one call without the shared reads.
+- **Qwen3.8-Flash-Next decode**: the QSA layers' attention, token by token and in the MTP verify windows, reads its
+  cells in place, a window's columns in one launch (the same bits). RTX 5090, 2,051 cells a layer: a 4-column window
+  88 -> 24 us; --bench decode about +2.6% (inside the bench's drift). `STRATA_Q4X_QSA_DECODE=0` is the old way; off
+  on HIP.
+- docs/deepseek41: **keep the iGPU lane on** when the box has one (it is the default): with DSpark, swe-bench 3 tasks
+  lane off 37.6-37.9 tok/s, on 46.6-50.5 (+25-33%). The lookahead (`STRATA_GLM_AHEAD`) re-measured on a ~6 GB/s NVMe
+  is still slower (47.9-49.3 off, 39.5-46.0 on) and stays off.
+- HIP: the lane library (built for the 8060S) carries the new call; the AMD engine build was not built or run on an AMD card for this release.
+
 ## v1.3.88 - 2026-11-01
 
 Qwen3.8-Flash-Next reads long prompts much faster: RTX 5090 (PCIe Gen4 x4), ISTA-DASLab GSQ-RCO IQ3_S, the v1.3.87
