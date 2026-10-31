@@ -493,6 +493,13 @@ static bool pack_dequant_tensor(const strata::TensorInfo& t, const uint8_t* src,
 
 }  // namespace
 
+std::string expert_counts_path(const std::string& pack_dir) {
+    const std::string p = pack_dir + "/expert_counts.txt";
+    if (!pack_dir.empty() && std::ifstream(p).good()) return p;
+    const char* v = getenv("STRATA_GLM_PRIOR");
+    return v != nullptr && v[0] ? std::string(v) : p;
+}
+
 // ================================ geometry ================================
 
 bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err) {
@@ -1608,7 +1615,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
                 if (e >= 0 && e < g.n_expert) cnt[(size_t) il][(size_t) e] = std::atof(kv.c_str() + c + 1);
             }
         }
-        std::ifstream cf(pack_dir + "/expert_counts.txt");
+        std::ifstream cf(expert_counts_path(pack_dir));
         while (std::getline(cf, line)) {
             std::istringstream ss(line);
             int il = -1;

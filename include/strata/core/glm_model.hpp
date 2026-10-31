@@ -124,6 +124,11 @@ struct Glm5Geometry {
     static bool from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
 };
 
+/// The routing profile's counts ("layer c0 c1 ..." by expert id, tools/glm_expert_prior.py): the pack's
+/// expert_counts.txt, else STRATA_GLM_PRIOR=<file> (the server points it at Abyss's shipped profile for a model it has
+/// one for - data/expert_counts/ - when the pack has none)
+std::string expert_counts_path(const std::string& pack_dir);
+
 class Glm5Model {
 public:
     Glm5Model() = default;

@@ -1113,7 +1113,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // layer rather than spending the capped budget on uneven partitions/spares.
         if (getenv("STRATA_GLM_UNIFORM_SLOTS") == nullptr && !(F->unified_memory && per == g.n_expert)) {
             std::vector<std::vector<double>> share((size_t) NL);
-            std::ifstream cf(pack_dir_ + "/expert_counts.txt");
+            std::ifstream cf(expert_counts_path(pack_dir_));
             std::string line;
             while (std::getline(cf, line)) {
                 std::istringstream ss(line);
@@ -3064,7 +3064,7 @@ bool Glm5Model::fast_warm(std::string& err) {
     // the routing profile's counts per expert id (expert_counts.txt), for the blend below
     std::vector<std::vector<double>> pcount((size_t) NL);
     {
-        std::ifstream cf(pack_dir_ + "/expert_counts.txt");
+        std::ifstream cf(expert_counts_path(pack_dir_));
         std::string line;
         while (std::getline(cf, line)) {
             std::istringstream ss(line);
@@ -3074,6 +3074,28 @@ bool Glm5Model::fast_warm(std::string& err) {
             if (il < 0 || il >= NL) continue;
             while (ss >> c) pcount[(size_t) il].push_back(c);
         }
+    }
+    // no expert_prior.txt (a pack with only the counts, or the shipped profile STRATA_GLM_PRIOR points at): each
+    // layer's order from the counts, the way tools/glm_expert_prior.py writes it (most routed first, ties by id)
+    {
+        bool any = false;
+        for (const auto& o : order) any = any || !o.empty();
+        int n_cnt = 0;
+        for (int il = 0; il < NL && !any; ++il) {
+            const auto& c = pcount[(size_t) il];
+            if (c.empty()) continue;
+            std::vector<int> o((size_t) g.n_expert);
+            std::iota(o.begin(), o.end(), 0);
+            std::stable_sort(o.begin(), o.end(), [&](int a, int b) {
+                const double ca = (size_t) a < c.size() ? c[(size_t) a] : 0.0, cb = (size_t) b < c.size() ? c[(size_t) b] : 0.0;
+                return ca > cb;
+            });
+            order[(size_t) il].swap(o);
+            ++n_cnt;
+        }
+        if (n_cnt > 0)
+            std::fprintf(stderr, "glm fast: CUDA%d the warm-up follows the routing profile %s (%d layers)\n", dev_,
+                         expert_counts_path(pack_dir_).c_str(), n_cnt);
     }
     static const double profile_w = [] {
         const char* v = getenv("STRATA_GLM_PROFILE_WEIGHT");
@@ -4946,9 +4968,14 @@ bool Glm5Model::fast_boundary(std::string& err) {
             F->ev_free.push_back(m.ev);
         }
         F->bg.swap(keep);
-        static const int bg_n = [] {
+        // Qwen3.8-Flash-Next (qwen4exp): 16 moves a boundary and swaps at 2 / 8 (below).  Its experts are ~2 MB (IQ3_S;
+        // a copy ~0.3 ms at Gen4 x4, DeepSeek V4's 8 MB held the link 1.2 ms), and at 8 and 4 / 16 the pool barely
+        // followed the text: RTX 5090 + Gen4 x4, ISTA IQ3_S, 4 greedy answers, VRAM hits 60-77% -> 68-89%, drafter-on
+        // 88 -> 100 tok/s, token by token 79 -> 90 (with the shipped routing profile: 115 -> 118, 94 -> 98)
+        const bool small_x = g.q4x;
+        static const int bg_n = [small_x] {
             const char* v = getenv("STRATA_GLM_PROMOTE");
-            return v != nullptr ? std::max(0, std::atoi(v)) : 8;
+            return v != nullptr ? std::max(0, std::atoi(v)) : small_x ? 16 : 8;
         }();
         // (c) the REFILL: while layers have free VRAM slots - a prompt's lending ends with ~15 a layer free on a 24 GB
         //     card - each such layer promotes its hottest RAM-only experts into them, up to STRATA_GLM_PROMOTE_FILL a
@@ -4965,13 +4992,13 @@ bool Glm5Model::fast_boundary(std::string& err) {
         // noisy: at 2 / 4 DeepSeek V4 swapped ~2.7 experts a token, and each 8 MB copy held the PCIe link ~1.2 ms -
         // the route's and the CPU lane's host-mapped reads and writes waited behind it (16 -> ~100 us a route).
         // 4 / 16: ~0.5 a token, decode +3% (prose) / +9% (code) on an RTX 5090 at Gen4 x4.
-        static const uint32_t bg_ratio = [] {
+        static const uint32_t bg_ratio = [small_x] {
             const char* v = getenv("STRATA_GLM_PROMOTE_RATIO");
-            return v != nullptr ? (uint32_t) std::max(1, std::atoi(v)) : 4u;
+            return v != nullptr ? (uint32_t) std::max(1, std::atoi(v)) : small_x ? 2u : 4u;
         }();
-        static const uint32_t bg_margin = [] {
+        static const uint32_t bg_margin = [small_x] {
             const char* v = getenv("STRATA_GLM_PROMOTE_MARGIN");
-            return v != nullptr ? (uint32_t) std::max(0, std::atoi(v)) : 16u;
+            return v != nullptr ? (uint32_t) std::max(0, std::atoi(v)) : small_x ? 8u : 16u;
         }();
         bool lane_all = F->cpu_plan != 0ull;   // the CPU lane takes every RAM-tier expert of a route
         for (int f = 1; f <= g.n_exp_used && lane_all; ++f) lane_all = (int) ((F->cpu_plan >> (4 * f)) & 15ull) == f;

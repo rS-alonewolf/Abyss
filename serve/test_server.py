@@ -382,6 +382,30 @@ class SamplingKeys(unittest.TestCase):
         self.assertFalse([k for k in self.keys(temperature=0.7) if k.startswith("penalty")])
 
 
+class ShippedPrior(unittest.TestCase):
+    """A Qwen3.8-Flash-Next pack without expert_counts.txt gets the shipped routing profile (STRATA_GLM_PRIOR)."""
+
+    def test_match(self):
+        import tempfile
+        from serve.server import child_env, shipped_prior
+        with tempfile.TemporaryDirectory() as d:
+            pack = Path(d)
+            (pack / "index.txt").write_text("# strata pack index v3\nblk.0.hc_attn_down.weight 0\noutput_hc_down.weight 0\n")
+            (pack / "native_experts.txt").write_text("# strata native experts v3: ... (n_expert 512, total 1)\n")
+            cfg = {"args": ["--glm-pack", str(pack)]}
+            prior = shipped_prior(cfg)
+            self.assertTrue(prior.endswith("data/expert_counts/qwen38-flash-next.txt"), prior)
+            self.assertTrue(Path(prior).exists())
+            self.assertEqual(child_env(cfg)["STRATA_GLM_PRIOR"], prior)
+            self.assertEqual(child_env({**cfg, "env": {"STRATA_GLM_PRIOR": "/x"}})["STRATA_GLM_PRIOR"], "/x")
+            (pack / "expert_counts.txt").write_text("0 1 2\n")      # the pack's own profile wins
+            self.assertEqual(shipped_prior(cfg), "")
+            (pack / "expert_counts.txt").unlink()
+            (pack / "index.txt").write_text("blk.0.attn_q.weight 0\n")   # another model: none
+            self.assertEqual(shipped_prior(cfg), "")
+        self.assertEqual(shipped_prior({"args": ["--model", "x.gguf"]}), "")
+
+
 class GpuChoice(unittest.TestCase):
     """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 

@@ -655,6 +655,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_V41_ENG_GEMM` | on | V4.1 の prompt：Engram の engram_kv を 256 トークンごとに 1 回の FP16 行列計算に（v1.3.60。トークンごとの GEMV は約 160 MB の重みを毎トークン読み直していた。32K の prompt で 20 → 3.9 秒）。`0`：1 トークンずつ |
 | `STRATA_GLM_V41_CAND_ROW` | off | `1`：V4.1 の prompt の候補ブロック（indexer で見える行が 16K を超える行）を 1 行ずつに戻す。off：行のまとまりごとに 1 回の呼び出し（v1.3.63）。HIP の gfx11 / gfx12 では V4.1 の 32 ヘッドの indexer も WMMA で計算する（`STRATA_DS4_IDX=1` で戻す。40K の prompt で GPU 時間 3.4 → 1.9 秒）。両方で AI PRO R9700 の Maya-XS の 32K / 60K の prompt が 1,093 / 1,028 → 1,119 / 1,214 tok/s（UD-IQ2_XXS の 60K は SSD が上限で変わらず） |
 | `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | 起動をまたいで残すエキスパートの使用記録。`0` で無効 |
+| `STRATA_GLM_PRIOR` | サーバが設定 | パックに無いときに使うルーティングの統計（`expert_counts.txt` の形式、`tools/glm_expert_prior.py`）。起動時はこの順にエキスパートを置き、層ごとの VRAM の割り当てもこれに従う。Abyss が統計を同梱しているモデル（Qwen3.8-Flash-Next、量子化は問わない）では、サーバが `data/expert_counts/` を指す（v1.3.86。RTX 5090、ISTA IQ3_S、上の入れ替え規則と合わせて `--bench` 87.6 → 116 tok/s） |
 | `STRATA_GLM_NO_REUSE` | オフ | `1`: 会話を再利用しない |
 | `STRATA_GLM_THINK_RESERVE` | 1024 | （サーバー）思考が回答のために必ず残すトークン数 |
 | `STRATA_ENGINE_STALL_S` | 90 | （サーバー）この秒数、何も言わず CPU・ディスク・GPU も使わないエンジンは止めて、次のリクエストで起動し直す。`0` で無効 |
@@ -680,7 +681,7 @@ v1.3.71 から、動かしながらモデルの拒否の方向を取り除けま
 | `STRATA_GLM_HC_CPU` | on（HIP）、off（NVIDIA） | deepseek4: MoE の層のうち CPU / iGPU レーンが計算した分を、専用の待ちカーネルではなく次の層の attention 側の mHC 読み出し（hc3）の中で足す（1 層あたり起動が 1 回減り、答えは hc3 の 32 ブロックで読む。v1.3.42）。ビット一致。`0` で待ちカーネル、NVIDIA でも `1` で有効（未測定） |
 | `STRATA_GLM_WAIT_FETCH` | on（HIP）、off（NVIDIA） | MoE の層のディスク読み込みの待ちと、RAM 層の expert のコピーを 2 回ではなく 1 回の起動で行う（v1.3.42。処理は同じ）。`0` で 2 回の起動 |
 | `STRATA_HIP_EXPERTS_LEGACY` | off | `1`: decode の expert を RDNA 版ではなく元のカーネルで計算する（gfx1100、v1.3.40 から gfx1201 も: AI PRO R9700 で gate/up と down が約 2 割速い。gfx1151 は IQ3_XXS の down 以外）。どちらでもビット一致 |
-| `STRATA_GLM_PROMOTE_RATIO` / `_MARGIN` | 4 / 16 | RAM 層のエキスパートの使用回数が「VRAM 側の ratio 倍 + margin」を超えたら入れ替える（2 / 4 は以前の、入れ替えの多い規則） |
+| `STRATA_GLM_PROMOTE_RATIO` / `_MARGIN` | 4 / 16（Qwen3.8: 2 / 8） | RAM 層のエキスパートの使用回数が「VRAM 側の ratio 倍 + margin」を超えたら入れ替える（2 / 4 は以前の、入れ替えの多い規則）。Qwen3.8-Flash-Next は早めに入れ替え、1 回のトークン境界で最大 16 個動かす（`STRATA_GLM_PROMOTE`、他は 8）。エキスパートが約 2 MB で、1 個のコピーが約 0.3 ms のため（v1.3.86。RTX 5090、ISTA IQ3_S: VRAM ヒット 60〜77% → 68〜89%、+12〜15%） |
 | `STRATA_GLM_BG_PACE_KB` | 1024 | tier の入れ替えのコピー（prompt の後の補充、入れ替え）を、token の境目でまとめて出さず、MoE 層ごとに最大この KB ずつ、次の層の mixer の間に流す（v1.3.28）。まとめて出すと、次の token の host-mapped の読みがコピーの終わりまで待たされていた（8K prompt の後、約 10 token が 35〜39 ms）。`0`: 従来どおり境目で |
 | `STRATA_GLM_ZERO_COPY` | オン | copy engine を使わない token の境目（v1.3.21）: 表の更新・埋め込み行（`token_embd` の pinned コピー、Q8_0 / Q5_K）・トークンを、カーネルが host-mapped で直接読み書きする。`0`: 従来どおり memcpy |
 | `STRATA_GLM_GAP_PROF` | オフ | `1`: 答えごとに `glm gap prof` の行を出す。トークンとトークンの間の時間の内訳（host 側のラップと、timing event で測った GPU の空き） |

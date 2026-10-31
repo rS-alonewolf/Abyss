@@ -1150,6 +1150,34 @@ def model_label(model_dir) -> tuple[str | None, str | None]:
     return stem, (q[-1] if q else None)
 
 
+# Routing profiles Abyss ships (data/expert_counts/<name>.txt, tools/glm_expert_prior.py's expert_counts.txt over a
+# broad prompt set): the engine warms its tiers in that order and sizes each layer's VRAM share from it when the pack
+# has no expert_counts.txt of its own.  A pack is matched by its tensors (the model's own, whatever the quant).
+# Qwen3.8-Flash-Next: 36 prompts (prose, code, math, Japanese), 8.2M routes; RTX 5090 + Gen4 x4, ISTA IQ3_S, 4 greedy
+# answers: VRAM hits 60-77% -> 79-91%, drafter-on 88 -> 115 tok/s, token by token 79 -> 94
+SHIPPED_PRIORS = (("qwen38-flash-next", ("blk.0.hc_attn_down.weight", "output_hc_down.weight"), 512),)
+
+
+def shipped_prior(cfg: dict) -> str:
+    """The shipped routing profile for the config's --glm-pack ("" when the pack has its own or none matches)."""
+    args = cfg.get("args") or []
+    if "--glm-pack" not in args[:-1]:
+        return ""
+    pack = Path(args[args.index("--glm-pack") + 1])
+    if (pack / "expert_counts.txt").exists():
+        return ""
+    try:
+        names = {l.split(" ", 1)[0] for l in (pack / "index.txt").read_text(errors="replace").splitlines()}
+        head = (pack / "native_experts.txt").read_text(errors="replace").split("\n", 1)[0]
+    except OSError:
+        return ""
+    for name, tensors, n_expert in SHIPPED_PRIORS:
+        f = Path(__file__).resolve().parents[1] / "data" / "expert_counts" / f"{name}.txt"
+        if all(t in names for t in tensors) and f"n_expert {n_expert}" in head and f.exists():
+            return str(f)
+    return ""
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -1171,6 +1199,9 @@ def child_env(cfg: dict) -> dict:
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
+    prior = shipped_prior(cfg)
+    if prior and "STRATA_GLM_PRIOR" not in env:
+        env["STRATA_GLM_PRIOR"] = prior
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
