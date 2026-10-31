@@ -1577,6 +1577,7 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
             if (!gf::mvn(j, 2, T, s)) { err = "qwen4exp verify: the PLE key / value"; return false; }
             k::native_ple_postops_batch(V->q4_key, V->R, V->q4_val, F->ple_hist, F->ple_w, V->q4_qn, V->q4_gated, V->q4_g4,
                                         T, (void*) s);
+            abl_res(V->R, T * g.hc, (int) E, s);   // (the PLE's rows are a residual write too)
             if (prof) F->mark("q4w_ple");
         }
         if (!q4x_mix_cols(V->R, T, Ly.hc4[0].norm, Ly.hc4[0].down, Ly.hc4[0].up, &Ly.hc4[0].inject, prev_out,

@@ -896,12 +896,14 @@ bool Glm5Model::fast_q4x_layers(int64_t p, std::string& err) {
                                       F->q4_xn, s);
             combined = true;
             if (!q4x_ple_apply(err)) return false;
+            abl_res(state_, g.hc, g.n_embd, s);   // (the PLE's rows are a residual write too, as V4.1's Engram)
             if (F->prof_on) F->mark("q4x_ple");
             if (dumps) q35_dump(s, "ple_out", il, state_, (int64_t) g.hc * g.n_embd);
         }
         if (!q4x_mix(Ly.hc4[0].norm, Ly.hc4[0].down, Ly.hc4[0].up, &Ly.hc4[0].inject, combined ? nullptr : F->ffn,
                      F->q4_inj[1], F->q4_inj[0], F->x, F->xq, err))
             return false;
+        abl_cap(il, state_, g.hc, s);   // (--abl-build: the residual entering the layer, the last FFN combined)
         if (F->prof_on) F->mark("q4x_hc");
         if (dumps) {
             q35_dump(s, "hc_norm", il, F->q4_xn, (int64_t) g.hc * g.n_embd);
@@ -935,6 +937,7 @@ bool Glm5Model::fast_q4x_layers(int64_t p, std::string& err) {
     if (!q4x_mix(F->q4_head[0], F->q4_head_w[0], F->q4_head_w[1], nullptr, F->ffn, F->q4_inj[1], nullptr, F->head_x,
                  F->head_xq, err))
         return false;
+    if (l1_ == g.n_layers) abl_cap(g.n_layers, state_, g.hc, s);
     if (F->prof_on) F->mark("q35_head");
     if (dumps) {
         q35_dump(s, "l_last", l1_ - 1, state_, (int64_t) g.hc * g.n_embd);

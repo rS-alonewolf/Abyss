@@ -24,15 +24,15 @@ The edit removes refusals. It adds no knowledge, and what the model then writes 
 
 | way | size | models | switch per request | quality cost |
 | --- | --- | --- | :---: | --- |
-| **`--uncensor <file>`, a file made by `--abl-build`** (recommended) | 16-82 KB | every `--glm-pack` model: DeepSeek V4 / V4.1, GLM-5.3-Flash, qwen35moe (Ornith, Qwen3.5) | yes | text KL 0.013-0.053 |
+| **`--uncensor <file>`, a file made by `--abl-build`** (recommended) | 16-82 KB | every `--glm-pack` model: DeepSeek V4 / V4.1, GLM-5.3-Flash, qwen35moe (Ornith, Qwen3.5), Qwen3.8-Flash-Next (qwen4exp) | yes | text KL 0.013-0.053 |
 | `--uncensor` with an abliteration's own edit (mrfakename's V4.1 `abliteration-edit.npz`, ABL1) | 43 KB | V4.1 | yes | KL +0.002 on UD-IQ1_S |
 | an overlay shard (`tools/dense_overlay.py --abl`) | 1.4 GB | V4.1 | no | KL +0.0006 (the tensors are rounded again) |
 | an abliterated GGUF (huihui-ai's V4 0731 Q2, orcarouter's V4.1 Mix-256G, orcarouter's Qwen3.8-Flash-Next-Uncensored) | the whole model | that model | no | V4.1 Mix-256G: text KL 0.083 |
 
 The run-time edit needs no second copy of the model, keeps the ordinary model one request away, and on V4.1 costs a
-third of the abliterated GGUF's KL. Qwen3.8-Flash-Next (qwen4exp) runs on the fast path from v1.3.74
-([docs/qwen38](qwen38/README.md)), but no edit file has been built or measured for it; use orcarouter's Uncensored
-GGUF for it.
+third of the abliterated GGUF's KL. Qwen3.8-Flash-Next (qwen4exp, the fast path of
+[docs/qwen38](qwen38/README.md)) takes `--abl-build` and `--uncensor` too (Unreleased; before it `--abl-build`
+measured nothing on that path and the PLE rows were not edited).
 
 ## How it works
 
@@ -49,7 +49,7 @@ at these sites:
 - the token embedding,
 - each layer's attention output,
 - each layer's whole FFN output: routed experts + shared expert + the CPU lane's part,
-- V4.1's Engram adds.
+- V4.1's Engram adds, Qwen3.8's per-layer embedding (PLE) rows.
 
 The routed experts on the SSD are not touched, so the edit costs no disk space and no second rounding. It runs on
 the token path, the prompt path and the speculative verify windows. A GPU flag switches it, so it works inside the
@@ -188,6 +188,10 @@ from the answer's opening.
 | DeepSeek V4 Flash 0731, UD-Q2_K_XL attn-q5k | 85% -> 6% | 11% -> 3% | 0.013 | layer 29, strength 1.3 | 16 KB |
 | GLM-5.3-Flash, Maya-S-v2-IQ2_XXS | 88% -> 8% | 11% -> 3% | 0.053 | layers 31+28+34, strength 1.0 | 50 KB |
 
+Qwen3.8-Flash-Next, ISTA-DASLab GSQ-RCO IQ3_S (RTX 5090): the build chose layers 39+43+36, rank 3, strength 1.0
+(31 KB, `--abl-gen 32 --abl-range 0.3,0.9 --abl-candidates 9 --abl-max-kl 1.0`, 5 minutes); a refusal word in the first
+32 tokens of 23 of 24 harmful check answers without it, 3 with it.
+
 On V4.1, harmful answers: 3.0% refused, 22.7% a short caveat followed by the answer, 74.2% answered. On V4: 6.1% /
 28.8% / 65.2%.
 
@@ -200,8 +204,7 @@ For comparison, orcarouter's abliterated V4.1 Mix-256G (new weights) has a text 
 - **Two speed features stay off while a file is loaded**: the hc3 fusion of the CPU lane's answer and
   `STRATA_GLM_DEFER` (the FFN output must be complete when it is edited). With the file switched off they stay off too.
 - **One file per model.** Another quant of the same model has not been measured with these files; check the KL.
-- **`--glm-pack` models only.** Not on the older engine path (the Maya-era packs, Qwen3.8-Flash-Next's older pack);
-  Qwen3.8 on the fast path has no edit file yet.
+- **`--glm-pack` models only.** Not on the older engine path (the Maya-era packs, Qwen3.8-Flash-Next's older pack).
 
 ## Older ways
 

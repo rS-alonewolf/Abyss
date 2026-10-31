@@ -27,7 +27,7 @@
 
 | 方法 | 大きさ | モデル | リクエストごとの入り切り | 品質の損失 |
 | --- | --- | --- | :---: | --- |
-| **`--uncensor <file>`、`--abl-build` で作ったファイル**（おすすめ） | 16〜82 KB | `--glm-pack` で動くモデルすべて: DeepSeek V4 / V4.1、GLM-5.3-Flash、qwen35moe（Ornith、Qwen3.5） | できる | 文章の KL 0.013〜0.053 |
+| **`--uncensor <file>`、`--abl-build` で作ったファイル**（おすすめ） | 16〜82 KB | `--glm-pack` で動くモデルすべて: DeepSeek V4 / V4.1、GLM-5.3-Flash、qwen35moe（Ornith、Qwen3.5）、Qwen3.8-Flash-Next（qwen4exp） | できる | 文章の KL 0.013〜0.053 |
 | `--uncensor` に abliteration 自身の編集（mrfakename の V4.1 `abliteration-edit.npz`、ABL1） | 43 KB | V4.1 | できる | UD-IQ1_S で KL +0.002 |
 | オーバーレイの shard（`tools/dense_overlay.py --abl`） | 1.4 GB | V4.1 | できない | KL +0.0006（テンソルをもう一度丸める） |
 | abliterated の GGUF（huihui-ai の V4 0731 Q2、orcarouter の V4.1 Mix-256G、orcarouter の Qwen3.8-Flash-Next-Uncensored） | モデル 1 本分 | そのモデル | できない | V4.1 Mix-256G: 文章の KL 0.083 |
@@ -37,8 +37,8 @@
 - 元のモデルにはリクエスト 1 つで戻せます。
 - V4.1 では、KL が abliterated の GGUF の 3 分の 1 以下です。
 
-Qwen3.8-Flash-Next（qwen4exp）は v1.3.74 から速い経路で動きます（[docs/qwen38](qwen38/README.ja.md)）が、このモデル用の
-編集ファイルはまだ作っても測ってもいません。Qwen3.8 では orcarouter の Uncensored の GGUF を使ってください。
+Qwen3.8-Flash-Next（qwen4exp、[docs/qwen38](qwen38/README.ja.md) の速い経路）でも `--abl-build` と `--uncensor` が使えます
+（未リリース。それまでは、この経路では `--abl-build` が何も測れず、PLE の行も編集されませんでした）。
 
 ## 仕組み
 
@@ -55,7 +55,7 @@ w  <-  w - s · Q (Qᵀ w)        Q: n_embd × rank の正規直交、s: 強さ
 - トークンの埋め込み
 - 各層の attention の出力
 - 各層の FFN の出力全体（ルーティングされたエキスパート + 共有エキスパート + CPU レーンの分）
-- V4.1 の Engram の加算
+- V4.1 の Engram の加算、Qwen3.8 の層ごとの埋め込み（PLE）の行
 
 SSD 上のルーティングされるエキスパートには触らないので、ディスクも余分な丸めも増えません。トークン経路、プロンプト経路、投機デコードの
 検証窓のすべてで効きます。入り切りは GPU 上のフラグで行うので、CUDA / HIP のグラフの中でも動き、リクエストごとに切れます。
@@ -202,6 +202,10 @@ AI PRO R9700 で測りました。
 | DeepSeek V4 Flash 0731、UD-Q2_K_XL attn-q5k | 85% → 6% | 11% → 3% | 0.013 | 29 層、強さ 1.3 | 16 KB |
 | GLM-5.3-Flash、Maya-S-v2-IQ2_XXS | 88% → 8% | 11% → 3% | 0.053 | 31+28+34 層、強さ 1.0 | 50 KB |
 
+Qwen3.8-Flash-Next、ISTA-DASLab GSQ-RCO IQ3_S（RTX 5090）: 作成は 39+43+36 層、rank 3、強さ 1.0 を選びました（31 KB、
+`--abl-gen 32 --abl-range 0.3,0.9 --abl-candidates 9 --abl-max-kl 1.0`、5 分）。有害な確認用の 24 問のうち、最初の 32 トークンに
+拒否の言葉が出た答えは、編集なしで 23 問、ありで 3 問です。
+
 有害な質問への答えの内訳（オン）:
 
 | モデル | 拒否 | 短い注意書きのあとに答える | そのまま答える |
@@ -218,7 +222,6 @@ AI PRO R9700 で測りました。
   出力がそろってから編集するため）。ファイルをオフにしていても止まったままです。
 - **ファイルはモデルごとに 1 本です。** 同じモデルの別の量子化では、これらのファイルを測っていません。KL を確かめてください。
 - **`--glm-pack` のモデルだけです。** 古いエンジン経路（Maya 時代の pack、Qwen3.8-Flash-Next の古い pack）では使えません。
-  速い経路の Qwen3.8 には、まだ編集ファイルがありません。
 
 ## 以前からある方法
 

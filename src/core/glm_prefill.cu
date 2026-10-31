@@ -2149,6 +2149,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             k::native_ple_postops_batch(Q.key, S->R + (size_t) t0 * HE, Q.val, F->ple_hist, F->ple_w, Q.qn, Q.gated,
                                         Q.gate4, tn, (void*) s);
         }
+        abl_res(S->R, T * g.hc, E, s);   // (the PLE's rows are a residual write too, as V4.1's Engram)
         S->mark("q4_ple", s);
         return true;
     };
