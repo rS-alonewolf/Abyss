@@ -7,7 +7,7 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
-## Unreleased
+## v1.3.85 - 2026-10-31
 
 - `tools/abl_prompts.py --cyber N` and `--extra-harmful FILE [--extra-n N]`: force malware / hacking prompts, or your
   own (one a line, `#` comments, JSON lines with a `"prompt"`), into the build's harmful side, for a kind of request
