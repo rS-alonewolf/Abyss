@@ -2507,6 +2507,15 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
 
 # ------------------------------------------------------------------------------------------------ the benchmark
 # the same three questions on every machine (greedy, thinking off), after one warm-up answer, so speeds compare
+def first_difference(a: list, b: list) -> int | None:
+    """The first position where two token lists part (the shorter one's length when one is the other's start), None
+    when they are the same - the --bench drafter check (a greedy answer with and without speculative decoding)."""
+    return next((i for i in range(min(len(a), len(b))) if a[i] != b[i]), None if len(a) == len(b) else min(len(a), len(b)))
+
+
+SPEC_EARLY = 12   # the drafter check: parting before this many tokens is a bug (late parts: near-ties)
+
+
 BENCH_TOPICS = [
     "Write a Python function that parses a CSV file into a list of dictionaries, with type hints and a docstring.",
     "Explain how photosynthesis works, step by step, for a high-school student.",
@@ -2872,13 +2881,18 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
                              stdout=subprocess.PIPE, stderr=log, text=True, env=env,
                              cwd=cfg.get("cwd") or str(ROOT), bufsize=1)
 
+        last_toks = []                                      # the last answer's tokens (gen)
+
         def gen(ids, n_new, keys=""):
             p.stdin.write(f"GEN {n_new} temperature=0 {keys}" + ",".join(map(str, ids)) + "\n")
             p.stdin.flush()
+            last_toks.clear()
             while True:
                 line = p.stdout.readline()
                 if not line:
                     fail("the engine stopped during the benchmark", f"its log: {log_path}")
+                if line.startswith("T "):
+                    last_toks.append(line.split()[1])
                 if line.startswith("DONE") or line.startswith("ERR"):
                     return line.split()
 
@@ -2892,12 +2906,28 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
         watch = bench_links(cfg, SV)
         gen(chat("Say hello in five languages."), 64)          # warm-up: the first answer after a start is slower
         results = []
+        first = None                                        # the first answer's tokens (the drafter check below)
         for q in BENCH_TOPICS * (3 if full else 1):
             f = gen(chat(q), 256)
+            if first is None:
+                first = list(last_toks)
             if f[0] == "DONE" and float(f[4]) > 0:
                 results.append(("decode", q, int(f[1]) / float(f[4]) * 1000.0))
                 say(f"  decode  {results[-1][2]:6.1f} tokens/s   {q[:60]}")
         n_dec = len(results)
+        # the drafter check: the first answer again token by token (GEN spec=0).  A draft decides how many tokens a
+        # verify window checks, never which come, but a window sums in another order than the token path, so a
+        # near-tie can still part the two late in an answer; parting within the first SPEC_EARLY tokens means the
+        # drafter or the window computes something wrong (2026-10-31: qwen4exp's windows on CUDA lost their experts'
+        # weights - the answers parted at tokens 2-29, then looped and lost facts)
+        f = gen(chat(BENCH_TOPICS[0]), 256, "spec=0 ")
+        spec_diff = None if f[0] != "DONE" or first is None else first_difference(first, last_toks)
+        spec_bad = spec_diff is not None and spec_diff < SPEC_EARLY
+        spec_txt = ("not checked" if f[0] != "DONE" or first is None else
+                    f"same {len(first)} tokens with and without speculative decoding" if spec_diff is None else
+                    f"the same first {spec_diff} of {len(first)} tokens with and without speculative decoding" +
+                    (" - TOO EARLY" if spec_bad else " (a late near-tie: fine)"))
+        say(f"  drafter check: {spec_txt}")
         if lens:                                            # warm-up: the first prompt after a start is slower
             gen(doc[-lens[0]:], 1)                          # (cold caches, issue #8); its opening is not reused below
         for i, n in enumerate(lens):
@@ -2985,7 +3015,10 @@ def bench(cfg_path: Path, version: str, deep: bool = False, full: bool = False) 
             now = _mean(r["ms"] for r in dec_recs)
             now = 1000.0 / now if now > 0 else _mean(dec)
         lines += sweep_report(shares, own, own_disk, plan_share(log_lines), now, lane_name, how)
-    lines += ["", f"quality: {q_txt}"]
+    lines += ["", f"quality: {q_txt}", f"drafter check (greedy, the first answer): {spec_txt}"]
+    if spec_bad:
+        lines.append("  a greedy answer must not change with the drafter: the drafter or the verify window computes "
+                     "something the token path does not - please report it")
     if quality and quality.get("lossy_off"):
         lines.append(f"  (scored without this setup's {', '.join(quality['lossy_off'])}: they change the numbers on "
                      "purpose)")

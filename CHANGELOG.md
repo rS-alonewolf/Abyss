@@ -7,6 +7,27 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.83 - 2026-10-31
+
+Speculative decoding on CUDA gave wrong answers since v1.3.74. Fixed. With Qwen3.8-Flash-Next's MTP drafter on an RTX
+5090 (ISTA IQ3_S), 120 capability items + 30 everyday tasks, greedy: **math 3/50 -> 43/50** (drafter off: 43/50),
+code 30/30, looping answers 2 of 130 (off: 3), **100.4 tok/s against 72.0 with the drafter off**.
+
+- **The route kernel wrote past a plan array and zeroed the verify window's expert weights.** v1.3.74 let it clear up
+  to 16 entries of `fetch_src`, which holds max(8, k); in a window column's block `plan_w` comes right after it, so
+  every window column on CUDA ran without its routed experts (only the shared expert and the CPU lane's share). The
+  token path's padding hid it there. This hit every model's windows: the Qwen3.8 MTP drafter, DeepSeek V4.1 with
+  DSpark (its answers parted from the no-draft ones at token 2-6, now at 16 or later or not at all), and the n-gram
+  windows. Not checked on HIP (no AMD card in the PC right now).
+- **Qwen3.8's batched windows: one scratch slot set a column** (up to 6 columns, as V4.1's). Columns 3-5 shared a
+  set, so a fetch for one could overwrite another's experts before the batched launch read them. Any model's batched
+  launch now needs every column in its own set.
+- **Qwen3.8 past 2,051 cells: a rejected window column no longer leaves the attention indexer's key tail changed**
+  (the tail is put back and the kept columns' keys added again).
+- `./abyss.sh --bench` has a **drafter check**: the first answer again token by token, and where it parts
+  ([docs/BENCH.md](docs/BENCH.md#the-drafter-check)). Over the `--serve` wire, `GEN ... spec=0` asks one answer
+  without speculative decoding; `tools/mtp_greedy_check.py` compares many.
+
 ## v1.3.82 - 2026-10-31
 
 Small VRAM (issue #23: an RTX A2000 Laptop 8 GB + 64 GB RAM, PCIe Gen4 x8), and CUDA's VRAM reserve on big cards.

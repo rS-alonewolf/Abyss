@@ -2893,7 +2893,10 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             a.d.fetch_src[i] = src;
             a.d.plan_w[i] = w;
             a.d.plan_id[i] = s_ids[i];
-        } else if (i < kMaxK) {
+        } else if (i < 8) {
+            // (the unused slots up to 8: fetch_src holds max(8, k) entries - k_slots - and a window column's plan_w
+            // follows it directly in verify_alloc's block, so a store past it zeroed that column's weights: 2026-10-31,
+            // qwen4exp's k = 10 wrote [10, 16) over the window's plan_w and every verify window lost its experts)
             a.d.fetch_src[i] = 0ull;
         }
         const unsigned int skip = (unsigned int) __ballot_sync(0xffffffffu, b_skip);

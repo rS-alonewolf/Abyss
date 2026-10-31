@@ -146,6 +146,12 @@ class BenchTests(unittest.TestCase):
             self.assertTrue(v is None or v > 0)
             self.assertIsNone(A.disk_read_gbs([Path(t) / "missing.gguf"]))
 
+    def test_drafter_check_finds_the_first_difference(self):   # (greedy with and without speculative decoding)
+        self.assertIsNone(A.first_difference(["1", "2", "3"], ["1", "2", "3"]))
+        self.assertEqual(A.first_difference(["1", "2", "3"], ["1", "5", "3"]), 1)
+        self.assertEqual(A.first_difference(["1", "2"], ["1", "2", "3"]), 2)
+        self.assertIsNone(A.first_difference([], []))
+
     def test_quality_without_a_reference_is_none(self):
         with tempfile.TemporaryDirectory() as t:
             d = Path(t)

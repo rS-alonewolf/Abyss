@@ -1493,6 +1493,9 @@ static int glm_pack_generate(const Options& o) {
     // in the same decode
     int64_t req_think_budget = 0;
     int32_t req_think_end = -1;
+    // GEN key spec=0: this request token by token - no drafter, no verify windows (--bench compares a greedy answer
+    // with and without them: greedy speculation must give the same tokens)
+    bool req_spec = true;
     uint64_t snap_img_hash = 1469598103934665603ull;
     const auto img_hash = [&](size_t len) {
         uint64_t h = 1469598103934665603ull;   // FNV-1a over the positions and rows inside [0, len)
@@ -2009,7 +2012,7 @@ static int glm_pack_generate(const Options& o) {
             }
             return produced < max_new;
         };
-        if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
+        if (std::strcmp(finish, "cancel") != 0 && req_spec && model.fast() && model.spec_ready()) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
             // running the NextN block's draft (same tokens as the loop below)
             int64_t n_spec = 0;
@@ -2017,7 +2020,7 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
-        } else if (spec_k > 0 && (model.dspark_ready() || spec_adapt) && model.fast() && model.verify_ready()) {
+        } else if (req_spec && spec_k > 0 && (model.dspark_ready() || spec_adapt) && model.fast() && model.verify_ready()) {
             // DSpark's speculative decode (STRATA_DS4_DSPARK=<the drafter GGUF>): after each token the drafter
             // proposes the next 5 with a confidence each; the leading ones at or above STRATA_DS4_DSPARK_THR (default
             // 0.6; ds4's 0.7: swe-bench 61.3 against 61.9 tok/s, 0.8 59.8) go through a verify window behind the token, compared and kept as the n-gram decode's below
@@ -2327,7 +2330,7 @@ static int glm_pack_generate(const Options& o) {
                              cw_n[6], cal_h[0] / cal_n[0], cal_h[1] / cal_n[1], cal_h[2] / cal_n[2],
                              cal_h[3] / cal_n[3], cal_h[4] / cal_n[4], cal_h[5] / cal_n[5], cal_h[6] / cal_n[6],
                              cal_h[7] / cal_n[7]);
-        } else if (spec_k > 0 && model.fast() && model.verify_ready()) {
+        } else if (req_spec && spec_k > 0 && model.fast() && model.verify_ready()) {
             // deepseek4's n-gram speculative decode (STRATA_DS4_SPEC=<k>): after each token, the latest earlier
             // occurrence of the last spec_min tokens in the prompt + the answer so far proposes the next k; the token
             // and its proposal go through one verify window, and each column's sample is compared with the proposal -
@@ -2769,6 +2772,7 @@ static int glm_pack_generate(const Options& o) {
             bool any_key = false, greedy_req = false;
             req_think_budget = 0;
             req_think_end = -1;
+            req_spec = true;
             abl_req = abl_def;        // abl=0|1: the refusal-direction edit for this request (as the engine started)
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
             int req_threads = 0;
@@ -2795,6 +2799,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "pcie_frac") { req_pcie = std::atof(v.c_str()); }
                 else if (k == "cpu_threads") { req_threads = std::atoi(v.c_str()); }
                 else if (k == "abl") { abl_req = abl_def && std::atoi(v.c_str()) != 0; }
+                else if (k == "spec") { req_spec = std::atoi(v.c_str()) != 0; }
                 // penalty_* need machinery this mode does not have (history rows): ignored rather than approximated
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path

@@ -272,7 +272,7 @@ class HipSetupTests(unittest.TestCase):
 
     def run_bench(self, path):
         proc = MagicMock()
-        proc.stdout.readline.side_effect = ["READY\n"] + ["DONE 256 0 1000 2000\n"] * 7
+        proc.stdout.readline.side_effect = ["READY\n"] + ["DONE 256 0 1000 2000\n"] * 8   # (+1: the drafter check)
         tok = MagicMock()
         tok.encode.return_value = list(range(9000))
         # Exercise the real server's engine_args/child_env without optional tokenizer/template packages.

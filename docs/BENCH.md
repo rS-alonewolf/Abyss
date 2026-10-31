@@ -143,6 +143,18 @@ more experts to the CPU lane, which rounds differently (issue #15; here, GLM-5.3
 - References ship for: Ornith-1.5-122B UD-Q4_K_XL, DeepSeek V4.1 Flash 1017 UD-IQ2_XXS, DeepSeek V4 Flash 0731
   UD-Q2_K_XL, GLM-5.3-Flash Maya-S-v2 IQ2_XXS.
 
+### The drafter check
+
+```
+drafter check (greedy, the first answer): the same first 140 of 256 tokens with and without speculative decoding (a late near-tie: fine)
+```
+
+The first answer is asked again token by token (no drafts, no verify windows). A draft only decides how many tokens a
+window checks, never which come, so the two answers should agree. A window adds its sums in another order than the
+token path, so a near-tie can still part them later in the answer; parting within the first 12 tokens (**TOO EARLY**)
+means the drafter or the window computes something wrong - please report it (v1.3.83 fixed one such bug: on CUDA the
+verify windows lost their experts' weights).
+
 ## Platforms
 
 | | Linux, AMD | Linux, NVIDIA | Windows, NVIDIA | Windows, AMD |

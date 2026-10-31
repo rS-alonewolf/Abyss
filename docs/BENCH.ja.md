@@ -114,6 +114,14 @@ quality: OK (KL 0.0078 vs a known-good run, same top token 98.2%)
 - わざと数値を変える設定（`STRATA_GLM_TAIL_SKIP*`、`STRATA_GLM_ABL`、`STRATA_GLM_DEFER`）は、採点のときだけ外し、結果にそう書きます。
 - 参照データがあるモデル：Ornith-1.5-122B UD-Q4_K_XL、DeepSeek V4.1 Flash 1017 UD-IQ2_XXS、DeepSeek V4 Flash 0731 UD-Q2_K_XL、GLM-5.3-Flash Maya-S-v2 IQ2_XXS
 
+### ドラフターチェック
+
+```
+drafter check (greedy, the first answer): the same first 140 of 256 tokens with and without speculative decoding (a late near-tie: fine)
+```
+
+最初の答えを、もう一度 1 トークンずつ（ドラフトも検証窓も使わずに）出させて比べます。ドラフトが決めるのは「窓で何トークンをまとめて確かめるか」だけで、次に来るトークンは変えません。なので、2 つの答えは本来一致します。ただ、窓はトークン経路と足し算の順序が違うため、僅差の候補がある箇所では、答えの後半で分かれることがあります。これは正常です。最初の 12 トークン以内で分かれたとき（**TOO EARLY**）は、ドラフターか検証窓の計算がおかしいので、報告してください。v1.3.83 では、CUDA の検証窓でエキスパートの重みが消える不具合を、このようにして見つけて直しました。
+
 ## 対応環境
 
 | | Linux・AMD | Linux・NVIDIA | Windows・NVIDIA | Windows・AMD |

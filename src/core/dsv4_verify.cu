@@ -158,6 +158,11 @@ struct VerifyBuf {
     float *q4_emb = nullptr, *q4_key = nullptr, *q4_val = nullptr, *q4_qn = nullptr, *q4_gated = nullptr,
           *q4_g4 = nullptr, *q4_ple_snap = nullptr, *q4_iraw = nullptr, *q4_iq = nullptr;
     int32_t *q4_steps = nullptr, *q4_steps_h = nullptr;
+    // ... and a QSA layer each: its raw-key tail before the window and the columns' raw keys (a rejected column past a
+    // block's end overwrote tail slots the block's kept cells still need: the rewind puts the tail back and appends
+    // the kept columns' keys again)
+    int q4_nattn = 0;
+    float *q4_tsnap = nullptr, *q4_rawk = nullptr;
     bool q4_ple_on = false;                   // the last window ran the PLE (its rows and snapshot are valid)
 };
 }  // namespace
@@ -254,6 +259,13 @@ bool Glm5Model::verify_alloc(std::string& err) {
         ok = ok && cudaMalloc((void**) &V->q4_ple_snap, (size_t) strata::kernels::NG_HIST * HE * sizeof(float)) == cudaSuccess &&
              cudaMalloc((void**) &V->q4_steps, (size_t) TM * (4 + IH) * sizeof(int32_t)) == cudaSuccess &&
              cudaHostAlloc((void**) &V->q4_steps_h, (size_t) TM * (4 + IH) * sizeof(int32_t), cudaHostAllocDefault) == cudaSuccess;
+        int na = 0;
+        for (int il = l0_; il < l1_; ++il) na += fast_->L[(size_t) il].q4_tail != nullptr ? 1 : 0;
+        V->q4_nattn = na;
+        const size_t tail_rows = (size_t) strata::kernels::qsa_real_shapes().idx_block - 1;
+        if (na > 0)
+            ok = ok && cudaMalloc((void**) &V->q4_tsnap, (size_t) na * tail_rows * ID * sizeof(float)) == cudaSuccess &&
+                 cudaMalloc((void**) &V->q4_rawk, (size_t) na * TM * ID * sizeof(float)) == cudaSuccess;
     }
     if (ok && g.v41) {
         const size_t ctx = (size_t) std::max<int64_t>(max_ctx_, 1);
@@ -310,7 +322,8 @@ bool Glm5Model::verify_alloc(std::string& err) {
     for (int il = l0_; il < l1_; ++il) blob_max = std::max(blob_max, fast_->L[(size_t) il].blob);
     const size_t sstride = (blob_max + 255u) & ~(size_t) 255u;
     // (sets for up to 4 groups: the 8-column window keeps 4 columns' worth, 192 MB a 8 MB blob)
-    const int NS = std::min(TM - 1, g.v41 ? (int) VerifyBuf::kScrSets : 3);
+    // (deepseek41, qwen35moe / qwen4exp: their windows are batched only - a set a column, up to kScrSets + 1 columns)
+    const int NS = std::min(TM - 1, g.v41 || g.qwen35() ? (int) VerifyBuf::kScrSets : 3);
     V->scr_set[0] = fast_->md.scratch;
     if (ok && sstride > 0 && cudaMalloc(&V->scr, (size_t) NS * KS * sstride) == cudaSuccess) {
         for (int k = 1; k <= NS && ok; ++k) {
@@ -696,7 +709,10 @@ bool Glm5Model::verify_moe(int il, int tb, int T, const std::vector<int32_t>& to
     }();
     // (deepseek41: its SSD reads land in the column's scratch set - a column a set up to 1 + n_scr columns; a longer
     // window keeps each column's experts right after its own fetch)
-    const bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on && (!g.v41 || T <= 1 + V->n_scr);
+    const bool cols = win_cols && T > 1 && V->cols_d != nullptr && !F->prof_on && T <= 1 + V->n_scr;
+    // (any model: a fetch with no spare left lands in its column's scratch set, so two columns sharing a set would
+    // have the later fetch overwrite the earlier one's experts before the batched launches read them - qwen4exp's
+    // 5-column MTP windows shared set 3 among columns 3-5 until 2026-10-31; a launch a column reads each in time)
     if (g.qwen35() && Ly.sh_gate_w != nullptr) {   // the shared expert's gate logit a column (sigmoid below)
         gf::MvJob jg = {Ly.sh_gate_w, nullptr, V->x + (size_t) tb * E, V->q35_shg + tb, nullptr, 1.0f, gf::kTypeF32, E, 1};
         if (!gf::mvn(&jg, 1, T, s)) { err = "qwen35 verify: the shared expert's gate"; return false; }
@@ -1044,8 +1060,8 @@ bool Glm5Model::verify_part(const std::vector<int32_t>& toks, int64_t p0, std::s
     int grp = !pipe ? T : grp_env > 0 ? std::min(grp_env, T) : (T + 1) / 2;
     while ((T + grp - 1) / grp > 1 + V->n_scr) ++grp;   // (a scratch set a group)
     const int n_grp = (T + grp - 1) / grp;
-    if (pipe)
-        for (int t = 0; t < T; ++t) V->md[(size_t) t].scratch = V->scr_set[t / grp];
+    // (a batched window: a set a column again - a pipelined window before left its groups' sets in md)
+    for (int t = 0; t < T; ++t) V->md[(size_t) t].scratch = V->scr_set[pipe ? t / grp : std::min(t, V->n_scr)];
     const bool prof = F->prof_on;
     const std::string vt = "v" + std::to_string(T) + "_";
     static std::vector<std::string> names;   // (mark keeps the pointer)
@@ -1531,8 +1547,19 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
     }
     cudaMemcpyAsync(V->q4_steps, V->q4_steps_h, (size_t) T * (4 + IH) * sizeof(int32_t), cudaMemcpyHostToDevice, s);
     const int32_t* ipos = V->q4_steps + (size_t) T * 4;
+    const size_t tail_n = (size_t) (sh.idx_block - 1) * ID;
+    {   // every QSA layer's raw-key tail as before the window (verify_rewind_q35)
+        int la = 0;
+        for (int il = l0_; il < l1_; ++il) {
+            const auto& Ly = F->L[(size_t) il];
+            if (Ly.q4_tail == nullptr) continue;
+            cudaMemcpyAsync(V->q4_tsnap + (size_t) la * tail_n, Ly.q4_tail, tail_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+            ++la;
+        }
+    }
     if (prof) F->mark("q4w_ple_read");
     li = 0;
+    int la = 0;   // (the QSA layers so far)
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
         const float* prev_out = il == l0_ ? nullptr : V->ffn;
@@ -1589,14 +1616,16 @@ bool Glm5Model::verify_part_q4x(const std::vector<int32_t>& toks, int64_t p0, st
                                 g.n_rot, g.rope_base, p0, T, Ly.kc, Ly.vc, V->q35_q, s);
             const float scale = 1.0f / std::sqrt((float) D);
             if (Ly.q4_pooled != nullptr) {
-                // the indexer's raw keys and queries (BF16 rows against the float columns), the block keys a column
+                // the indexer's raw keys (kept a layer for the rewind) and queries (BF16 rows against the float
+                // columns), the block keys a column
+                float* rawk = Ly.q4_tail != nullptr ? V->q4_rawk + (size_t) la++ * TM * ID : V->q4_iraw;
                 gf::MvJob ij[2];
-                ij[0] = {Ly.q4_ik.q, nullptr, V->x, V->q4_iraw, nullptr, 1.0f, Ly.q4_ik.type, E, ID};
+                ij[0] = {Ly.q4_ik.q, nullptr, V->x, rawk, nullptr, 1.0f, Ly.q4_ik.type, E, ID};
                 ij[1] = {Ly.q4_iq.q, nullptr, V->x, V->q4_iq, nullptr, 1.0f, Ly.q4_iq.type, E, IH * ID};
                 if (!gf::mvn(ij, 2, T, s)) { err = "qwen4exp verify: the indexer projections"; return false; }
                 const k::QsaIndexerBuffers ib{Ly.q4_tail, Ly.q4_dead, Ly.q4_pooled, Ly.q4_bpos};
                 for (int t = 0; t < T; ++t)
-                    k::indexer_key_append(V->q4_iraw + (size_t) t * ID, V->q4_steps + (size_t) t * 4 + k::kStepPos, 0,
+                    k::indexer_key_append(rawk + (size_t) t * ID, V->q4_steps + (size_t) t * 4 + k::kStepPos, 0,
                                           Ly.q4_ikn, g.norm_eps, ib, sh, F->q4_cos, F->q4_sin, (void*) s);
                 bool any = false;
                 for (int t = 0; t < T && !any; ++t) any = k::qsa_selection_width(p0 + t + 1, sh) < p0 + t + 1;
@@ -1688,6 +1717,26 @@ void Glm5Model::verify_rewind_q35(int64_t pos) {
         q35_mtp_pend_set(p0 + kept - 1, h + (size_t) (kept - 1) * E);
     }
     if (kept >= T) return;   // (every column kept: the states are after the window already)
+    if (g.q4x && V->q4_nattn > 0 && V->q4_tsnap != nullptr) {
+        // qwen4exp's QSA layers: the raw-key tail back to before the window, then the kept columns' keys again (a
+        // dropped column in the next block wrote over slots of cells the kept block still pools)
+        namespace k = strata::kernels;
+        const k::QsaShapes sh = k::qsa_real_shapes();
+        const size_t ID = (size_t) g.idx_key, tail_n = (size_t) (sh.idx_block - 1) * ID;
+        int la = 0;
+        for (int il = l0_; il < l1_; ++il) {
+            const auto& Ly = F->L[(size_t) il];
+            if (Ly.q4_tail == nullptr) continue;
+            cudaMemcpyAsync(Ly.q4_tail, V->q4_tsnap + (size_t) la * tail_n, tail_n * sizeof(float), cudaMemcpyDeviceToDevice, s);
+            if (Ly.q4_pooled != nullptr) {
+                const k::QsaIndexerBuffers ib{Ly.q4_tail, Ly.q4_dead, Ly.q4_pooled, Ly.q4_bpos};
+                for (int t = 0; t < kept; ++t)
+                    k::indexer_key_append(V->q4_rawk + ((size_t) la * TM + t) * ID, V->q4_steps + (size_t) t * 4 + k::kStepPos,
+                                          0, Ly.q4_ikn, g.norm_eps, ib, sh, F->q4_cos, F->q4_sin, (void*) s);
+            }
+            ++la;
+        }
+    }
     if (g.q4x && V->q4_ple_on && F->ple_hist != nullptr) {   // qwen4exp: the PLE conv history after the kept columns
         const size_t HE = (size_t) g.hc * g.n_embd;
         cudaMemcpyAsync(F->ple_hist, V->q4_ple_snap, (size_t) strata::kernels::NG_HIST * HE * sizeof(float),
