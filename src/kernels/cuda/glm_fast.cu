@@ -2560,7 +2560,7 @@ __device__ __forceinline__ float route_score(float x, int gating) {
 
 // the top-k of sel[0, E) (E <= 512) by one warp: 16 scores a lane in registers, k rounds of shuffles; the same
 // selection rule and ties as topk_argmax (the larger score, then the lower index); invalid ranks -> -1
-__device__ void warp_topk(const float* sel, int E, int k, int* out) {
+__device__ void warp_topk_scan(const float* sel, int E, int k, int* out) {
     const int lane = threadIdx.x & 31;
     float v[16];
 #pragma unroll
@@ -2588,6 +2588,58 @@ __device__ void warp_topk(const float* sel, int E, int k, int* out) {
             if (lane + 32 * j == bi) v[j] = -INFINITY;
         if (lane == 0) out[r] = bi >= 0 && bi < E && isfinite(bv) ? bi : -1;
     }
+}
+
+// CUDA sm_80+: the same selection with the warp's REDUX instructions - a round is each lane's best of its 16 (a
+// tree, the lower entry on a tie), then the warp's max key and the lowest index among the lanes holding it: two
+// reductions instead of five shuffle pairs.  The scores as order-preserving keys (-0 as +0: equal scores, equal
+// keys).  The same ids in the same order as the scan (both are the k first of one total order; checked against it
+// over every E / k / tie / -inf / -0 pattern).  RTX 5090, Qwen3.8's k = 10 of 512: 8.8k -> 5.0k cycles
+#if !defined(STRATA_USE_HIP)
+__device__ __forceinline__ unsigned topk_key(float v) {
+    const unsigned u = __float_as_uint(v == 0.0f ? 0.0f : v);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+#endif
+__device__ void warp_topk(const float* sel, int E, int k, int* out) {
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const int lane = threadIdx.x & 31;
+    unsigned key[16];
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const int e = lane + 32 * j;
+        key[j] = e < E ? topk_key(sel[e]) : 0u;   // (past E or taken: 0 - below every score's key, -inf's is 0x007fffff)
+    }
+    for (int r = 0; r < k; ++r) {
+        unsigned bk[8], bj[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const bool t = key[2 * j + 1] > key[2 * j];
+            bk[j] = t ? key[2 * j + 1] : key[2 * j];
+            bj[j] = t ? 2 * j + 1 : 2 * j;
+        }
+#pragma unroll
+        for (int w = 4; w >= 1; w >>= 1)
+#pragma unroll
+            for (int j = 0; j < w; ++j) {
+                const bool t = bk[2 * j + 1] > bk[2 * j];
+                bk[j] = t ? bk[2 * j + 1] : bk[2 * j];
+                bj[j] = t ? bj[2 * j + 1] : bj[2 * j];
+            }
+        const unsigned m = __reduce_max_sync(0xffffffffu, bk[0]);
+        const unsigned mi = (unsigned) lane + 32u * bj[0];
+        const unsigned bi = __reduce_min_sync(0xffffffffu, bk[0] == m ? mi : 0xffffffffu);
+        if (mi == bi) {
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+                if (j == (int) bj[0]) key[j] = 0u;
+        }
+        // (-inf, or nothing left: no expert, as the scan's non-finite best)
+        if (lane == 0) out[r] = bi < (unsigned) E && m > 0x007fffffu ? (int) bi : -1;
+    }
+#else
+    warp_topk_scan(sel, E, k, out);
+#endif
 }
 
 // STRATA_GLM_ROUTE_PROF=1 (diagnostics, CUDA): thread 0 of the route block sums SM cycles per phase (0 start, 1 x / prev
@@ -2972,6 +3024,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         }
         route_put_xq(a, rq, tid);
     }
+    // the request's fields (host-mapped: each store crosses PCIe) a thread an entry - thread 0 storing them one after
+    // another was ~13k cycles of the route with the fence (RTX 5090); the same bytes, every thread's fence below
     if (tid == 0) {
         rq->layer = a.layer;
         rq->error = 0;
@@ -2980,21 +3034,25 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         rq->promo_mask = s_promo;
         rq->cpu_mask = s_cpu;
         rq->skip_mask = s_skip;
-        for (int i = 0; i < a.k; ++i) {
-            rq->ids[i] = s_ids[i];
-            rq->w[i] = s_w[i];
-            rq->promo_ptr[i] = s_pp[i];
-            rq->pred[i] = s_pred[i];
-            rq->cpu_src[i] = s_cs[i];
-        }
         rq->pf_n = s_npf;
         rq->win_more = a.win_more;
-        for (int i = 0; i < s_npf; ++i) {
-            rq->pf_ids[i] = s_pfid[i];
-            rq->pf_ptr[i] = s_pfptr[i];
-        }
-        for (int d2 = 0; d2 < kAhead; ++d2)
-            for (int i = 0; i < kMaxK; ++i) rq->ahead[d2][i] = d2 < a.n_ahead && i < a.k ? s_ah[d2][i] : (short) -1;
+    }
+    if (tid >= 32 && tid < 32 + a.k) {
+        const int i = tid - 32;
+        rq->ids[i] = s_ids[i];
+        rq->w[i] = s_w[i];
+        rq->promo_ptr[i] = s_pp[i];
+        rq->pred[i] = s_pred[i];
+        rq->cpu_src[i] = s_cs[i];
+    }
+    if (tid >= 64 && tid < 64 + s_npf) {
+        const int i = tid - 64;
+        rq->pf_ids[i] = s_pfid[i];
+        rq->pf_ptr[i] = s_pfptr[i];
+    }
+    if (tid >= 96 && tid < 96 + kAhead * kMaxK) {
+        const int d2 = (tid - 96) / kMaxK, i = (tid - 96) % kMaxK;
+        rq->ahead[d2][i] = d2 < a.n_ahead && i < a.k ? s_ah[d2][i] : (short) -1;
     }
     __threadfence_system();
     __syncthreads();
