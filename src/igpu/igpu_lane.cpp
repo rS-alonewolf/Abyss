@@ -155,6 +155,159 @@ __global__ void __launch_bounds__(256) lane_down_q2k_kernel(const unsigned long 
         if (threadIdx.x == 0) atomicAdd(done, 1u);
     }
 }
+
+// THE UNION (abyss_igpu_experts_cols): a verify window's columns route ~20% of their lane experts in common.  The
+// one-column kernels read an expert once per column that routes it; these read each expert of the union ONCE and
+// run every column that routes it over the same rows (the later columns' reads hit L2), each (expert, column) dot
+// the one-column kernel's call bit for bit (the same rows_dot / rows_dot_rdna, the same inputs), each column's
+// sum in its own plan order (the one-column down's).  UN_MAX experts a call (8 columns x 8).
+constexpr int UN_COLS = 8, UN_MAX = UN_COLS * 8;
+struct UnionPlan {   // host-mapped
+    unsigned long long ptr[UN_MAX];       // the union's experts (device addresses of their blobs)
+    int ncol[UN_MAX];                     // ... how many columns route each
+    unsigned char col[UN_MAX][UN_COLS];   // ... which, and at which slot of that column's plan
+    unsigned char slot[UN_MAX][UN_COLS];
+    float w[UN_COLS][gf::kMaxK];          // column c's weights by plan slot
+    int ne[UN_COLS];                      // column c's expert count
+    int nu, nc;
+};
+// gate/up: block (chunk, u) - the expert's 32 gate + 32 up rows for every column that routes it, h to that column's
+// plan slot.  RDNA: rows_dot_rdna with the grid in LDS and the signs expanded in registers (what gate_up_impl's RDNA
+// branch runs for the type and shape); else rows_dot (the generic moe_gate_up_kernel's)
+template<int TG, bool RDNA>
+__global__ void __launch_bounds__(GU_WARPS * 32) lane_gu_union_kernel(const UnionPlan* __restrict__ up, int n_embd, int n_ff,
+                                                                      float limit, const uint8_t* __restrict__ xq, size_t xq_cs,
+                                                                      uint8_t* __restrict__ hq, size_t hq_cs) {
+    const int u = blockIdx.y, chunk = blockIdx.x;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    __shared__ float sg[GU_ROWS], su[GU_ROWS];
+    __shared__ uint32_t s_tab[TabWords<TG>::n > 0 ? TabWords<TG>::n : 1];
+    load_tab<TG>(s_tab);
+    __syncthreads();
+    const unsigned long long ptr = up->ptr[u];
+    if (ptr == 0ull) return;
+    const size_t rb = rbytes<TG>(n_embd);
+    const uint8_t* blob = (const uint8_t*) ptr;
+    constexpr int RPW = GU_ROWS / GU_WARPS;
+    const uint8_t* rows[2 * RPW];
+#pragma unroll
+    for (int j = 0; j < RPW; ++j) {
+        const int r = chunk * GU_ROWS + warp * RPW + j;
+        rows[j] = blob + (size_t) r * rb;
+        rows[RPW + j] = blob + (size_t) n_ff * rb + (size_t) r * rb;
+    }
+    const int ncol = up->ncol[u];
+    for (int q = 0; q < ncol; ++q) {
+        const int c = up->col[u][q], sl = up->slot[u][q];
+        const block_q8_1* x = (const block_q8_1*) (xq + (size_t) c * xq_cs);
+        float s[2 * RPW];
+        if constexpr (RDNA) rows_dot_rdna<TG, 2 * RPW>(rows, x, n_embd, lane, s_tab, nullptr, s, true, false);
+        else rows_dot<TG, 2 * RPW>(rows, x, n_embd, lane, s_tab, s);
+        if (lane == 0) {
+#pragma unroll
+            for (int j = 0; j < RPW; ++j) {
+                sg[warp * RPW + j] = s[j];
+                su[warp * RPW + j] = s[RPW + j];
+            }
+        }
+        __syncthreads();
+        if (warp == 0) {
+            const float g = fminf(sg[lane], limit);
+            const float uu = fminf(fmaxf(su[lane], -limit), limit);
+            q8_1_store_warp((g / (1.0f + expf(-g))) * uu, (block_q8_1*) (hq + (size_t) c * hq_cs) + (size_t) sl * (n_ff / 32) + chunk, lane);
+        }
+        __syncthreads();
+    }
+}
+// down: a warp on NR rows, every union expert's rows read once and dotted with each routing column's h; the partial
+// dots parked in LDS by (column, slot), then each column's sum in plan order - lane_down_kernel's sum, bit for bit
+template<int TD, int NR, bool RDNA>
+__global__ void __launch_bounds__(256) lane_dn_union_kernel(const UnionPlan* __restrict__ up, int n_ff, size_t down_off,
+                                                            const uint8_t* __restrict__ hq, size_t hq_cs, float* __restrict__ out,
+                                                            size_t out_cs, unsigned int* done) {
+    __shared__ uint32_t s_tab[TabWords<TD>::n > 0 ? TabWords<TD>::n : 1];
+    __shared__ float s_part[UN_COLS][8][8 * NR];
+    load_tab<TD>(s_tab);
+    __syncthreads();
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int r0 = (blockIdx.x * 8 + warp) * NR;
+    const size_t drb = rbytes<TD>(n_ff);
+    const int nu = up->nu, nc = up->nc;
+    for (int u = 0; u < nu; ++u) {
+        const uint8_t* rows[NR];
+#pragma unroll
+        for (int j = 0; j < NR; ++j) rows[j] = (const uint8_t*) up->ptr[u] + down_off + (size_t) (r0 + j) * drb;
+        const int ncol = up->ncol[u];
+        for (int q = 0; q < ncol; ++q) {
+            const int c = up->col[u][q], sl = up->slot[u][q];
+            const block_q8_1* h = (const block_q8_1*) (hq + (size_t) c * hq_cs) + (size_t) sl * (n_ff / 32);
+            float s[NR];
+            if constexpr (RDNA) rows_dot_rdna<TD, NR>(rows, h, n_ff, lane, s_tab, nullptr, s, true, false);
+            else rows_dot<TD, NR>(rows, h, n_ff, lane, s_tab, s);
+            if (lane == 0)
+#pragma unroll
+                for (int j = 0; j < NR; ++j) s_part[c][sl][warp * NR + j] = s[j];
+        }
+    }
+    __syncthreads();
+    for (int c = 0; c < nc; ++c) {
+        float m[NR];
+#pragma unroll
+        for (int j = 0; j < NR; ++j) m[j] = 0.0f;
+        const int k = up->ne[c];
+        for (int i = 0; i < k; ++i) {
+            const float wi = up->w[c][i];
+#pragma unroll
+            for (int j = 0; j < NR; ++j) m[j] += wi * s_part[c][i][warp * NR + j];
+        }
+        if (lane == 0)
+#pragma unroll
+            for (int j = 0; j < NR; ++j) out[(size_t) c * out_cs + r0 + j] = m[j] + 0.0f;
+    }
+    if (done != nullptr) {
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) atomicAdd(done, 1u);
+    }
+}
+// the per-column gate/up kernel gate_up_impl would run for this type and shape on this device: RDNA (true) or the generic
+bool gu_rdna_here(int gu_type, int n_embd, int n_ff) {
+    const RdnaArch ra = rdna_expert_arch();
+    const bool arch = ra == RdnaArch::gfx1100 || ra == RdnaArch::gfx1151 || ra == RdnaArch::gfx1201;
+    static const bool gu17_legacy = std::getenv("ABYSS_IGPU_GU17_LEGACY") != nullptr;
+    static const bool gu16_any = std::getenv("ABYSS_IGPU_GU16_4096") == nullptr;
+    if (gu_type == 17 && n_embd == 4096 && n_ff == 2048 && arch && !gu17_legacy) return true;
+    if ((gu_type == 17 || gu_type == 22) && n_embd == 5120 && n_ff == 2304 && arch) return true;
+    if (gu_type == 16 && ((n_embd == 4096 && n_ff == 2048) || (gu16_any && n_embd % 256 == 0 && n_ff % GU_ROWS == 0)) &&
+        rdna3_expert_device())
+        return true;
+    return false;
+}
+// the union gate/up launch (false: no kernel for the type - the caller runs the per-column grid)
+bool lane_gu_union(int gu_type, const UnionPlan* up_d, int nu, int n_embd, int n_ff, float limit, const void* xq, size_t xq_cs,
+                   void* hq, size_t hq_cs, hipStream_t s) {
+    const dim3 grid((unsigned) (n_ff / GU_ROWS), (unsigned) nu);
+    const auto* X = (const uint8_t*) xq;
+    auto* H = (uint8_t*) hq;
+    if (gu_rdna_here(gu_type, n_embd, n_ff)) {
+        switch (gu_type) {
+            case 16: lane_gu_union_kernel<16, true><<<grid, GU_WARPS * 32, 0, s>>>(up_d, n_embd, n_ff, limit, X, xq_cs, H, hq_cs); break;
+            case 17: lane_gu_union_kernel<17, true><<<grid, GU_WARPS * 32, 0, s>>>(up_d, n_embd, n_ff, limit, X, xq_cs, H, hq_cs); break;
+            case 22: lane_gu_union_kernel<22, true><<<grid, GU_WARPS * 32, 0, s>>>(up_d, n_embd, n_ff, limit, X, xq_cs, H, hq_cs); break;
+            default: return false;
+        }
+        return hipGetLastError() == hipSuccess;
+    }
+    switch (gu_type) {
+#define LANE_GU_U(T) \
+        case T: lane_gu_union_kernel<T, false><<<grid, GU_WARPS * 32, 0, s>>>(up_d, n_embd, n_ff, limit, X, xq_cs, H, hq_cs); break;
+        LANE_GU_U(16) LANE_GU_U(18) LANE_GU_U(19) LANE_GU_U(23) LANE_GU_U(10) LANE_GU_U(11) LANE_GU_U(17) LANE_GU_U(22) LANE_GU_U(21)
+        LANE_GU_U(29) LANE_GU_U(12) LANE_GU_U(13) LANE_GU_U(14) LANE_GU_U(39)
+#undef LANE_GU_U
+        default: return false;
+    }
+    return hipGetLastError() == hipSuccess;
+}
 }  // namespace
 
 // ABYSS_IGPU_Q2K_NR: the Q2_K down's rows a lane group (1 / 2 / 4; 0: rows_dot as before)
@@ -216,6 +369,36 @@ bool lane_down(int d_type, const unsigned long long* plan_ptr, const float* plan
     }
     return hipGetLastError() == hipSuccess;
 }
+// the union down (lane_dn_union_kernel) where lane_down would run lane_down_kernel for the type: the RDNA dot at 2 rows
+// for 16 / 18 / 22, rows_dot at DOWN_ROWS for the others it has; the Q2_K lane group kernel (another sum order) and the
+// types lane_down leaves to moe_down are not here (false: the caller runs lane_down a column).  blocks: how many count in done
+bool lane_dn_union(int d_type, const UnionPlan* up_d, int n_embd, int n_ff, size_t down_off, const void* hq, size_t hq_cs,
+                   float* out, size_t out_cs, unsigned int* done, int* blocks, hipStream_t s) {
+    if (d_type == 10 && lane_q2k_nr() > 0 && n_ff % 256 == 0) return false;
+    const auto* H = (const uint8_t*) hq;
+    if (lane_dn_rdna(d_type)) {
+        if (n_embd % 16 != 0) return false;
+        *blocks = n_embd / 16;
+        switch (d_type) {
+            case 16: lane_dn_union_kernel<16, 2, true><<<*blocks, 256, 0, s>>>(up_d, n_ff, down_off, H, hq_cs, out, out_cs, done); break;
+            case 18: lane_dn_union_kernel<18, 2, true><<<*blocks, 256, 0, s>>>(up_d, n_ff, down_off, H, hq_cs, out, out_cs, done); break;
+            default: lane_dn_union_kernel<22, 2, true><<<*blocks, 256, 0, s>>>(up_d, n_ff, down_off, H, hq_cs, out, out_cs, done); break;
+        }
+        return hipGetLastError() == hipSuccess;
+    }
+    constexpr int NR = DOWN_ROWS;
+    if (n_embd % (8 * NR) != 0) return false;
+    *blocks = n_embd / (8 * NR);
+    switch (d_type) {
+#define LANE_DN_U(T) \
+        case T: lane_dn_union_kernel<T, NR, false><<<*blocks, 256, 0, s>>>(up_d, n_ff, down_off, H, hq_cs, out, out_cs, done); break;
+        LANE_DN_U(16) LANE_DN_U(18) LANE_DN_U(19) LANE_DN_U(23) LANE_DN_U(10) LANE_DN_U(11) LANE_DN_U(17) LANE_DN_U(22) LANE_DN_U(21)
+        LANE_DN_U(29) LANE_DN_U(12) LANE_DN_U(13) LANE_DN_U(14) LANE_DN_U(39)
+#undef LANE_DN_U
+        default: return false;
+    }
+    return hipGetLastError() == hipSuccess;
+}
 __global__ void lane_poke_kernel() {}
 void lane_poke(hipStream_t s) { lane_poke_kernel<<<1, 32, 0, s>>>(); }
 // ABYSS_IGPU_TEST_STALL (test only): spins `ticks` of the device's wall clock, standing in for a queue the kernel
@@ -250,6 +433,24 @@ struct Lane {
     void *xq = nullptr, *hq = nullptr;
     void *xqh = nullptr, *xqh_d = nullptr;   // pinned, mapped: a caller's q8_1 x (abyss_igpu_experts_q)
     // a call started by abyss_igpu_experts_start, for abyss_igpu_experts_finish
+    // abyss_igpu_experts_cols (a verify window's columns in one call): per-column plans (host-mapped), the column
+    // table the kernels read, one q8_1 x buffer and one h buffer a column, the sums a column (host-mapped)
+    static constexpr int kCols = 8;
+    struct PlanCols {
+        unsigned long long ptr[kCols][gf::kMaxK];
+        float w[kCols][gf::kMaxK];
+        int cpu_flag;
+        unsigned int done;
+    };
+    PlanCols *planc_h = nullptr, *planc_d = nullptr;
+    gf::MoeColArgs *ca_h = nullptr, *ca_d = nullptr;
+    void *xqc_h = nullptr, *xqc_d = nullptr;   // kCols x (n_embd / 32 x 36)
+    float *xc_h = nullptr, *xc_d = nullptr;    // kCols x n_embd (a column given as floats: quantized here)
+    void* hqc = nullptr;                       // kCols x kMaxK x (n_ff / 32 x 36)
+    float *outc_h = nullptr, *outc_d = nullptr;
+    gf::UnionPlan *un_h = nullptr, *un_d = nullptr;   // the union (host-mapped)
+    unsigned long long un_calls = 0, un_gu = 0, un_dn = 0;
+    bool cols_ok = false, cols_tried = false;
     bool g_counted = false;
     int g_want = 0;
     unsigned long long g_dout = 0ull;
@@ -387,7 +588,7 @@ static int igpu_experts(int gu_type, int d_type, int n_embd, int n_ff, size_t do
                         const void* const* blobs, const float* w, const float* x, const void* xq_in, float* out,
                         bool start_only = false);
 static int igpu_wait(bool counted, int want, unsigned long long dout, float* out, int n_embd,
-                     std::chrono::steady_clock::time_point t0);
+                     std::chrono::steady_clock::time_point t0, volatile unsigned int* done_h = nullptr);
 // in two halves (the engine's service thread starts a route's lane experts before that route's disk reads, and
 // collects the sum after them): _start queues the kernels and keeps the lane (0; 1: busy or not in registered memory -
 // nothing queued, compute it elsewhere), _finish waits up to the deadline and copies the sum out (0), or leaves the
@@ -422,6 +623,173 @@ __attribute__((visibility("default"))) int abyss_igpu_experts_q(int gu_type, int
     DevScope ds;
     if (xq == nullptr || n_embd % 32 != 0) return 1;
     return igpu_experts(gu_type, d_type, n_embd, n_ff, down_off, limit, ne, blobs, w, nullptr, xq, out);
+}
+// A verify window's columns in ONE call (abyss_igpu_experts_cols): column c's ne[c] experts (blobs / w at c * kMaxK),
+// its x as q8_1 (xq[c]) or floats (x[c], quantized here), its sum into out[c].  The gate/up of every column in one
+// grid (moe_gate_up_cols: the blocks nc single-column launches would run, the same sums), the down a column after
+// another on the same stream (lane_down, the same kernel as the one-column call), one wait at the end.  What it saves
+// is the per-call cost - the launches' gaps and the host's wait and copies a column - not bytes: each column's
+// blocks read their own experts (a window's columns share ~20% of them: see the engine's verify-window stats).
+// 0 ok; 1 not here (busy, a blob outside registered memory, too many columns / experts: the caller does it a column
+// at a time); < 0 an error.  Every (expert, column) product and every column's sum is the one-column call's bit for bit
+static bool cols_alloc() {
+    if (L.cols_tried) return L.cols_ok;
+    L.cols_tried = true;
+    const auto hm = [&](void** p, size_t b) { return hipHostMalloc(p, b, hipHostMallocMapped); };
+    const size_t xq_b = (size_t) L.n_embd / 32 * kQ8, hq_b = (size_t) gf::kMaxK * L.n_ff / 32 * kQ8;
+    hipError_t e;
+    if ((e = hm((void**) &L.planc_h, sizeof(Lane::PlanCols))) != hipSuccess ||
+        (e = hm((void**) &L.ca_h, sizeof(gf::MoeColArgs) * Lane::kCols)) != hipSuccess ||
+        (e = hm(&L.xqc_h, xq_b * Lane::kCols)) != hipSuccess ||
+        (e = hm((void**) &L.xc_h, (size_t) L.n_embd * sizeof(float) * Lane::kCols)) != hipSuccess ||
+        (e = hipMalloc(&L.hqc, hq_b * Lane::kCols)) != hipSuccess ||
+        (e = hm((void**) &L.outc_h, (size_t) L.n_embd * sizeof(float) * Lane::kCols)) != hipSuccess ||
+        (e = hm((void**) &L.un_h, sizeof(gf::UnionPlan))) != hipSuccess) {
+        std::fprintf(stderr, "iGPU lane: the columns call's buffers did not allocate (%s) - a call a column\n", hipGetErrorString(e));
+        return false;
+    }
+    hipHostGetDevicePointer((void**) &L.planc_d, L.planc_h, 0);
+    hipHostGetDevicePointer((void**) &L.ca_d, L.ca_h, 0);
+    hipHostGetDevicePointer(&L.xqc_d, L.xqc_h, 0);
+    hipHostGetDevicePointer((void**) &L.xc_d, L.xc_h, 0);
+    hipHostGetDevicePointer((void**) &L.outc_d, L.outc_h, 0);
+    hipHostGetDevicePointer((void**) &L.un_d, L.un_h, 0);
+    std::memset(L.planc_h, 0, sizeof(Lane::PlanCols));
+    std::memset(L.un_h, 0, sizeof(gf::UnionPlan));
+    for (int c = 0; c < Lane::kCols; ++c) {
+        L.ca_h[c].plan_ptr = L.planc_d->ptr[c];
+        L.ca_h[c].plan_w = L.planc_d->w[c];
+        L.ca_h[c].cpu_flag = &L.planc_d->cpu_flag;
+        L.ca_h[c].cpu_part = nullptr;
+    }
+    L.cols_ok = true;
+    return true;
+}
+__attribute__((visibility("default"))) int abyss_igpu_experts_cols(int gu_type, int d_type, int n_embd, int n_ff,
+                                                                   size_t down_off, float limit, int nc, const int* ne,
+                                                                   const void* const* blobs, const float* w,
+                                                                   const float* const* x, const void* const* xq,
+                                                                   float* const* out) {
+    DevScope ds;
+    if (!L.open || nc < 1 || nc > Lane::kCols || n_embd > L.n_embd || n_ff > L.n_ff || n_embd % 32 != 0) return 1;
+    int kmax = 0;
+    for (int c = 0; c < nc; ++c) {
+        if (ne[c] < 1 || ne[c] > gf::kMaxK) return 1;
+        kmax = std::max(kmax, ne[c]);
+    }
+    std::unique_lock<std::mutex> lk(L.mu, std::try_to_lock);
+    if (!lk.owns_lock()) return 1;
+    if (L.pending) {   // (as abyss_igpu_experts: a late call still owns the queue)
+        if (hipStreamQuery(L.s) != hipSuccess) {
+            ++L.on_cpu;
+            L.t_busy = std::chrono::steady_clock::now();
+            return 1;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const double lo = std::chrono::duration<double, std::milli>(L.t_busy - L.t_pend).count();
+        const double hi = std::chrono::duration<double, std::milli>(now - L.t_pend).count();
+        std::fprintf(stderr, "iGPU lane: the late call ran %.0f-%.0f ms (busy at the last of %llu calls the CPU took "
+                             "meanwhile, done by this one)\n", lo, hi, L.on_cpu);
+        L.pending = false;
+        L.on_cpu = 0;
+    }
+    if (!cols_alloc()) return 1;
+    const size_t xq_b = (size_t) L.n_embd / 32 * kQ8, hq_b = (size_t) gf::kMaxK * L.n_ff / 32 * kQ8;
+    for (int c = 0; c < nc; ++c) {
+        for (int i = 0; i < ne[c]; ++i) {
+            const unsigned long long d = dev_of(blobs[(size_t) c * gf::kMaxK + i]);
+            if (d == 0ull) return 1;
+            L.planc_h->ptr[c][i] = d;
+            L.planc_h->w[c][i] = w[(size_t) c * gf::kMaxK + i];
+        }
+        for (int i = ne[c]; i < gf::kMaxK; ++i) { L.planc_h->ptr[c][i] = 0ull; L.planc_h->w[c][i] = 0.0f; }
+    }
+    L.planc_h->cpu_flag = 0;
+    volatile unsigned int* done_h = &L.planc_h->done;
+    *done_h = 0u;
+    for (int c = 0; c < nc; ++c) {
+        if (xq != nullptr && xq[c] != nullptr) {
+            std::memcpy((uint8_t*) L.xqc_h + (size_t) c * xq_b, xq[c], (size_t) n_embd / 32 * kQ8);
+        } else {
+            if (x == nullptr || x[c] == nullptr) return 1;
+            std::memcpy(L.xc_h + (size_t) c * L.n_embd, x[c], (size_t) n_embd * sizeof(float));
+            gf::quantize_q8_1(L.xc_d + (size_t) c * L.n_embd, (uint8_t*) L.xqc_d + (size_t) c * xq_b, n_embd, L.s);
+        }
+    }
+    // THE UNION (ABYSS_IGPU_COLS_UNION=0: the per-column grids, every column reading its own experts): the columns'
+    // distinct experts, each with the columns that route it
+    static const bool union_on = [] { const char* v = getenv("ABYSS_IGPU_COLS_UNION"); return v == nullptr || std::atoi(v) != 0; }();
+    bool gu_done = false, dn_done = false;
+    int want = 0;
+    bool counted = true;
+    if (union_on) {
+        gf::UnionPlan* U = L.un_h;
+        int nu = 0;
+        bool fits = true;
+        for (int c = 0; c < nc && fits; ++c) {
+            U->ne[c] = ne[c];
+            for (int i = 0; i < ne[c]; ++i) {
+                const unsigned long long d = L.planc_h->ptr[c][i];
+                U->w[c][i] = L.planc_h->w[c][i];
+                int u = 0;
+                while (u < nu && U->ptr[u] != d) ++u;
+                if (u == nu) {
+                    if (nu == gf::UN_MAX) { fits = false; break; }
+                    U->ptr[nu] = d;
+                    U->ncol[nu] = 0;
+                    ++nu;
+                }
+                if (U->ncol[u] >= gf::UN_COLS) { fits = false; break; }   // (a column routes an expert once: never)
+                U->col[u][U->ncol[u]] = (unsigned char) c;
+                U->slot[u][U->ncol[u]] = (unsigned char) i;
+                ++U->ncol[u];
+            }
+        }
+        if (fits && ne[0] <= 8) {
+            bool ok8 = true;
+            for (int c = 0; c < nc; ++c) ok8 = ok8 && ne[c] <= 8;   // (s_part holds 8 slots a column)
+            if (ok8) {
+                U->nu = nu;
+                U->nc = nc;
+                gu_done = gf::lane_gu_union(gu_type, L.un_d, nu, n_embd, n_ff, limit, L.xqc_d, xq_b, L.hqc, hq_b, L.s);
+                if (gu_done) {
+                    int blocks = 0;
+                    dn_done = gf::lane_dn_union(d_type, L.un_d, n_embd, n_ff, down_off, L.hqc, hq_b, L.outc_d, (size_t) L.n_embd,
+                                                &L.planc_d->done, &blocks, L.s);
+                    if (dn_done) want = blocks;
+                }
+                ++L.un_calls;
+                L.un_gu += gu_done;
+                L.un_dn += dn_done;
+            }
+        }
+    }
+    if (!gu_done)
+        gf::moe_gate_up_cols(gu_type, L.ca_d, nc, kmax, n_embd, n_ff, limit, L.xqc_d, xq_b, L.hqc, hq_b, nullptr, 0,
+                             nullptr, 0, 0, nullptr, 0, L.s);
+    for (int c = 0; c < nc && !dn_done; ++c) {
+        const int wb = gf::lane_down_blocks(d_type, n_embd);
+        unsigned int* dn = counted && wb > 0 ? &L.planc_d->done : nullptr;
+        if (!gf::lane_down(d_type, L.planc_d->ptr[c], L.planc_d->w[c], ne[c], n_embd, n_ff, down_off,
+                           (uint8_t*) L.hqc + (size_t) c * hq_b, L.outc_d + (size_t) c * L.n_embd, dn, L.s)) {
+            gf::MoeDev md;
+            md.plan_ptr = L.planc_d->ptr[c];
+            md.plan_w = L.planc_d->w[c];
+            md.cpu_flag = &L.planc_d->cpu_flag;
+            gf::moe_down(d_type, md, ne[c], n_embd, n_ff, down_off, (uint8_t*) L.hqc + (size_t) c * hq_b, nullptr,
+                         L.outc_d + (size_t) c * L.n_embd, L.s);
+            counted = false;
+        } else if (dn != nullptr) {
+            want += wb;
+        } else {
+            counted = false;
+        }
+    }
+    const int rc = igpu_wait(counted, counted ? want : 0, 1ull /* (no copy there) */, nullptr, n_embd,
+                             std::chrono::steady_clock::now(), done_h);
+    if (rc != 0) return rc;
+    for (int c = 0; c < nc; ++c) std::memcpy(out[c], L.outc_h + (size_t) c * L.n_embd, (size_t) n_embd * sizeof(float));
+    return 0;
 }
 static int igpu_experts(int gu_type, int d_type, int n_embd, int n_ff, size_t down_off, float limit, int ne,
                         const void* const* blobs, const float* w, const float* x, const void* xq_in, float* out,
@@ -517,8 +885,8 @@ static int igpu_experts(int gu_type, int d_type, int n_embd, int n_ff, size_t do
 }
 
 static int igpu_wait(bool counted, int want, unsigned long long dout, float* out, int n_embd,
-                     std::chrono::steady_clock::time_point t0) {
-    volatile unsigned int* done_h = &L.plan_h->done;
+                     std::chrono::steady_clock::time_point t0, volatile unsigned int* done_h) {
+    if (done_h == nullptr) done_h = &L.plan_h->done;   // (the columns call counts in its own plan's)
     // wait (spinning: a call is ~0.05-0.3 ms) up to the deadline, STRATA_GLM_IGPU_TIMEOUT_MS (20; 0: no deadline)
     static const double timeout_ms = [] {
         const char* v = getenv("STRATA_GLM_IGPU_TIMEOUT_MS");
@@ -843,6 +1211,13 @@ __attribute__((visibility("default"))) void abyss_igpu_close(void) {
     L.ranges.clear();
     hipFree(L.xq);
     hipFree(L.hq);
+    if (L.planc_h) hipHostFree(L.planc_h);
+    if (L.ca_h) hipHostFree(L.ca_h);
+    if (L.xqc_h) hipHostFree(L.xqc_h);
+    if (L.xc_h) hipHostFree(L.xc_h);
+    if (L.hqc) hipFree(L.hqc);
+    if (L.outc_h) hipHostFree(L.outc_h);
+    if (L.un_h) hipHostFree(L.un_h);
     if (L.rxq) hipFree(L.rxq);
     if (L.rhq) hipFree(L.rhq);
     if (L.rptr_h) hipHostFree(L.rptr_h);

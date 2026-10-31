@@ -35,6 +35,13 @@ typedef int (*abyss_igpu_experts_start_fn)(int gu_type, int d_type, int n_embd, 
                                            int ne, const void* const* blobs, const float* w, const float* x,
                                            const void* xq);
 typedef int (*abyss_igpu_experts_finish_fn)(float* out, int n_embd);
+/// (optional symbol abyss_igpu_experts_cols) a verify window's nc (1..8) columns in one call: column c's ne[c] experts
+/// (blobs / w at c * 16), its x as q8_1 (xq[c]; else x[c] as floats, quantized on the lane), its weighted sum into
+/// out[c].  The same sums as nc abyss_igpu_experts calls, bit for bit, for the cost of one call.  Synchronous.  0 ok;
+/// 1 not here (busy, unregistered memory, too many: call it a column at a time); < 0 an error.
+typedef int (*abyss_igpu_experts_cols_fn)(int gu_type, int d_type, int n_embd, int n_ff, size_t down_off, float limit,
+                                          int nc, const int* ne, const void* const* blobs, const float* w,
+                                          const float* const* x, const void* const* xq, float* const* out);
 /// Forget a range registered by abyss_igpu_register (before the host frees it).
 typedef void (*abyss_igpu_unregister_fn)(const void* host);
 // an EXL3 layer's experts (optional symbol abyss_igpu_experts_x3): off9 = suh[3], svh[3], trellis[3] byte offsets

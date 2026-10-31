@@ -598,7 +598,7 @@ public:
     // a batched verify window's n columns of layer il at once on the CPU threads: column t's ne[t] experts at
     // blob / w [8 t + i], its x[t], its sum to out[t] - an expert several columns route decoded once for them
     void fast_cpu_experts_multi(int il, int n, const int* ne, const uint8_t* const* blob, const float* w,
-                                const float* const* x, float* const* out);
+                                const float* const* x, float* const* out, const void* const* xq = nullptr);
     void fast_igpu_setup();   // the iGPU lane (STRATA_GLM_IGPU, src/igpu)
     // ---- the NextN (MTP) draft block (the last half carries it; layer index n_layers)
     int mtp_il_ = -1;                                      // its layer index here, -1: not on this half

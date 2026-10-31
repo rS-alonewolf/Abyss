@@ -1780,6 +1780,10 @@ void Glm5Model::fast_igpu_setup() {
     static const bool early_on = [] { const char* v = getenv("STRATA_GLM_IGPU_EARLY"); return v == nullptr || std::atoi(v) != 0; }();
     auto exs = early_on ? (abyss_igpu_experts_start_fn) dlsym(lib, "abyss_igpu_experts_start") : nullptr;
     auto exf = early_on ? (abyss_igpu_experts_finish_fn) dlsym(lib, "abyss_igpu_experts_finish") : nullptr;
+    // (optional) a verify window's columns in one call (STRATA_GLM_IGPU_COLS=0: a call a column, as before).  The
+    // window's columns are queued for it like the CPU lane's multi call (the service thread, lane_flush)
+    static const bool cols_on = [] { const char* v = getenv("STRATA_GLM_IGPU_COLS"); return v == nullptr || std::atoi(v) != 0; }();
+    auto exc = cols_on ? (abyss_igpu_experts_cols_fn) dlsym(lib, "abyss_igpu_experts_cols") : nullptr;
     if (ver == nullptr || op == nullptr || rg == nullptr || ex == nullptr || ver() != ABYSS_IGPU_API)
         return fail("interface mismatch: rebuild libabyss_igpu.so");
     char e[256] = {0};
@@ -1815,6 +1819,7 @@ void Glm5Model::fast_igpu_setup() {
     F->igpu_lib = lib;
     F->igpu_experts = ex;
     F->igpu_experts_q = exq;
+    F->igpu_cols = exc;
     F->igpu_start = exs != nullptr && exf != nullptr ? exs : nullptr;
     F->igpu_finish = exs != nullptr && exf != nullptr ? exf : nullptr;
     F->igpu_poke = (abyss_igpu_poke_fn) dlsym(lib, "abyss_igpu_poke");
@@ -2221,17 +2226,51 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
 // column) product is the one-column call's bit for bit (the multi-token rows are ggml's dot per token, like the
 // one-token rows), and so is each sum.  An EXL3 layer or the iGPU lane: one call a column
 void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8_t* const* blob, const float* w,
-                                       const float* const* x, float* const* out) {
+                                       const float* const* x, float* const* out, const void* const* xq) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto& Ly = F->L[(size_t) il];
+    const int n_ff = g.n_ff_exp, n_embd = g.n_embd;
+    // STRATA_GLM_CPU_MULTI_CHECK=1 (debug, slow): every column through the one-column call too, compared bit for bit
+    static const bool check = getenv("STRATA_GLM_CPU_MULTI_CHECK") != nullptr;
+    const auto check_cols = [&](const char* who) {
+        static std::vector<float> ref;
+        ref.resize((size_t) n_embd);
+        static uint64_t cols = 0, bad = 0;
+        for (int t = 0; t < n; ++t) {
+            fast_cpu_experts(il, ne[t], blob + gf::kMaxK * t, w + gf::kMaxK * t, x[t], ref.data(), xq ? xq[t] : nullptr);
+            ++cols;
+            if (std::memcmp(ref.data(), out[t], (size_t) n_embd * sizeof(float)) != 0) ++bad;
+        }
+        if (cols % 512 < (uint64_t) n)
+            std::fprintf(stderr, "%s multi check: %llu columns, %llu differ from the one-column call\n", who,
+                         (unsigned long long) cols, (unsigned long long) bad);
+    };
+    // the iGPU lane's columns call (abyss_igpu_experts_cols): the window's columns in one call; 1 (busy, a blob it
+    // cannot see, ...): a call a column below; < 0: the lane is gone, the CPU takes over as fast_cpu_experts does
+    if (n >= 2 && !Ly.exl3 && F->igpu_experts != nullptr && F->igpu_cols != nullptr && n <= kVerifyMax) {
+        const int rc = F->igpu_cols(Ly.gu_type, Ly.d_type, n_embd, n_ff, Ly.down_off, g.swiglu_exp, n, ne,
+                                    (const void* const*) blob, w, x, xq, out);
+        if (rc == 0) {
+            F->igpu_calls.fetch_add((uint64_t) n, std::memory_order_relaxed);
+            F->igpu_cols_calls.fetch_add(1, std::memory_order_relaxed);
+            F->igpu_cols_cols.fetch_add((uint64_t) n, std::memory_order_relaxed);
+            if (check) check_cols("igpu");
+            return;
+        }
+        if (rc < 0) {
+            std::fprintf(stderr, "glm fast: CUDA%d iGPU lane failed (columns call) - the CPU lane takes over\n", dev_);
+            F->igpu_experts = nullptr;
+        }
+        F->igpu_cols_falls.fetch_add(1, std::memory_order_relaxed);
+    }
     if (n <= 1 || Ly.exl3 || F->igpu_experts != nullptr) {
-        for (int t = 0; t < n; ++t) fast_cpu_experts(il, ne[t], blob + gf::kMaxK * t, w + gf::kMaxK * t, x[t], out[t]);
+        for (int t = 0; t < n; ++t)
+            fast_cpu_experts(il, ne[t], blob + gf::kMaxK * t, w + gf::kMaxK * t, x[t], out[t], xq ? xq[t] : nullptr);
         return;
     }
     namespace kc = strata::kernels::cpu;
     const auto& nf = F->cpu_fmt[(size_t) il];
-    const int n_ff = g.n_ff_exp, n_embd = g.n_embd;
     constexpr int kCols = kVerifyMax, kPairs = gf::kMaxK * kVerifyMax;   // (a column's entries at stride kMaxK)
     // the union: expert u's blob, its columns, the (expert, column) pair each of them is; pair p's buffers at p
     int nu = 0, np = 0;
@@ -2303,21 +2342,7 @@ void Glm5Model::fast_cpu_experts_multi(int il, int n, const int* ne, const uint8
             for (int i = 0; i < ne[t]; ++i) m += w[gf::kMaxK * t + i] * F->cpu_dn_m[(size_t) pair_of[t][i] * n_embd + r];
             out[t][r] = m;
         }
-    // STRATA_GLM_CPU_MULTI_CHECK=1 (debug, slow): every column through the one-column call too, compared bit for bit
-    static const bool check = getenv("STRATA_GLM_CPU_MULTI_CHECK") != nullptr;
-    if (check) {
-        static std::vector<float> ref;
-        ref.resize((size_t) n_embd);
-        static uint64_t cols = 0, bad = 0;
-        for (int t = 0; t < n; ++t) {
-            fast_cpu_experts(il, ne[t], blob + gf::kMaxK * t, w + gf::kMaxK * t, x[t], ref.data());
-            ++cols;
-            if (std::memcmp(ref.data(), out[t], (size_t) n_embd * sizeof(float)) != 0) ++bad;
-        }
-        if (cols % 512 < (uint64_t) n)
-            std::fprintf(stderr, "cpu multi check: %llu columns, %llu differ from the one-column call\n",
-                         (unsigned long long) cols, (unsigned long long) bad);
-    }
+    if (check) check_cols("cpu");
     F->cpu_multi_calls.fetch_add(1, std::memory_order_relaxed);
     F->cpu_multi_cols.fetch_add((uint64_t) n, std::memory_order_relaxed);
     F->cpu_multi_uses.fetch_add((uint64_t) np, std::memory_order_relaxed);
@@ -3458,6 +3483,10 @@ void Glm5Model::fast_destroy() {
             std::fprintf(stderr, "glm fast: iGPU lane: %llu calls (%llu started before their route's disk reads), %llu "
                                  "left to the CPU\n", (unsigned long long) F->igpu_calls.load(),
                          (unsigned long long) F->igpu_early.load(), (unsigned long long) F->igpu_falls.load());
+        if (const uint64_t cc = F->igpu_cols_calls.load(); cc > 0 || F->igpu_cols_falls.load() > 0)
+            std::fprintf(stderr, "glm fast: iGPU lane: %llu verify-window calls of %.2f columns each, %llu windows a call a column\n",
+                         (unsigned long long) cc, cc > 0 ? (double) F->igpu_cols_cols.load() / (double) cc : 0.0,
+                         (unsigned long long) F->igpu_cols_falls.load());
         if (auto cl = (abyss_igpu_close_fn) dlsym(F->igpu_lib, "abyss_igpu_close")) cl();
         F->igpu_experts = nullptr;
         F->igpu_rows = nullptr;
@@ -3664,6 +3693,7 @@ void Glm5Model::fast_service() {
         const uint8_t* blob[gf::kMaxK];
         float w[gf::kMaxK];
         const float* x;
+        const void* xq;   // (the iGPU lane's columns call: x's q8_1 from the request, when it has it)
     };
     WinCol wq[kVerifyMax];
     int wq_n = 0, wq_layer = -1;
@@ -3673,9 +3703,13 @@ void Glm5Model::fast_service() {
         const uint8_t* blob[gf::kMaxK * kVerifyMax];
         float w[gf::kMaxK * kVerifyMax];
         const float* x[kVerifyMax];
+        const void* xqv[kVerifyMax];
         float* out[kVerifyMax];
         uint64_t n_exp = 0;
+        bool xq_all = true;
         for (int t = 0; t < wq_n; ++t) {
+            xqv[t] = wq[t].xq;
+            xq_all = xq_all && wq[t].xq != nullptr;
             ne[t] = wq[t].ne;
             n_exp += (uint64_t) wq[t].ne;
             for (int i = 0; i < gf::kMaxK; ++i) {
@@ -3685,7 +3719,7 @@ void Glm5Model::fast_service() {
             x[t] = wq[t].x;
             out[t] = (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->part;
         }
-        fast_cpu_experts_multi(wq_layer, wq_n, ne, blob, w, x, out);
+        fast_cpu_experts_multi(wq_layer, wq_n, ne, blob, w, x, out, xq_all ? xqv : nullptr);
         const auto t1 = std::chrono::steady_clock::now();
         std::atomic_thread_fence(std::memory_order_release);
         for (int t = 0; t < wq_n; ++t) (F->cpu_ans_h + (wq[t].seq % gf::kCpuAnswers))->seq = wq[t].seq;
@@ -4152,7 +4186,8 @@ void Glm5Model::fast_service() {
         //      A batched verify window's column (win_more: that many more routes of the layer follow, the device
         //      waiting for none of them yet) is queued, and the window's last column answers them all
         if (wq_n > 0 && wq_layer != rq->layer) lane_flush();   // (a window cut short)
-        if (rq->cpu_mask != 0u && F->cpu_ans_h != nullptr && cpu_multi && F->igpu_experts == nullptr && !lane_started &&
+        if (rq->cpu_mask != 0u && F->cpu_ans_h != nullptr && cpu_multi && !lane_started &&
+            (F->igpu_experts == nullptr || (F->igpu_cols != nullptr && !F->L[(size_t) rq->layer].exl3)) &&
             (rq->win_more > 0 || wq_n > 0) && wq_n < kVerifyMax) {
             WinCol& c = wq[wq_n++];
             wq_layer = rq->layer;
@@ -4164,6 +4199,7 @@ void Glm5Model::fast_service() {
                     c.w[c.ne++] = rq->w[i];
                 }
             c.x = rq->x;
+            c.xq = rq->xq_ok ? (const void*) rq->xq : nullptr;
         } else if (rq->cpu_mask != 0u && F->cpu_ans_h != nullptr) {
             const auto t0 = std::chrono::steady_clock::now();
             const unsigned int cm = rq->cpu_mask;

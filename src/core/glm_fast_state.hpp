@@ -661,6 +661,8 @@ struct Glm5Model::FastState {
     abyss_igpu_register_fn igpu_reg = nullptr;
     abyss_igpu_unregister_fn igpu_unreg = nullptr;
     std::atomic<uint64_t> igpu_calls{0}, igpu_falls{0}, igpu_early{0};   // (early: started before disk reads)
+    abyss_igpu_experts_cols_fn igpu_cols = nullptr;   // (optional) a verify window's columns in one lane call (STRATA_GLM_IGPU_COLS)
+    std::atomic<uint64_t> igpu_cols_calls{0}, igpu_cols_cols{0}, igpu_cols_falls{0};
     std::thread svc;
     std::atomic<bool> quit{false};
     uint64_t clock = 0;
