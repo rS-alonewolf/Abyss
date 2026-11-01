@@ -456,8 +456,11 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
-        pname = rest[:rest.index(">")]
-        rest = rest[rest.index(">") + 1:]
+        close = rest.find(">")
+        if close < 0 or "<" in rest[:close]:   # an unclosed <parameter= tag: malformed like the other cases
+            raise ValueError("malformed tool call: " + body[:80])
+        pname = rest[:close]
+        rest = rest[close + 1:]
         end = rest.find("</parameter>")
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len("</parameter>"):] if end >= 0 else ""
@@ -819,7 +822,12 @@ class OutputParser:
                 if self.bend < 0:
                     return out
                 body, self.buf = self._body_take()
-                for call in parse_dsml_calls(body):
+                try:
+                    calls = parse_dsml_calls(body)
+                except ValueError:                  # a malformed block is returned as text, never a failed request
+                    calls = None
+                    out.append(Event("content", self._track(self.dsml_tag + body)))
+                for call in calls or []:
                     out.append(Event("tool_call", call=call))
                 self.state, self.lead = "content", True
             else:
@@ -835,10 +843,18 @@ class OutputParser:
                 if i < 0:
                     return out
                 body, self.buf = self._body_take()
-                call = parse_tool_call(body, self.schemas.get(call_name(body)))
-                if self.scall is not None:
-                    call.id = self.scall.id
-                out.append(Event("tool_call", call=call))
+                try:
+                    call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                except ValueError:                  # a malformed call is returned as text, never a failed request
+                    call = None
+                if call is None and self.scall is None:
+                    out.append(Event("content", self._track(CALL_START + body)))
+                elif call is None:                  # already announced while streaming: close it as scanned
+                    out.append(Event("tool_call", call=self.scall))
+                else:
+                    if self.scall is not None:
+                        call.id = self.scall.id
+                    out.append(Event("tool_call", call=call))
                 self._reset_scan()
                 self.state, self.lead = "content", True
 

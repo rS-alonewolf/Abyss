@@ -65,6 +65,22 @@ class GlmCalls(unittest.TestCase):
             with self.assertRaises(ValueError, msg=body):
                 parse_tool_call(body)
 
+    def test_unclosed_parameter(self):
+        bad = "<function=get_weather>\n<parameter=city\nParis\n</parameter>\n</function>"
+        with self.assertRaises(ValueError):
+            parse_tool_call(bad)
+        for stream in (True, False):
+            for pieces in (None, 1, 5):
+                p = OutputParser(thinking=False, tools=TOOLS, stream_tools=stream)
+                text = "Let me check.\n<tool_call>\n" + bad + "\n</tool_call>\nDone."
+                chunks = [text] if pieces is None else [text[i:i + pieces] for i in range(0, len(text), pieces)]
+                ev = []
+                for c in chunks:
+                    ev += p.feed(c)
+                ev += p.finish()
+                self.assertTrue(ev, msg=(stream, pieces))
+                self.assertFalse([e for e in ev if e.kind == "tool_call" and e.call and e.call.arguments.get("city") == "Paris"])
+
     def test_streamed_as_whole(self):
         for pieces in (None, 1, 3, 7):
             ev = run("Checking the weather.\n\n" + GLM, pieces)
