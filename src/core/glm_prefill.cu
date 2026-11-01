@@ -693,7 +693,10 @@ bool Glm5Model::prefill_setup(std::string& err) {
         // (qwen4exp: the i-quant projections too - hgemm_q's dequant_f16 takes them)
         const bool iq = g.q4x && (w.type == 16 || w.type == 17 || w.type == 18 || w.type == 21 || w.type == 22 ||
                                   w.type == 29);
-        if (w.q == nullptr || (w.type != gf::kTypeBF16 && w.type != strata::kernels::exl3::kTypeEXL3 && !iq &&
+        // (qwen35 / qwen4exp: F32 rows too - unsloth's Qwen3.8 UD files keep ssm_alpha / ssm_beta F32 where ISTA's are
+        // BF16, and hgemm_q widens F32 to FP16 as it does the injects; issue #25: they dropped the whole prompt path)
+        const bool f32 = g.qwen35() && w.type == gf::kTypeF32;
+        if (w.q == nullptr || (w.type != gf::kTypeBF16 && w.type != strata::kernels::exl3::kTypeEXL3 && !iq && !f32 &&
                                !strata::kernels::dequant_bf16_supported(w.type)))
             why += "blk." + std::to_string(il) + "." + nm + " (type " + std::to_string(w.type) + ") ";
     };
