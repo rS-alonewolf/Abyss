@@ -209,3 +209,7 @@ These change part of the config file; the other keys stay as they are.
 | `~/.config/project-maya/calibration.json` | `--calibrate`'s results (per PC, model, context, and the GPU's PCIe link and driver: a card moved to another slot or a driver update leaves the old result unused, with one line saying so) | no |
 | `Abyss-tools/logs/last-model` | the model `abyss.sh start` started last | no |
 | `Abyss-tools/abyss.sh`, `common.sh` | the start / stop tools; setup brings them up to date (the old ones kept as `.bak`) | no |
+
+### Per-position log probabilities
+
+Set `STRATA_GLM_LOGPOS` to a new output path to enable the engine command `LOGPOS <comma-separated-token-ids>`. It writes the target and top-k log probabilities for each next-token position as tab-separated rows and resets the model state. `STRATA_GLM_LOGPOS_TOPK` sets the number of top tokens (default 64). `STRATA_GLM_LOGPOS_PREFILL=1` uses the prompt path on a single-device DeepSeek V4.1 with prefill enabled; the default is the token path. The paths can differ numerically. Each tab-separated row contains position, target ID, target log probability, top ID, top log probability, hit (0 or 1), then top-k `ID:log_probability` fields. Multiple requests append to the same file and restart positions at zero; wait for `LPDONE` before sending `QUIT`.

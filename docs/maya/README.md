@@ -219,6 +219,8 @@ These settings change what the engine chooses (put them in the config with `--en
 
 | Setting | Default | |
 | --- | --- | --- |
+| `STRATA_GLM_LOGPOS`, `STRATA_GLM_LOGPOS_TOPK` | off; top-k 64 | Set a new output path to enable the engine `LOGPOS` command for per-position target and top-k log probabilities; `TOPK` sets the number recorded. The command resets model state. |
+| `STRATA_GLM_LOGPOS_PREFILL` | off | Set to `1` to score LOGPOS using the prompt path on a single-device DeepSeek V4.1; requires prefill. Prompt and token paths can differ numerically. |
 | `STRATA_GLM_RAM_HEADROOM_GB` | 6 | RAM left free for the system when the RAM tier is sized; it also takes one more GPU's prompt buffers, pinned after the measurement - a split of three or more GPUs sets the others' aside on top, and each later GPU measures again and leaves at least half of it free |
 | `STRATA_GLM_RAM_GB` | from free RAM | a fixed RAM-tier size in GB |
 | `STRATA_GLM_RAM_RESIDENT` | off | `1` (or `--glm-ram-resident`): the RAM tier holds every expert not in VRAM and nothing is evicted to disk. The start fails if it cannot. For PCs whose RAM holds everything off-card (a 4090 D with 128 GB: decode 1.9x as fast with `PROMOTE_MIN=6`). `STRATA_GLM_RAM_SLACK` is extra slots per MoE layer (default 16) |

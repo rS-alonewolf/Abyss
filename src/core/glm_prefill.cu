@@ -2259,7 +2259,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     // updates, but omit the output projection and FFN (including both mHC write halves). Split boundaries and seam
     // dumps consume these rows, so keep their full path. STRATA_GLM_PREFILL_TAIL_SKIP=0 is the A/B baseline.
     const char* tail_env = getenv("STRATA_GLM_PREFILL_TAIL_SKIP");
-    const bool tail_skip = l0_ == 0 && l1_ == g.n_layers && split_next_ == nullptr && mtp_il_ < 0 && dsp_ == nullptr && q4d_ == nullptr &&
+    const bool tail_skip = !prefill_logits && l0_ == 0 && l1_ == g.n_layers && split_next_ == nullptr && mtp_il_ < 0 && dsp_ == nullptr && q4d_ == nullptr &&
                            (cb_dir == nullptr || !cb_dir[0]) && (tail_env == nullptr || std::atoi(tail_env) != 0);
     const auto dump_row = [&](const std::string& name, const float* rows, int width, int row = -1) {
         if (cb_dir == nullptr || !cb_dir[0]) return;
@@ -4148,7 +4148,10 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // a handful of tokens costs less through the token path (the batched path streams every expert they touch)
     int64_t min_n = 32;
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
-    if ((int64_t) tokens.size() < min_n) return false;
+    if (!prefill_logits && (int64_t) tokens.size() < min_n) return false;
+    if (prefill_logits && (!g_.v41 || split_next_ || l0_ != 0 || l1_ != g_.n_layers)) {
+        err = "prefill logits requires single-device DeepSeek V4.1"; return false;
+    }
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
     int Tmax = pf_->T;
@@ -4215,7 +4218,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     int yl = -1;
     int64_t cut = 0;
     static const bool skip_on = [] { const char* v = getenv("STRATA_GLM_PROMPT_SKIP"); return v == nullptr || std::atoi(v) != 0; }();
-    if (skip_on && g.v41 && split_next_ == nullptr && l0_ == 0 && l1_ == g.n_layers && mtp_il_ < 0) {
+    if (skip_on && !prefill_logits && g.v41 && split_next_ == nullptr && l0_ == 0 && l1_ == g.n_layers && mtp_il_ < 0) {
         for (int il = 0; il < g.n_layers && yl < 0; ++il)
             if (g.ratio(il) == 1) yl = il;
         bool ok = yl > 0 && g.kv_src[(size_t) yl];
@@ -4290,6 +4293,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         for (int c = 0; c < nc; ++c) {
             const int T = chunk_len(c);
             const int64_t p0 = pos_start + cs[(size_t) c];
+            if (prefill_logits)
+                std::fprintf(stderr, "LOGPOS prefill chunk: position %lld length %d\n", (long long) p0, T);
             cudaSetDevice(dev_);
             if (!embed(c)) return false;
             std::vector<int32_t> nx0;
@@ -4314,6 +4319,29 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 if (m->mtp_il_ >= 0) next_of(c, nx);
                 if (!m->prefill_half(p0, T, err, nx.empty() ? nullptr : nx.data())) return false;
                 prev = m;
+            }
+            if (prefill_logits) {
+                namespace d41 = strata::kernels::dsv41;
+                namespace gf = strata::kernels::glmf;
+                const WSlot& ow = ws_map_.at("output.weight");
+                std::vector<float> logits((size_t) g.n_vocab);
+                for (int t = 0; t < T; ++t) {
+                    d41::head_prep(pf_->R + (size_t) t * 4 * E, pf_->pre2 + (size_t) t * 4,
+                                   w_.at("output_norm.weight"), g.norm_eps, E,
+                                   fast_->head_x, fast_->head_xq, fast_->cs);
+                    gf::MvJob job = {ow.q, fast_->head_xq, fast_->head_x, sc_ + sc_logits, nullptr,
+                                     1.0f, ow.type, E, g.n_vocab};
+                    if (ow.type == 0) job.w = ow.f32;
+                    if (!gf::mv(&job, 1, fast_->cs) ||
+                        !glmfast::cuda_ok(cudaMemcpyAsync(logits.data(), sc_ + sc_logits,
+                            logits.size() * sizeof(float), cudaMemcpyDeviceToHost, fast_->cs),
+                            "prefill logits copy", err) ||
+                        !glmfast::cuda_ok(cudaStreamSynchronize(fast_->cs), "prefill logits", err)) {
+                        if (err.empty()) err = "prefill output head failed";
+                        return false;
+                    }
+                    if (!prefill_logits(p0 + t, logits, err)) return false;
+                }
             }
             pos_ = p0 + T;
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) m->pos_ = pos_;
