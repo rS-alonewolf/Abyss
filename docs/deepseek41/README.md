@@ -209,6 +209,9 @@ slots (2,321 -> 2,498). It stays optional until a swe-bench run shows the answer
 
 ### Overlays: changed dense tensors without another copy of the model (v1.3.52)
 
+`tools/dense_overlay.py` writes only the changed tensors into a small first shard and links the model's own shards
+behind it; `iq_pack.py --first-wins` then takes the changed copies (the engine looks tensors up in shard order too).
+
 **UD-IQ2_XXS with Q5_K dense** (2026-11-01, lossy, opt-in, recommended on a 32 GB card): the layers' Q8_0 / Q6_K
 projections (attention, shared experts, `engram_kv`; 283 tensors, 6.26 -> 4.36 GB) re-quantized to Q5_K - a 4.4 GB
 overlay; the VRAM tier gets the 1.9 GB. RTX 5090 + Radeon 8060S lane, the everyday settings + DSpark, swe-bench 3 tasks
@@ -228,8 +231,6 @@ cp $U/pack/expert_*.txt $O/pack/
 
 Then point the config's `--glm-pack` and `tokenizer` at `$O/pack` (`GGUF_PY` / `LIBGGML` as for `requant_dense.py`).
 
-`tools/dense_overlay.py` writes only the changed tensors into a small first shard and links the model's own shards
-behind it; `iq_pack.py --first-wins` then takes the changed copies (the engine looks tensors up in shard order too).
 Two uses on unsloth's UD-IQ1_S (AI PRO R9700 + 8060S lane, 94 GB RAM, the 8 held-out sequences and the swe-bench
 subset of 8 tasks):
 
