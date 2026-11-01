@@ -7,6 +7,21 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.90 - 2026-11-01
+
+A malformed tool call no longer fails the request; a Q5_K dense recipe for DeepSeek V4.1 UD-IQ2_XXS.
+
+- **A malformed tool call comes back as text.** A call with an unclosed `<parameter=` tag, or a DeepSeek DSML block
+  that does not parse, raised inside the streaming parser and ended the request with an error; small quants and the
+  uncensor edit make such output more likely. Now the block is returned as ordinary text (a call already announced
+  while streaming is closed as scanned). A regression test covers the tag whole and in pieces, streamed or not.
+- **docs/deepseek41: UD-IQ2_XXS with Q5_K dense** (opt-in, recommended on a 32 GB card): the layers' Q8_0 / Q6_K
+  projections re-quantized to Q5_K as a 4.4 GB overlay (283 tensors, 6.26 -> 4.36 GB), the 1.9 GB going to the VRAM
+  tier. RTX 5090 + Radeon 8060S lane, the everyday settings + DSpark, swe-bench 3 tasks alternated 4 times:
+  47.5 -> 50.5 tok/s (+6%); 8 held-out texts with exact routing: KL 0.1420 -> 0.1456. Three copy-paste commands.
+
+Checked: the serve tests (206) and the tools tests. Engine code is unchanged from v1.3.89.
+
 ## v1.3.89 - 2026-11-01
 
 DeepSeek V4.1 Flash 1017 with the DSpark drafter and an iGPU lane: the lane takes a verify window's columns in one
