@@ -19,6 +19,11 @@ inline bool queue_input(const std::string& line, std::atomic<bool>& stop, std::a
     return true;
 }
 inline void begin_logpos(std::atomic<bool>& stop) { stop.store(false); }
+template <typename Model>
+inline void prepare_logpos_model(Model& model, bool abl_default) {
+    model.reset();
+    if (abl_default) model.abl_enable(abl_default);
+}
 inline bool logpos_cancelled(const std::atomic<bool>& stop, const std::atomic<bool>& quit) {
     return stop.load() || quit.load();
 }

@@ -2726,7 +2726,7 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("ERR %s\n", why.c_str()); std::fflush(stdout); continue;
             }
             snap_tokens.clear(); lp_ctx.clear();
-            model.reset();
+            strata::program::prepare_logpos_model(model, abl_def);
             model.set_host_logits(true);
             const auto begin = std::chrono::steady_clock::now();
             std::vector<float> lg;

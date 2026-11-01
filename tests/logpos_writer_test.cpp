@@ -11,6 +11,18 @@
 #include <vector>
 
 int main() {
+    struct Model {
+        bool enabled = true;
+        int resets = 0, enables = 0;
+        void reset() { ++resets; }
+        void abl_enable(bool value) { ++enables; enabled = value; }
+    } model;
+    model.abl_enable(false); // A preceding generation requested abl=0.
+    strata::program::prepare_logpos_model(model, true);
+    assert(model.enabled && model.resets == 1 && model.enables == 2);
+    Model unloaded;
+    strata::program::prepare_logpos_model(unloaded, false);
+    assert(unloaded.resets == 1 && unloaded.enables == 0);
     std::atomic<bool> stop{false}, quit{false};
     std::deque<std::string> lines;
     auto receive = [&](const std::string& line) {
