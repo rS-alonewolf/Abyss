@@ -209,6 +209,25 @@ slots (2,321 -> 2,498). It stays optional until a swe-bench run shows the answer
 
 ### Overlays: changed dense tensors without another copy of the model (v1.3.52)
 
+**UD-IQ2_XXS with Q5_K dense** (2026-11-01, lossy, opt-in, recommended on a 32 GB card): the layers' Q8_0 / Q6_K
+projections (attention, shared experts, `engram_kv`; 283 tensors, 6.26 -> 4.36 GB) re-quantized to Q5_K - a 4.4 GB
+overlay; the VRAM tier gets the 1.9 GB. RTX 5090 + Radeon 8060S lane, the everyday settings + DSpark, swe-bench 3 tasks
+alternated 4 times: 47.5 -> 50.5 tok/s (+6%; a token -6 / -9 / -18% on the three tasks), 8 held-out texts with exact
+routing: KL 0.1420 -> 0.1456, ppl 8.79 -> 8.87, same top 83.8 -> 83.7%.
+
+```sh
+U=<models dir>/unsloth/DeepSeek-V4.1-Flash-1017-GGUF/UD-IQ2_XXS
+O=<models dir>/ud-iq2xxs-q5k
+.venv/bin/python -I tools/dense_overlay.py $U/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf $O \
+  --type=q5_k --from=q8_0,q6_k \
+  'blk\.\d+\.(attn_q_a|attn_q_b|attn_kv|attn_output_a|attn_output_b|ffn_(gate|up|down)_shexp|engram_kv)\.weight'
+STRATA_GGUF_PY=third_party/llama.cpp/gguf-py .venv/bin/python tools/iq_pack.py \
+  --gguf $O/overlay-00001-of-00007.gguf --out $O/pack --compat-bf16 --first-wins
+cp $U/pack/expert_*.txt $O/pack/
+```
+
+Then point the config's `--glm-pack` and `tokenizer` at `$O/pack` (`GGUF_PY` / `LIBGGML` as for `requant_dense.py`).
+
 `tools/dense_overlay.py` writes only the changed tensors into a small first shard and links the model's own shards
 behind it; `iq_pack.py --first-wins` then takes the changed copies (the engine looks tensors up in shard order too).
 Two uses on unsloth's UD-IQ1_S (AI PRO R9700 + 8060S lane, 94 GB RAM, the 8 held-out sequences and the swe-bench
