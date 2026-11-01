@@ -1279,7 +1279,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         std::fprintf(stderr, "glm fast: CUDA%d layers [%d,%d) expert pool %.2f GB, %d-%d slots/layer (%lld total)\n",
                      dev_, l0_, l1_, (double) tot / 1073741824.0, nmin, nmax, (long long) F->pool_slots);
         fast_tail_skip_setup();
-        if (const char* dv = getenv("STRATA_GLM_DEFER"); dv != nullptr && std::atoi(dv) != 0) {
+        if (const char* dv = getenv("STRATA_GLM_DEFER"); dv != nullptr && std::atoi(dv) != 0 && !F->abl_full) {
             // (a layer split: each part defers within its own layers - its last layer waits for its own part, as
             // the trunk's last layer does, and the next part's first layer has nothing to add)
             F->defer = true;
