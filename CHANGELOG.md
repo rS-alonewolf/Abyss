@@ -7,6 +7,23 @@ only what changed and starts; the model is not downloaded again.
 Abyss numbers its own releases from v1.1.0 (zephel01/Abyss). v1.0.31 and older below are Project Maya's, which Abyss
 was copied from; DeepSeek V4 support (the `deepseek4` port) came on top of v1.0.31.
 
+## v1.3.91 - 2026-11-01
+
+Qwen3.8-Flash-Next from unsloth's UD files reads the prompt in batches again; two contributed fixes.
+
+- **unsloth Qwen3.8 UD files: the prompt path** (issue #25, thanks @LarsDrakblod). unsloth keeps the GDN layers'
+  `ssm_alpha` / `ssm_beta` rows F32 (ISTA's files have them BF16); the prompt path's weight check refused F32, so every
+  prompt was read token by token. The GEMM already widens F32 rows to FP16, so the check now lets them through on
+  qwen35 / qwen4exp. unsloth UD-IQ1_S, RTX 5090 + Radeon 8060S lane, the same 8K / 32K prompts:
+  8K 90 -> 2,373 tok/s, 32K 90 -> 3,165 tok/s (32K: 6 min -> 10 s to the first token); the needle found in both.
+- **`--uncensor` and `STRATA_GLM_ABL` both set: an error** instead of one silently replacing the other; deferral
+  (`STRATA_GLM_DEFER`) stays off while an ABL2 edit is loaded (PR #26, thanks @rS-alonewolf).
+- **`LOGPOS`** (opt-in, `STRATA_GLM_LOGPOS=<new file>`): the engine command writes each position's target and top-k
+  log probabilities, for comparing quants and edits position by position; `STRATA_GLM_LOGPOS_PREFILL=1` scores
+  through the prompt path on a single-GPU DeepSeek V4.1 (PR #27, thanks @rS-alonewolf). Off by default.
+
+Checked: CUDA build, the serve and tools tests, the engine's CPU tests (those needing a local model pack skipped).
+
 ## v1.3.90 - 2026-11-01
 
 A malformed tool call no longer fails the request; a Q5_K dense recipe for DeepSeek V4.1 UD-IQ2_XXS.
