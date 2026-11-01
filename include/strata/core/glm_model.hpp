@@ -738,6 +738,8 @@ public:
     /// Called (from any thread) when a chunk has gone through every layer: (positions done, total); false cancels
     /// the prompt (prefill then returns false with err "cancelled" and the sequence must be reset).
     std::function<bool(int64_t, int64_t)> prefill_progress;
+    // Optional V4.1 single-device consumer of each prefilled row, in position order.
+    std::function<bool(int64_t, const std::vector<float>&, std::string&)> prefill_logits;
     /// Debug: every half's sequence state (KDA states + conv histories, DSA caches) to <path>.<half>.bin, with the
     /// per-layer offsets in <path>.<half>.txt - two runs that should agree are compared per layer and component.
     bool dump_state(const std::string& path);

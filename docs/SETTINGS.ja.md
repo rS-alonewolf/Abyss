@@ -208,3 +208,7 @@ grep -o -- '--config" "[^"]*' ~/llm/apps/Abyss/run-abyss-dsv4-q2_k_xl.sh
 | `~/.config/project-maya/calibration.json` | `--calibrate` の結果（PC・モデル・コンテキスト・GPU の PCIe リンクとドライバごと。カードを別のスロットに移したりドライバを更新すると古い結果は使われず、1 行で知らせる） | 触らない |
 | `Abyss-tools/logs/last-model` | `abyss.sh start` で最後に起動したモデル名 | 触らない |
 | `Abyss-tools/abyss.sh`、`common.sh` | 起動・停止の道具。セットアップのたびに最新になる（古いものは `.bak`） | 触らない |
+
+### 各位置の対数確率
+
+`STRATA_GLM_LOGPOS` に未使用の出力パスを指定すると、エンジンの `LOGPOS <カンマ区切りのトークンID>` が各位置の正解トークンと上位トークンの対数確率を記録します。モデルの状態はリセットされます。`STRATA_GLM_LOGPOS_TOPK` は記録する上位トークン数（既定 64）です。`STRATA_GLM_LOGPOS_PREFILL=1` はプレフィルが有効な単一デバイスの DeepSeek V4.1 でプロンプト経路を使用します。既定はトークン経路です。両経路の数値は異なる場合があります。

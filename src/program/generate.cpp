@@ -47,6 +47,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/program/logits_selection.hpp"
+#include "strata/program/logpos.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -1454,12 +1455,8 @@ static int glm_pack_generate(const Options& o) {
             };
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
-                if (l == "STOP") { stop_req.store(true); continue; }
                 if (l == "WRAP") { wrap_req.store(true); continue; }
-                if (l == "QUIT") {                       // cancel an in-flight request AND queue the line:
-                    quit_req.store(true);
-                    stop_req.store(true);                // (the decode checks stop_req; reset by the next GEN)
-                }
+                if (!strata::program::queue_input(l, stop_req, quit_req)) continue;
                 std::lock_guard<std::mutex> lk(in_mu);   // a GEN written before QUIT must still run (pipes)
                 in_lines.push_back(l);
                 in_cv.notify_one();
@@ -2675,6 +2672,7 @@ static int glm_pack_generate(const Options& o) {
     // floats) in prompt order; their rows stand in for the prompt's <|image|> tokens, in order (GLM-5.3's image
     // tokens take no positions of their own: the rows only replace the embeddings)
     constexpr int64_t kGlmImageToken = 154854;   // <|image|>
+    strata::program::LogposWriter logpos;
     std::vector<int32_t> lp_ctx;   // LOGP: the context the saved state belongs to (the state before its last token)
     std::string line;
     while (next_line(line)) {
@@ -2706,6 +2704,67 @@ static int glm_pack_generate(const Options& o) {
             if (model.vision_reclaim(err)) std::printf("VRECLAIMED\n");
             else std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
+            continue;
+        }
+        // Opt-in teacher forcing without sampling, prompt reuse or speculative windows.
+        // LOGPOS <ids> writes positions 0..N-2 to STRATA_GLM_LOGPOS, then LPDONE N-1 seconds.
+        if (cmd == "LOGPOS" && getenv("STRATA_GLM_LOGPOS") != nullptr) {
+            strata::program::begin_logpos(stop_req);
+            std::string ids_s, extra, why;
+            std::vector<int64_t> ids;
+            ss >> ids_s;
+            bool ok = !ids_s.empty() && !(ss >> extra) && parse_i64_list(ids_s.c_str(), ids, why) &&
+                      ids.size() >= 2 && ids.size() <= (size_t) o.max_context;
+            for (int64_t id : ids) ok = ok && id >= 0 && id < n_vocab;
+            if (!ok) {
+                std::printf("ERR LOGPOS invalid ids/context\n");
+                std::fflush(stdout);
+                continue;
+            }
+            if (!logpos.open(getenv("STRATA_GLM_LOGPOS"), getenv("STRATA_GLM_LOGPOS_TOPK"),
+                             (size_t) n_vocab, why)) {
+                std::printf("ERR %s\n", why.c_str()); std::fflush(stdout); continue;
+            }
+            snap_tokens.clear(); lp_ctx.clear();
+            model.reset();
+            model.set_host_logits(true);
+            const auto begin = std::chrono::steady_clock::now();
+            std::vector<float> lg;
+            const char* lp_prefill = getenv("STRATA_GLM_LOGPOS_PREFILL");
+            if (lp_prefill && std::strcmp(lp_prefill, "1") == 0) {
+                std::vector<int32_t> input(ids.begin(), ids.end() - 1);
+                model.prefill_logits = [&](int64_t pos, const std::vector<float>& row, std::string& e) {
+                    if (strata::program::logpos_cancelled(stop_req, quit_req)) { e = "LOGPOS cancelled"; return false; }
+                    strata::core::progress_at("LOGPOS: after position", pos);
+                    strata::core::progress_beat();
+                    return logpos.write((size_t) pos, (int) ids[(size_t) pos + 1], row, e);
+                };
+                ok = model.prefill(input, why, (int32_t) ids.back());
+                model.prefill_logits = nullptr;
+                if (!ok && why.empty()) why = "LOGPOS prefill unavailable (enable prompt path)";
+            } else for (size_t i = 0; ok && i + 1 < ids.size(); ++i) {
+                if (strata::program::logpos_cancelled(stop_req, quit_req)) { why = "LOGPOS cancelled"; ok = false; break; }
+                ok = model.forward({(int32_t) ids[i]}, lg, why) &&
+                     logpos.write(i, (int) ids[i + 1], lg, why);
+                if (ok) {
+                    strata::core::progress_at("LOGPOS: after position", (int64_t) i);
+                    strata::core::progress_beat();
+                    if ((i + 1) % 256 == 0) {
+                        std::printf("LPPROGRESS %zu %zu %.6f\n", i + 1, ids.size() - 1,
+                                    std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+                        std::fflush(stdout);
+                    }
+                }
+            }
+            model.set_host_logits(false);
+            ok = logpos.flush(why) && ok;
+            if (ok) {
+                std::printf("LPDONE %zu %.6f\n", ids.size() - 1,
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count());
+            } else std::printf("ERR %s\n", why.c_str());
+            std::fflush(stdout);
+            // A partial request must not be mistaken for a complete request.
+            if (!ok) return 1;
             continue;
         }
         if (cmd == "LOGP") {
