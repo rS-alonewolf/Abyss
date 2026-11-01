@@ -1374,7 +1374,16 @@ static int glm_pack_generate(const Options& o) {
     // the prompt chunk, set in the config's args like Strata's: --prefill auto | N (a chunk of N tokens) | 0
     // (the engine reads it as STRATA_GLM_PREFILL; without either, auto)
     if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
-    if (!o.uncensor.empty() && o.abl_build.empty()) set_env("STRATA_GLM_ABL", o.uncensor.c_str());
+    if (!o.uncensor.empty() && o.abl_build.empty()) {
+        // Both options select an ABL input; reject a conflict instead of silently replacing one.
+        const char* env_abl = std::getenv("STRATA_GLM_ABL");
+        if (env_abl != nullptr && env_abl[0] != '\0') {
+            std::fprintf(stderr, "maya generate: --uncensor %s and STRATA_GLM_ABL=%s are both set; "
+                                 "give one of the two\n", o.uncensor.c_str(), env_abl);
+            return 1;
+        }
+        set_env("STRATA_GLM_ABL", o.uncensor.c_str());
+    }
     // the layer split across the visible GPUs: STRATA_GLM_SPLIT, else --layer-split (auto | K1,K2,..)
     if (!model.load_pack_env(o.glm_pack, o.max_context, err, o.layer_split)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
